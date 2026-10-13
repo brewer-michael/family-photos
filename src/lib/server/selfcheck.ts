@@ -2,10 +2,12 @@
  * Startup self-check of the media tools (docs/PLAN.md hooks.server.ts `init`; media-pipeline.md §3
  * "Startup self-check"). Run by startQueue(); the admin page shows getSelfCheck().
  *
- *   ffmpeg/ffprobe  version, encoders (libx264, aac), filters (zscale, tonemap, sidedata incl.
- *                   AMBIENT_VIEWING_ENVIRONMENT) and the decoders the pipeline relies on
- *   HEIF decoder    HEIF_DEC_BIN, else heif-dec (libheif ≥ 1.18), else heif-convert (1.17);
- *                   `--list-decoders` must show libde265 (HEIC) and dav1d (AVIF); heif-info
+ * Each lane's own detection is the one source of truth, so the check and the lanes can't disagree:
+ *   video lane      ffmpegCaps() + capsProblems() (encoders, zscale/tonemap/sidedata filters), plus
+ *                   the video and audio decoders the format rules rely on; ffprobe `-version`
+ *   photo lane      photoToolsReport() (src/worker/photo/tools.ts: the HEIF decoder and its
+ *                   libde265/dav1d plugins, ffmpeg's still-image decoders); it imports neither sharp
+ *                   nor exiftool, so it is safe to load in the web process
  *   exiftool        `-ver`
  *   disk            free space on /config (≥ 2 GiB per job) and /photos (≥ 2 GiB headroom)
  *
@@ -18,6 +20,7 @@ import { getConfig } from './config';
 import { configRoot, photosRoot } from './paths';
 import { capsProblems, ffmpegCaps } from './media/probe';
 import { JOB_MIN_FREE_BYTES, UPLOAD_HEADROOM_BYTES, formatBytes, freeBytes } from './disk';
+import { photoToolsReport } from '../../worker/photo/tools';
 import { MediaError } from '#lib/shared/errors';
 
 export interface SelfCheck {
@@ -36,18 +39,14 @@ interface Part {
 
 const TOOL_TIMEOUT_MS = 15_000;
 
-/** ffmpeg decoders (codec names) the format rules depend on, and what fails without each. */
+/** ffmpeg video decoders (codec names) the format rules depend on, and what fails without each. */
 const NEEDED_DECODERS: readonly [codec: string, what: string][] = [
 	['h264', 'H.264 videos'],
 	['hevc', 'iPhone (HEVC) videos'],
 	['vp9', 'VP9 videos'],
 	['av1', 'AV1 videos'],
 	['prores', 'ProRes videos'],
-	['mpeg2video', 'MPEG-2 videos'],
-	['jpegxl', 'JPEG XL photos'],
-	['jpeg2000', 'JPEG 2000 photos'],
-	['bmp', 'BMP photos'],
-	['psd', 'Photoshop (PSD) photos']
+	['mpeg2video', 'MPEG-2 videos']
 ];
 
 /** A tool's stdout. */
@@ -65,27 +64,6 @@ function why(e: unknown): string {
 	const text = MediaError.is(e) ? e.detail : e instanceof Error ? e.message : String(e);
 	if ((e as NodeJS.ErrnoException | null)?.code === 'ENOENT' || /\bENOENT\b/.test(text)) return 'not installed';
 	return text.split('\n')[0];
-}
-
-/**
- * `heif-dec --list-decoders` → decoder ids per section:
- *   "HEIC decoders:\n- libde265 = libde265 HEVC decoder…\n- ffmpeg = …\nAVIF decoders:\n- dav1d = …"
- *   → { HEIC: ['libde265', 'ffmpeg'], AVIF: ['dav1d'] }
- */
-export function parseHeifDecoders(text: string): Record<string, string[]> {
-	const out: Record<string, string[]> = {};
-	let section: string[] | null = null;
-	for (const line of text.split('\n')) {
-		const head = /^(.+?) decoders:\s*$/.exec(line.trim());
-		if (head) {
-			section = out[head[1]] = [];
-			continue;
-		}
-		const entry = /^-\s*(\S+)\s*=/.exec(line.trim());
-		if (entry && section) section.push(entry[1]);
-		else if (line.trim() !== '') section = null;
-	}
-	return out;
 }
 
 /** The first line of a tool's version output, without copyright noise. */
@@ -116,53 +94,16 @@ async function checkFfmpeg(): Promise<Part> {
 	return { problems, tools };
 }
 
-/** HEIF_DEC_BIN, else the first of heif-dec / heif-convert that runs. */
-async function findHeifDecoder(): Promise<{ bin: string; version: string } | null> {
-	const override = getConfig().heifDecBin;
-	for (const bin of override ? [override] : ['heif-dec', 'heif-convert']) {
-		try {
-			return { bin, version: firstLine(await exec(bin, ['--version'])) };
-		} catch {
-			// try the next candidate
-		}
-	}
-	return null;
-}
-
-async function checkHeif(): Promise<Part> {
-	const problems: string[] = [];
-	const tools: Record<string, string> = {};
-	const dec = await findHeifDecoder();
-	if (!dec) {
-		const tried = getConfig().heifDecBin ?? 'heif-dec or heif-convert';
-		problems.push(`No HEIF decoder (${tried}) could be run, so iPhone photos can't be added.`);
-	} else {
-		tools['heif decoder'] = `${dec.bin} ${dec.version}`;
-		try {
-			const list = parseHeifDecoders(await exec(dec.bin, ['--list-decoders']));
-			tools['heif decoders'] = Object.entries(list)
-				.filter(([, ids]) => ids.length > 0)
-				.map(([format, ids]) => `${format}: ${ids.join(', ')}`)
-				.join('; ');
-			if (!list.HEIC?.includes('libde265')) {
-				problems.push(`${dec.bin} has no libde265 decoder plugin, so iPhone photos may fail (install libheif-plugin-libde265).`);
-			}
-			if (!list.AVIF?.includes('dav1d')) {
-				problems.push(`${dec.bin} has no dav1d decoder plugin, so AVIF photos may fail (install libheif-plugin-dav1d).`);
-			}
-		} catch (e) {
-			problems.push(`${dec.bin} --list-decoders failed: ${why(e)}.`);
-		}
-	}
+/** The photo lane's own report (HEIF decoder and plugins, ffmpeg's still-image decoders). */
+async function checkPhotoTools(): Promise<Part> {
 	try {
-		tools['heif-info'] = firstLine(await exec('heif-info', ['--version']));
+		return await photoToolsReport();
 	} catch (e) {
-		problems.push(`heif-info could not be run: ${why(e)}, so iPhone photos can't be added.`);
+		return { problems: [`The photo tools could not be checked: ${why(e)}.`], tools: {} };
 	}
-	return { problems, tools };
 }
 
-/** EXIFTOOL_BIN, else the system exiftool the worker lanes use (libimage-exiftool-perl). */
+/** EXIFTOOL_BIN / EXIFTOOL_PATH (as the lanes read them), else the system exiftool (libimage-exiftool-perl). */
 function exiftoolBin(): string {
 	return getConfig().exiftoolBin ?? (fs.existsSync('/usr/bin/exiftool') ? '/usr/bin/exiftool' : 'exiftool');
 }
@@ -205,7 +146,7 @@ export function getSelfCheck(): SelfCheck | null {
 
 /** Runs every check (concurrent calls share one run), stores and logs the result. Never rejects. */
 export function runSelfCheck(): Promise<SelfCheck> {
-	running ??= Promise.all([checkFfmpeg(), checkHeif(), checkExiftool(), checkDisk()])
+	running ??= Promise.all([checkFfmpeg(), checkPhotoTools(), checkExiftool(), checkDisk()])
 		.then(
 			(parts): Part[] => parts,
 			(e: unknown): Part[] => [{ problems: [`The self-check itself failed: ${why(e)}`], tools: {} }]

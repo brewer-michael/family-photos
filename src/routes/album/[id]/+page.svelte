@@ -145,7 +145,8 @@
 	>
 		{#if uploaderMounted}
 			{#key data.album.id}
-				<Uploader albumId={data.album.id} ondone={refresh} />
+				<!-- Finished uploads move to the grid, or to "Still on their way" when they failed. -->
+				<Uploader albumId={data.album.id} ondone={refresh} clearOnDone />
 			{/key}
 		{/if}
 	</section>

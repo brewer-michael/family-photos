@@ -54,7 +54,7 @@
 			<span class="none"><Icon name={item.kind === 'video' ? 'video' : 'photo'} size="3em" /></span>
 		{/if}
 		<figcaption>
-			<a href="/view/{item.id}">Open the {item.kind}</a>
+			<a class="tap" href="/view/{item.id}">Open the {item.kind}</a>
 			{#if item.trashed}<span class="muted"> (it is in the trash)</span>{/if}
 		</figcaption>
 	</figure>
@@ -69,7 +69,7 @@
 			<dd class="quote">“{r.details}”</dd>
 		{/if}
 		<dt>Album</dt>
-		<dd><a href="/album/{item.albumId}">{item.album}</a></dd>
+		<dd><a class="tap" href="/album/{item.albumId}">{item.album}</a></dd>
 		<dt>Added by</dt>
 		<dd>{item.by}</dd>
 		{#if taken}
@@ -80,7 +80,7 @@
 
 	<Note result={form} />
 	{#if form?.conflictId}
-		<p><a href="/view/{form.conflictId}">See the copy that is already there</a></p>
+		<p><a class="tap" href="/view/{form.conflictId}">See the copy that is already there</a></p>
 	{/if}
 
 	{#if r.status === 'pending'}
@@ -118,11 +118,21 @@
 	{/if}
 
 	{#if item.hasOriginal}
-		<p class="original"><a href="/admin/original/{item.id}" download>Download the original file</a></p>
+		<p class="original">
+			<a class="btn" href="/admin/original/{item.id}" download><Icon name="save" /> Download the original file</a>
+		</p>
 	{/if}
 </div>
 
 <style>
+	/* Links on their own get the same 56 px tap height as buttons. */
+	.tap {
+		display: inline-flex;
+		align-items: center;
+		min-height: var(--tap);
+		max-width: 100%;
+		overflow-wrap: anywhere;
+	}
 	.preview {
 		margin: 0 0 1.25rem;
 		overflow: hidden;
@@ -143,7 +153,7 @@
 		color: var(--muted);
 	}
 	figcaption {
-		padding: 0.75rem 1rem;
+		padding: 0.25rem 1rem;
 	}
 	.facts {
 		display: grid;

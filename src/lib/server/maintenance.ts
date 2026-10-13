@@ -5,11 +5,14 @@
  *   - items in the trash for more than 30 days are deleted for good (files, then rows)
  *   - `duplicate` rows older than 24 h are deleted, with any upload/original they still have
  *   - db.backup() → PHOTOS_DIR/.backups/app-YYYY-MM-DD.sqlite; the newest 7 are kept
- *   - .incoming sweep: tus files untouched for 48 h whose token no item uses
+ *   - .incoming sweep: tus files untouched for 48 h whose token no item uses, and FileStore
+ *     <token>.json files the lanes leave behind for items that are done (their token is cleared)
  *   - cache dirs of items that no longer exist (untouched for an hour)
+ *   - saved emails (outbox/*.eml) older than 90 days
  * Hourly (also one minute after start):
  *   - one email to ADMIN_EMAIL listing the items that failed since the last one; none when nothing
- *     new, and at most one an hour (the time of the last one is kept in settings across restarts)
+ *     new, and about one an hour at most (the time of the last one is kept in settings across
+ *     restarts; a few minutes' slack keeps timer and clock drift from skipping a whole hour)
  *   - removal-request emails a restart left unsent
  *
  * Timers are unref'd. Each step logs its own failure and never stops the others.
@@ -19,7 +22,7 @@ import path from 'node:path';
 import { getConfig, publicOrigin } from './config';
 import { getDb } from './db';
 import { backupPath, backupsDir, cacheRoot, incomingDir } from './paths';
-import { sendMail, type MailMessage, type MailResult } from './mail';
+import { pruneOutbox, sendMail, type MailMessage, type MailResult } from './mail';
 import { sendStuckRemovalEmails } from './removal';
 import { ERROR_CODE_LABELS, TRASH_KEEP_MS, deleteItemFiles, purgeTrash, removeInside } from './admin';
 import * as media from './repo/media';
@@ -39,6 +42,11 @@ export const CACHE_ORPHAN_MIN_AGE_MS = HOUR_MS;
 export const BACKUPS_KEPT = 7;
 /** Removal-request emails still `pending` after this long were lost to a restart. */
 const STUCK_EMAIL_MS = 10 * MINUTE_MS;
+/**
+ * The failure email goes at most once per this long. A little under an hour, so the hourly timer
+ * (which fires a minute after the first run, and drifts against the wall clock) never skips an hour.
+ */
+export const DIGEST_MIN_GAP_MS = HOUR_MS - 5 * MINUTE_MS;
 const DIGEST_SETTING = 'failure_digest_at';
 
 const BACKUP_NAME = /^app-\d{4}-\d{2}-\d{2}\.sqlite$/;
@@ -174,12 +182,12 @@ export function failureDigestEmail(to: string, rows: readonly media.MediaRow[], 
 
 /**
  * Emails the admin the items that failed since the last digest. 'skipped' when the last one was
- * under an hour ago, 'nothing' when there is nothing new (or no ADMIN_EMAIL). A failed send keeps
- * the cursor, so the next hour tries again with everything since.
+ * under DIGEST_MIN_GAP_MS ago, 'nothing' when there is nothing new (or no ADMIN_EMAIL). A failed
+ * send keeps the cursor, so the next hour tries again with everything since.
  */
 export async function sendFailureDigest(now: number = Date.now()): Promise<MailResult | 'skipped' | 'nothing'> {
 	const last = getNumber(DIGEST_SETTING);
-	if (last !== undefined && now - last < HOUR_MS) return 'skipped';
+	if (last !== undefined && now - last < DIGEST_MIN_GAP_MS) return 'skipped';
 	const rows = media.listFailed({ sinceMs: last ?? now - HOUR_MS, limit: 500 }).filter((r) => r.updated_at < now);
 	const to = getConfig().adminEmail;
 	if (rows.length === 0 || !to) {
@@ -213,6 +221,7 @@ export async function runDaily(now: number = Date.now()): Promise<void> {
 	await step('database backup', () => backupDatabase(now));
 	await step('abandoned uploads deleted', () => sweepIncoming(now));
 	await step('orphaned previews deleted', () => sweepCache(now));
+	await step('old saved emails deleted', () => pruneOutbox(now));
 }
 
 /** Every hourly step. */

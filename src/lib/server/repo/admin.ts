@@ -5,13 +5,25 @@ import type { MediaRow } from './media';
 /**
  * Items trashed before `cutoff` plus their hidden Live Photo videos (whose rows go with them via
  * ON DELETE CASCADE), so their files can be deleted before the rows.
+ *
+ * Items that intake or a lane is working on right now ('received', 'processing'; or whose Live
+ * Photo video is) are left for a later purge: a lane would otherwise rename its output into
+ * library/ after the row is gone, and nothing would ever delete that file. They settle by
+ * themselves. Trashed 'queued' rows are never claimed (claimForProcessing skips the trash), so
+ * they can go at once.
  */
 export function trashedBefore(cutoff: number): MediaRow[] {
 	return stmt(
-		`SELECT * FROM media
-		 WHERE (deleted_at IS NOT NULL AND deleted_at < ?)
-		    OR live_photo_of IN (SELECT id FROM media WHERE deleted_at IS NOT NULL AND deleted_at < ?)`
-	).all(cutoff, cutoff) as MediaRow[];
+		`WITH gone AS (
+			SELECT id FROM media p
+			 WHERE p.deleted_at IS NOT NULL AND p.deleted_at < ?
+			   AND p.status NOT IN ('received', 'processing')
+			   AND NOT EXISTS (SELECT 1 FROM media v WHERE v.live_photo_of = p.id AND v.status IN ('received', 'processing'))
+			   -- a hidden Live Photo video in the trash with its photo goes when its photo goes
+			   AND NOT EXISTS (SELECT 1 FROM media o WHERE o.id = p.live_photo_of AND o.deleted_at IS NOT NULL)
+		)
+		SELECT * FROM media WHERE id IN (SELECT id FROM gone) OR live_photo_of IN (SELECT id FROM gone)`
+	).all(cutoff) as MediaRow[];
 }
 
 /** Deletes media rows (memories and removal requests go with them). Returns how many. */

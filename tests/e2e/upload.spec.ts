@@ -200,8 +200,9 @@ test.describe('limits', () => {
 	test('an upload is refused with 413 when /photos lacks 2 × its size + 2 GiB', async ({ request, baseURL }) => {
 		const s = fs.statfsSync(path.join(e2eDir(), 'photos'));
 		const free = s.bavail * s.bsize;
-		// Smallest size that no longer fits, if that is still under the 50 GiB cap.
-		const size = Math.floor((free - 2 * GiB) / 2) + 64 * MiB;
+		// A size that misses by 4 GiB (2 × the 2 GiB margin), so other tests freeing space in the
+		// meantime can't make it fit; only headers are sent. It has to stay under the 50 GiB cap.
+		const size = Math.floor((free - 2 * GiB) / 2) + 2 * GiB;
 		test.skip(size > 50 * GiB, `this machine has ${Math.round(free / GiB)} GiB free; can't exceed it below the 50 GiB cap`);
 		const cookie = await signIn(request, baseURL!, 'Aunt Linda');
 		const res = await create(request, baseURL!, cookie, seedAlbum('Low disk'), Math.max(size, 1));

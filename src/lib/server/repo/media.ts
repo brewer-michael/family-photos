@@ -722,9 +722,10 @@ export function requeueInterrupted(maxAttempts: number = MAX_ATTEMPTS): { requeu
 }
 
 // ---------------------------------------------------------------------------
-// Admin: move, trash, purge
+// Admin: move, trash
 // ---------------------------------------------------------------------------
 
+/** A refused move or restore names the item already there as the family sees it (see visibleId()). */
 export type MoveResult =
 	| { ok: true }
 	| { ok: false; reason: 'not_found' | 'album_not_found' }
@@ -733,6 +734,11 @@ export type MoveResult =
 /** An item and its hidden Live Photo video(s): the rows move/trash/restore act on together. */
 function withLivePhotoVideos(row: MediaRow): MediaRow[] {
 	return [row, ...(stmt('SELECT * FROM media WHERE live_photo_of = ?').all(row.id) as MediaRow[])];
+}
+
+/** The item the family sees for a row: the photo for a hidden Live Photo video, else the row itself. */
+function visibleId(row: MediaRow): string {
+	return row.live_photo_of ?? row.id;
 }
 
 /**
@@ -759,7 +765,7 @@ export function move(id: string, albumId: number): MoveResult {
 		if (!getAlbum(albumId)) return { ok: false, reason: 'album_not_found' };
 		if (row.album_id === albumId) return { ok: true };
 		const dup = conflictIn(albumId, withLivePhotoVideos(row).filter((r) => r.deleted_at === null));
-		if (dup) return { ok: false, reason: 'duplicate', conflictId: dup.id };
+		if (dup) return { ok: false, reason: 'duplicate', conflictId: visibleId(dup) };
 		const now = Date.now();
 		stmt('UPDATE media SET album_id = ?, updated_at = ? WHERE id = ? OR live_photo_of = ?').run(albumId, now, id, id);
 		touchAlbum(albumId, now);
@@ -792,7 +798,7 @@ export function restore(id: string): RestoreResult {
 		const row = getById(id);
 		if (!row || row.deleted_at === null) return { ok: false, reason: 'not_found' };
 		const dup = conflictIn(row.album_id, withLivePhotoVideos(row).filter((r) => r.deleted_at !== null));
-		if (dup) return { ok: false, reason: 'duplicate', conflictId: dup.id };
+		if (dup) return { ok: false, reason: 'duplicate', conflictId: visibleId(dup) };
 		stmt(
 			`UPDATE media SET deleted_at = NULL, deleted_reason = NULL, updated_at = ?
 			 WHERE (id = ? OR live_photo_of = ?) AND deleted_at IS NOT NULL`
@@ -806,27 +812,6 @@ export function listTrash(): MediaRow[] {
 	return stmt(
 		`SELECT * FROM media WHERE deleted_at IS NOT NULL AND live_photo_of IS NULL ORDER BY deleted_at DESC`
 	).all() as MediaRow[];
-}
-
-/**
- * Permanently deletes rows trashed more than `ms` ago (plus their Live Photo videos) and
- * returns them so the caller can delete library/, originals/ and cache/ files.
- */
-export function purgeTrashOlderThan(ms: number, now: number = Date.now()): MediaRow[] {
-	const cutoff = now - ms;
-	return tx(() => {
-		const rows = stmt(
-			`SELECT * FROM media
-			 WHERE (deleted_at IS NOT NULL AND deleted_at < ?)
-			    OR live_photo_of IN (SELECT id FROM media WHERE deleted_at IS NOT NULL AND deleted_at < ?)`
-		).all(cutoff, cutoff) as MediaRow[];
-		if (rows.length > 0) {
-			stmt('DELETE FROM media WHERE id IN (SELECT value FROM json_each(?))').run(
-				JSON.stringify(rows.map((r) => r.id))
-			);
-		}
-		return rows;
-	});
 }
 
 /**

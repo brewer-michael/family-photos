@@ -1,6 +1,6 @@
 /**
  * Shared facts about the photo fixtures: where they live, the colours they were built from and
- * the metadata written into them. Imported by the generator (tests/fixtures/photo/generate.mjs,
+ * the metadata written into them. Imported by the generator (tests/fixtures/photo/generate.ts,
  * run directly by Node, so only node:* imports and erasable TypeScript here) and by the tests.
  */
 import path from 'node:path';

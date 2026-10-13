@@ -1,12 +1,13 @@
 /**
  * Camera RAW (DNG/ProRAW, CR2, CR3, NEF, ARW, RAF, ORF, RW2, …): the canonical file is the
  * largest embedded JPEG preview, not re-encoded, with the RAW's tags copied in (including
- * Orientation), as in docs/media-pipeline.md §2 "Other decoders". A RAW whose best preview is
- * shorter than 1600 px on its long edge fails as unsupported (the source is kept for the admin).
+ * Orientation; metadata.ts copyRawTags, called by the photo lane), as in docs/media-pipeline.md
+ * §2 "Other decoders". A RAW whose best preview is shorter than 1600 px on its long edge fails
+ * as unsupported (the source is kept for the admin).
  */
 import path from 'node:path';
 import sharp from 'sharp';
-import { MediaError, errorDetail } from '#lib/shared/errors';
+import { MediaError } from '#lib/shared/errors';
 import { exiftool } from '../exiftool';
 
 export const RAW_MIN_LONG_EDGE = 1600;
@@ -17,7 +18,7 @@ export const RAW_FILE_TYPES = new Set([
 	'NEF', 'NRW', 'ORF', 'ORI', 'PEF', 'RAF', 'RW2', 'RWL', 'SR2', 'SRF', 'SRW'
 ]);
 
-/** Extracts the largest usable preview into `dir`, copies the RAW's tags into it and returns its path. */
+/** Extracts the largest usable preview into `dir` and returns its path (no tags copied yet). */
 export async function rawPreview(src: string, dir: string): Promise<string> {
 	const et = exiftool();
 	const candidates: { file: string; pixels: number; longEdge: number }[] = [];
@@ -39,11 +40,6 @@ export async function rawPreview(src: string, dir: string): Promise<string> {
 	if (!best) {
 		const sizes = candidates.map((c) => c.longEdge).join(', ') || 'none';
 		throw new MediaError('unsupported', `RAW has no embedded JPEG preview of at least ${RAW_MIN_LONG_EDGE} px (found: ${sizes})`);
-	}
-	try {
-		await et.write(best.file, {}, { writeArgs: ['-overwrite_original', '-TagsFromFile', src, '-all:all'], ignoreMinorErrors: true });
-	} catch (e) {
-		throw new MediaError('retryable', `exiftool could not copy the RAW's tags: ${errorDetail(e, 500)}`);
 	}
 	return best.file;
 }

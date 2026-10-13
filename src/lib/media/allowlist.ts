@@ -61,6 +61,13 @@ export function extensionOf(name: string): string {
 	return m ? m[1].toLowerCase() : '';
 }
 
+/** "IMG_1234.HEIC" → "IMG_1234", the way tiles name a file (any folder part dropped; ".hidden" stays). */
+export function withoutExtension(name: string): string {
+	const base = name.replace(/^.*[\\/]/, '');
+	const dot = base.lastIndexOf('.');
+	return dot > 0 ? base.slice(0, dot) : base;
+}
+
 /** Documents, archives, audio, apps and SVG: things nobody means to add as a photo or video. */
 const NOT_MEDIA_EXTS = new Set([
 	'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'odt', 'ods', 'odp', 'rtf', 'txt', 'md', 'csv',

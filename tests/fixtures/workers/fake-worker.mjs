@@ -9,7 +9,10 @@
 //   stubborn        ignores SIGTERM and `shutdown`, never answers (needs SIGKILL)
 //   ready-then-fail commits, then reports failed/retryable
 //   ready-then-crash commits, then exits with code 1
+//   abortable       never answers until `shutdown`, then reports failed/retryable (like the real
+//                   lane, whose running job is aborted) and exits
 //
+// With FAKE_WORKER_HELLO=never the lane starts but never says hello (a hung startup).
 // Every event is appended as a JSON line to FAKE_WORKER_LOG.
 import fs from 'node:fs';
 import os from 'node:os';
@@ -23,6 +26,8 @@ if (!lane || !process.send || !logFile || !configDir) process.exit(2);
 
 const db = new Database(path.join(configDir, 'app.sqlite'), { timeout: 5000 });
 let stubborn = false;
+/** @type {string | null} An `abortable` job in progress. */
+let abortable = null;
 
 /** @param {Record<string, unknown>} event */
 function log(event) {
@@ -96,6 +101,9 @@ async function runJob(id) {
 			markReady(id);
 			process.exit(1);
 			return;
+		case 'abortable':
+			abortable = id;
+			return;
 		default: // 'hang'
 			return;
 	}
@@ -104,7 +112,11 @@ async function runJob(id) {
 process.on('message', (/** @type {any} */ msg) => {
 	if (msg?.type === 'shutdown') {
 		log({ type: stubborn ? 'ignored-shutdown' : 'shutdown' });
-		if (!stubborn) process.exit(0);
+		if (abortable) {
+			process.send?.({ type: 'done', id: abortable, outcome: 'failed', errorCode: 'retryable', detail: 'ffmpeg aborted' }, () =>
+				process.exit(0)
+			);
+		} else if (!stubborn) process.exit(0);
 	}
 	if (msg?.type === 'job') void runJob(String(msg.id));
 });
@@ -117,4 +129,4 @@ log({
 	uvThreadpoolSize: process.env.UV_THREADPOOL_SIZE,
 	niceness: os.getPriority()
 });
-send({ type: 'hello', lane, pid: process.pid });
+if (process.env.FAKE_WORKER_HELLO !== 'never') send({ type: 'hello', lane, pid: process.pid });

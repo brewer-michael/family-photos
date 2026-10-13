@@ -2,6 +2,8 @@
 	Uploader: pick photos and videos, watch them go up and get ready (docs/media-pipeline.md §6).
 	One tile per file straight away; "Sending 3 of 12…" with a progress bar while sending (the
 	screen is kept awake); then each tile follows the server ("Getting it ready…", "✓ Added", …).
+	With `clearOnDone` (a page that lists unfinished uploads itself), a finished batch collapses to
+	one line ("Done! 3 added.") and only tiles the page can't show stay (not sent, not a photo).
 	Copy never mentions file formats. State lives in #lib/client/uploader.svelte.
 -->
 <script lang="ts">
@@ -11,17 +13,22 @@
 	import Icon from './Icon.svelte';
 	import { BASE_ACCEPT, acceptFor, isIOS } from '#lib/media/allowlist';
 	import { statusLine, type StatusLine } from '#lib/client/status';
-	import { NOT_MEDIA_TEXT, UploadBatch, type UploadItem } from '#lib/client/uploader.svelte';
+	import { NOT_MEDIA_TEXT, UploadBatch, summaryText, type UploadItem } from '#lib/client/uploader.svelte';
 
 	interface Props {
 		albumId: number;
 		/** Called when every file in the current batch has finished (ready, duplicate or failed). */
 		ondone?: () => void;
+		/**
+		 * After `ondone`, collapse the sent files to a one-line summary, because the page shows them
+		 * itself (e.g. failed ones in its own list). Default false: the tiles stay.
+		 */
+		clearOnDone?: boolean;
 	}
 
-	let { albumId, ondone }: Props = $props();
+	let { albumId, ondone, clearOnDone = false }: Props = $props();
 
-	const batch = new UploadBatch({ albumId: () => albumId, ondone: () => ondone?.() });
+	const batch = new UploadBatch({ albumId: () => albumId, ondone: () => ondone?.(), clearOnDone: () => clearOnDone });
 	const adminName = $derived(typeof page.data.adminName === 'string' ? page.data.adminName : 'the site admin');
 
 	let input = $state<HTMLInputElement>();
@@ -70,7 +77,7 @@
 			case 'error':
 				return { text: item.problem ?? '', tone: 'retry' };
 			case 'sent': {
-				if (!item.mediaId) return { text: '✓ Sent', tone: 'ok' };
+				if (!item.mediaId || item.gone) return { text: '✓ Sent', tone: 'ok' };
 				const s = item.server;
 				return statusLine(
 					{
@@ -108,9 +115,11 @@
 	const announcement = $derived(
 		batch.sending
 			? `Sending ${batch.current} of ${batch.toSend.length}.`
-			: batch.toSend.length > 0
-				? `Done! ${finishedText}`
-				: ''
+			: batch.summary
+				? summaryText(batch.summary)
+				: batch.toSend.length > 0
+					? `Done! ${finishedText}`
+					: ''
 	);
 </script>
 
@@ -131,7 +140,7 @@
 	/>
 	<button type="button" class="btn btn-primary btn-big btn-block" onclick={choose}>
 		<Icon name="plus" />
-		{batch.items.length > 0 ? 'Add more photos & videos' : 'Choose photos & videos'}
+		{batch.items.length > 0 || batch.summary ? 'Add more photos & videos' : 'Choose photos & videos'}
 	</button>
 
 	{#if batch.gap}
@@ -143,20 +152,25 @@
 	<!-- One polite announcement for the whole batch (the tiles themselves stay quiet). -->
 	<p class="visually-hidden" role="status">{announcement}</p>
 
-	{#if batch.items.length > 0}
-		{#if batch.sending}
-			<div>
-				<p class="headline">Sending {batch.current} of {batch.toSend.length}…</p>
-				<progress class="bar" max={batch.bytesTotal || 1} value={batch.bytesSent} aria-label="Sent so far"></progress>
-				<p class="keep"><Icon name="phone" /> Keep this screen open until it says Done.</p>
-			</div>
-		{:else if batch.toSend.length > 0}
-			<div>
-				<p class="headline ok"><Icon name="check" /> Done!</p>
-				<p class="keep">{finishedText}</p>
-			</div>
-		{/if}
+	{#if batch.sending}
+		<div>
+			<p class="headline">Sending {batch.current} of {batch.toSend.length}…</p>
+			<progress class="bar" max={batch.bytesTotal || 1} value={batch.bytesSent} aria-label="Sent so far"></progress>
+			<p class="keep"><Icon name="phone" /> Keep this screen open until it says Done.</p>
+		</div>
+	{:else if batch.summary}
+		<p class="headline summary" class:ok={batch.summary.failed === 0}>
+			{#if batch.summary.failed === 0}<Icon name="check" />{/if}
+			{summaryText(batch.summary)}
+		</p>
+	{:else if batch.toSend.length > 0}
+		<div>
+			<p class="headline ok"><Icon name="check" /> Done!</p>
+			<p class="keep">{finishedText}</p>
+		</div>
+	{/if}
 
+	{#if batch.items.length > 0}
 		<ul class="tiles" aria-label="Your photos and videos">
 			{#each batch.items as item (item.key)}
 				{@const line = tileLine(item)}
@@ -210,6 +224,9 @@
 		align-items: center;
 		gap: 0.5rem;
 		color: var(--ok);
+	}
+	.headline.summary {
+		margin: 0;
 	}
 	.keep {
 		display: flex;

@@ -32,6 +32,10 @@ export interface SeedItem {
 	errorCode?: 'retryable' | 'unsupported';
 	/** Trashed at this time (ms). */
 	deletedAt?: number;
+	/** A moving picture (photos only): kept as a GIF, or an APNG kept as a PNG. */
+	moving?: 'gif' | 'apng';
+	/** The uploaded file's bytes, archived for the admin in originals/ (source_kept = 1). */
+	original?: Buffer;
 }
 
 function db(): Database.Database {
@@ -42,6 +46,7 @@ function db(): Database.Database {
 
 const shard = (id: string) => id.slice(-2);
 const libraryFile = (id: string, ext: string) => path.join(e2eDir(), 'photos', 'library', shard(id), `${id}.${ext}`);
+const originalFile = (id: string, ext: string) => path.join(e2eDir(), 'photos', 'originals', shard(id), `${id}.${ext}`);
 const cacheFile = (id: string, variant: string) => path.join(e2eDir(), 'config', 'cache', shard(id), id, `${variant}.webp`);
 
 function write(file: string, bytes: Buffer): void {
@@ -85,12 +90,36 @@ const takenMsOf = (takenAt: string) => {
 const pictureOf = (item: Pick<SeedItem, 'color'>) =>
 	sharp({ create: { width: 640, height: 480, channels: 3, background: item.color ?? '#c96f3b' } });
 
+type FileKind = Pick<SeedItem, 'kind' | 'moving'>;
+
+const canonicalExt = (item: FileKind) =>
+	item.kind === 'video' ? 'mp4' : item.moving === 'gif' ? 'gif' : item.moving === 'apng' ? 'png' : 'jpg';
+
+/** What detection would have said about the upload (the viewer goes by it for APNGs). */
+const sourceType = (item: FileKind): [mime: string, ext: string] =>
+	item.kind === 'video'
+		? ['video/quicktime', 'mov']
+		: item.moving === 'gif'
+			? ['image/gif', 'gif']
+			: item.moving === 'apng'
+				? ['image/apng', 'png']
+				: ['image/heic', 'heic'];
+
 /** Writes a ready item's canonical file and thumbnails; returns the canonical file's size. */
-async function writeReadyFiles(id: string, item: Pick<SeedItem, 'kind' | 'color'>): Promise<number> {
+async function writeReadyFiles(id: string, item: Pick<SeedItem, 'kind' | 'moving' | 'color'>): Promise<number> {
 	const kind = item.kind ?? 'photo';
 	const picture = pictureOf(item);
-	const canonical = kind === 'video' ? sampleVideo() : await picture.clone().jpeg({ quality: 80 }).toBuffer();
-	write(libraryFile(id, kind === 'video' ? 'mp4' : 'jpg'), canonical);
+	const ext = canonicalExt(item);
+	// A one-frame stand-in for the moving ones: what's tested is which file the viewer shows.
+	const canonical =
+		ext === 'mp4'
+			? sampleVideo()
+			: ext === 'gif'
+				? await picture.clone().gif().toBuffer()
+				: ext === 'png'
+					? await picture.clone().png().toBuffer()
+					: await picture.clone().jpeg({ quality: 80 }).toBuffer();
+	write(libraryFile(id, ext), canonical);
 	write(cacheFile(id, 'thumb'), await picture.clone().resize(480, 360).webp().toBuffer());
 	if (kind === 'photo') write(cacheFile(id, 'display'), await picture.clone().webp().toBuffer());
 	return canonical.length;
@@ -102,8 +131,11 @@ export async function seedMedia(albumId: number, item: SeedItem): Promise<string
 	const kind = item.kind ?? 'photo';
 	const status = item.status ?? 'ready';
 	const ready = status === 'ready';
-	const ext = kind === 'video' ? 'mp4' : 'jpg';
+	const ext = canonicalExt(item);
+	const [sourceMime, sourceExt] = sourceType(item);
 	const size = ready ? await writeReadyFiles(id, item) : 1000;
+	const kept = ready && item.original !== undefined;
+	if (kept) write(originalFile(id, sourceExt), item.original!);
 	if (kind === 'video') write(cacheFile(id, 'poster'), await pictureOf(item).webp().toBuffer());
 
 	const d = db();
@@ -111,10 +143,10 @@ export async function seedMedia(albumId: number, item: SeedItem): Promise<string
 		const now = Date.now();
 		d.prepare(
 			`INSERT INTO media(id, upload_token, album_id, uploaded_by_name, uploaded_by_device, kind, status, attempts,
-				error_code, pipeline_version, source_name, source_mime, source_ext, source_size, source_sha256, conversion,
-				canonical_ext, canonical_size, width, height, duration_ms, taken_at, taken_ms, live_photo_of,
+				error_code, pipeline_version, source_name, source_mime, source_ext, source_size, source_sha256, source_kept,
+				conversion, canonical_ext, canonical_size, width, height, duration_ms, taken_at, taken_ms, live_photo_of,
 				created_at, updated_at, deleted_at, deleted_reason)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			 VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		).run(
 			id,
 			ready ? null : randomBytes(16).toString('base64url'),
@@ -126,11 +158,12 @@ export async function seedMedia(albumId: number, item: SeedItem): Promise<string
 			status === 'failed' ? (item.errorCode ?? 'unsupported') : null,
 			ready ? 1 : 0,
 			item.name,
-			kind === 'video' ? 'video/quicktime' : 'image/heic',
-			kind === 'video' ? 'mov' : 'heic',
-			size,
+			sourceMime,
+			sourceExt,
+			kept ? item.original!.length : size,
 			randomBytes(32).toString('hex'),
-			ready ? 'transcode' : null,
+			kept ? 1 : 0,
+			ready ? (item.moving ? 'none' : 'transcode') : null,
 			ready ? ext : null,
 			ready ? size : null,
 			ready ? 640 : null,
@@ -152,7 +185,7 @@ export async function seedMedia(albumId: number, item: SeedItem): Promise<string
 }
 
 /** Finishes an unfinished seeded photo or video, as the worker would: files written, then ready. */
-export async function markSeededReady(id: string, item: Pick<SeedItem, 'kind' | 'takenAt' | 'color'>): Promise<void> {
+export async function markSeededReady(id: string, item: Pick<SeedItem, 'kind' | 'moving' | 'takenAt' | 'color'>): Promise<void> {
 	const kind = item.kind ?? 'photo';
 	const size = await writeReadyFiles(id, item);
 	const d = db();
@@ -162,7 +195,7 @@ export async function markSeededReady(id: string, item: Pick<SeedItem, 'kind' | 
 			`UPDATE media SET status = 'ready', error_code = NULL, pipeline_version = 1, conversion = 'transcode',
 				canonical_ext = ?, canonical_size = ?, width = 640, height = 480, duration_ms = ?, taken_at = ?, taken_ms = ?,
 				updated_at = ? WHERE id = ?`
-		).run(kind === 'video' ? 'mp4' : 'jpg', size, kind === 'video' ? 1000 : null, item.takenAt, takenMsOf(item.takenAt), now, id);
+		).run(canonicalExt(item), size, kind === 'video' ? 1000 : null, item.takenAt, takenMsOf(item.takenAt), now, id);
 		d.prepare('UPDATE albums SET updated_at = ? WHERE id = (SELECT album_id FROM media WHERE id = ?)').run(now, id);
 	} finally {
 		d.close();

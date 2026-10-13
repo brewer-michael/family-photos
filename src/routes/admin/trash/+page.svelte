@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { enhance } from '$app/forms';
+	import { enhance, type SubmitFunction } from '$app/forms';
 	import type { PageProps } from './$types';
 	import Icon from '#lib/components/Icon.svelte';
 	import AdminIcon from '#lib/components/admin/AdminIcon.svelte';
@@ -12,6 +12,21 @@
 	let { data, form }: PageProps = $props();
 
 	const left = (days: number) => (days === 0 ? 'Deleted for good today' : `Deleted for good in ${days} ${days === 1 ? 'day' : 'days'}`);
+
+	/** Items being restored right now: their button is disabled, so a double tap does it once. */
+	let busy = $state<Record<string, boolean>>({});
+	const restoring =
+		(id: string): SubmitFunction =>
+		() => {
+			busy[id] = true;
+			return async ({ update }) => {
+				try {
+					await update();
+				} finally {
+					busy[id] = false;
+				}
+			};
+		};
 </script>
 
 <svelte:head>
@@ -25,7 +40,7 @@
 
 	<Note result={form} />
 	{#if form?.conflictId}
-		<p><a href="/view/{form.conflictId}">See the copy that is in the album</a></p>
+		<p><a class="tap" href="/view/{form.conflictId}">See the copy that is in the album</a></p>
 	{/if}
 
 	{#if data.items.length === 0}
@@ -37,15 +52,17 @@
 					<Thumb src={t.thumbUrl} kind={t.kind} alt={t.name} />
 					<div class="text">
 						<p class="lead">
-							{#if t.ready}<a href="/view/{t.id}">{t.name}</a>{:else}<strong>{t.name}</strong>{/if}
+							{#if t.ready}<a class="tap" href="/view/{t.id}">{t.name}</a>{:else}<strong>{t.name}</strong>{/if}
 						</p>
 						<p>Added by {t.by}{t.album ? ` to “${t.album}”` : ''}</p>
 						{#if t.reason}<p class="muted">{t.reason}</p>{/if}
 						<p class="muted small">In the trash since {formatDay(t.trashedAt, data.timeZone)} · {left(t.daysLeft)}</p>
 					</div>
-					<form method="POST" action="?/restore" use:enhance>
+					<form method="POST" action="?/restore" use:enhance={restoring(t.id)}>
 						<input type="hidden" name="id" value={t.id} />
-						<button type="submit" class="btn"><AdminIcon name="undo" /> Restore<span class="visually-hidden">: {t.name}</span></button>
+						<button type="submit" class="btn" disabled={busy[t.id]}>
+							<AdminIcon name="undo" /> Restore<span class="visually-hidden">: {t.name}</span>
+						</button>
 					</form>
 				</li>
 			{/each}
@@ -64,6 +81,14 @@
 </div>
 
 <style>
+	/* Links on their own get the same 56 px tap height as buttons. */
+	.tap {
+		display: inline-flex;
+		align-items: center;
+		min-height: var(--tap);
+		max-width: 100%;
+		overflow-wrap: anywhere;
+	}
 	.rows {
 		list-style: none;
 		margin: 0;

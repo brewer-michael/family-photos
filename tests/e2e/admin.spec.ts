@@ -14,7 +14,7 @@ import AxeBuilder from '@axe-core/playwright';
 import Database from 'better-sqlite3';
 import { simpleParser, type ParsedMail } from 'mailparser';
 import { monotonicFactory } from 'ulid';
-import { expect, test, type Browser, type Page } from '@playwright/test';
+import { expect, test, type Browser, type Locator, type Page } from '@playwright/test';
 import { joinToken } from '../../src/lib/server/crypto';
 import { ADMIN_PASSWORD, FAMILY_CODE, adminLogin, e2eDir, login } from './helpers';
 import { readRows, seedAlbum, seedMedia } from './seed';
@@ -251,6 +251,43 @@ test.describe('admin', () => {
 		const cards = await admin.locator('article.qr-card').count();
 		expect(await admin.locator('article.qr-card svg').count()).toBe(cards);
 		if (isMobile) expect(await seriousViolations(admin), 'qr').toEqual([]);
+		else {
+			// Printed one card per page: exactly one sheet per card, no blank sheet at the end.
+			const pdf = (await admin.pdf({ format: 'A4' })).toString('latin1');
+			expect(pdf.match(/\/Type\s*\/Page\b(?!s)/g)?.length).toBe(cards);
+		}
+		await admin.context().close();
+	});
+
+	test('standalone links are as easy to tap as buttons', async ({ browser, baseURL }) => {
+		const title = `Tap ${unique()}`;
+		const albumId = seedAlbum(title);
+		const name = `IMG_${unique()}.HEIC`;
+		const id = await seedMedia(albumId, { name, takenAt: '2024-01-01T00:00:00' });
+		const [{ id: rid }] = readRows<{ id: number }>(
+			`INSERT INTO deletion_requests(media_id, requester_name, requester_device, reason, status, email_status, created_at, updated_at)
+			 VALUES (?, 'Cousin Sam', 'seed-device-request00', 'in_it', 'pending', 'saved', ?, ?) RETURNING id`,
+			id,
+			Date.now(),
+			Date.now()
+		);
+		const admin = await adminPage(browser, baseURL!);
+		const tall = async (link: Locator) => expect((await link.boundingBox())?.height ?? 0).toBeGreaterThanOrEqual(56);
+		await tall(admin.locator('#albums').getByRole('link', { name: title, exact: true }));
+		await tall(admin.locator('#storage').getByRole('link', { name: /items?$/ }));
+		await admin.goto(`/admin/requests/${rid}`);
+		await tall(admin.getByRole('link', { name: 'Open the photo' }));
+		await tall(admin.getByRole('link', { name: title, exact: true }));
+		await admin.context().close();
+	});
+
+	test('"Check again" runs the media tools check', async ({ browser, baseURL, isMobile }) => {
+		test.skip(isMobile, 'run once, on the desktop project');
+		const admin = await adminPage(browser, baseURL!);
+		const tools = admin.locator('#tools');
+		await tools.getByRole('button', { name: 'Check again' }).click();
+		await expect(tools.getByRole('status')).toContainText('Checked again', { timeout: 30_000 });
+		await expect(tools.getByText(/^Versions \(checked /)).toBeVisible();
 		await admin.context().close();
 	});
 });
@@ -446,7 +483,7 @@ test.describe('admin actions that affect everyone (private server)', () => {
 		await storage.locator('summary', { hasText: 'Delete all archived originals…' }).click();
 		await expect(storage.getByText('Uploads that didn\'t work keep theirs')).toBeVisible();
 		await storage.getByRole('button', { name: 'Yes, delete them' }).click();
-		await expect(storage.getByRole('status')).toContainText('archived originals and freed');
+		await expect(storage.getByRole('status')).toContainText(/archived originals? and freed/);
 		expect(fs.existsSync(filesOf(id).original)).toBe(false);
 		expect(fs.existsSync(filesOf(id).library)).toBe(true);
 		expect(query('SELECT source_kept FROM media WHERE id = ?', id)).toEqual([{ source_kept: 0 }]);

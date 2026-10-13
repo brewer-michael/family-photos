@@ -46,6 +46,13 @@
 			{/snippet}
 		</Viewer>
 
+		{#if data.originalHref}
+			<p class="original">
+				<a class="btn" href={data.originalHref} download><Icon name="save" /> Download the original file</a>
+				<span class="muted">Only you, the admin, see this. It is the {kindWord} exactly as it was sent.</span>
+			</p>
+		{/if}
+
 		<MemoryList
 			memories={data.memories}
 			editingId={data.editingId}
@@ -68,5 +75,12 @@
 		min-height: var(--tap);
 		margin-bottom: 0.5rem;
 		font-weight: 600;
+	}
+	.original {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 0.5rem 1rem;
+		margin-top: 1.5rem;
 	}
 </style>

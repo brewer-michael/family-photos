@@ -79,7 +79,11 @@ export const actions: Actions = {
 		return done('request', 'Removed. It stays in the trash for 30 days in case you change your mind.');
 	},
 
-	/** To another album (refused when that album already has the same photo or video). */
+	/**
+	 * To another album (refused when that album already has the same photo or video). Other pending
+	 * "Wrong album" requests for the item are approved with it; requests for other reasons stay
+	 * pending, since moving it doesn't answer them.
+	 */
 	move: async ({ params, request, locals }) => {
 		requireAdmin(locals);
 		const found = pending(params.id);
@@ -90,7 +94,11 @@ export const actions: Actions = {
 		if (!target) return problem(400, 'request', 'Please pick an album.');
 		const moved = tx(() => {
 			const m = media.move(item.id, target.id);
-			if (m.ok) requests.resolve(r.id, 'approved', 'moved');
+			if (!m.ok) return m;
+			requests.resolve(r.id, 'approved', 'moved');
+			for (const other of requests.listPending()) {
+				if (other.media_id === item.id && other.reason === 'wrong_album') requests.resolve(other.id, 'approved', 'moved');
+			}
 			return m;
 		});
 		if (moved.ok) return done('request', `Moved to “${target.title}”.`);

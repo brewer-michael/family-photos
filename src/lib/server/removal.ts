@@ -9,8 +9,10 @@
  *
  * The outcome is recorded as email_status sent/saved/failed (+ email_error); the admin can resend.
  * The JPEG is made by ffmpeg from the cached display.webp (photos) or poster.webp (videos), so sharp
- * never loads in the web process. Links in the email only lead to pages: removing, moving and
- * dismissing are POST-only, so link scanners can't act on them.
+ * never loads in the web process; at most THUMB_CONCURRENCY of those run at once (anyone with the
+ * family code can send requests, and a fresh device id is just a cleared cookie away). Links in the
+ * email only lead to pages: removing, moving and dismissing are POST-only, so link scanners can't
+ * act on them.
  */
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
@@ -43,6 +45,8 @@ export const THUMB_CID = 'thumb@family-photos';
 /** Longest edge of the inline picture. */
 export const THUMB_MAX_PX = 600;
 const THUMB_TIMEOUT_MS = 30_000;
+/** ffmpeg processes for email pictures running at once; the rest wait their turn. */
+export const THUMB_CONCURRENCY = 2;
 
 /** The server's time zone (Unraid sets TZ), as on the pages. */
 const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -140,6 +144,21 @@ function ffmpegJpeg(src: string): Promise<Buffer> {
 	});
 }
 
+let thumbsRunning = 0;
+const thumbsWaiting: (() => void)[] = [];
+
+/** Runs `fn` once fewer than THUMB_CONCURRENCY others are running (first come, first served). */
+async function inTurn<T>(fn: () => Promise<T>): Promise<T> {
+	while (thumbsRunning >= THUMB_CONCURRENCY) await new Promise<void>((resolve) => thumbsWaiting.push(resolve));
+	thumbsRunning++;
+	try {
+		return await fn();
+	} finally {
+		thumbsRunning--;
+		thumbsWaiting.shift()?.();
+	}
+}
+
 /**
  * A ≤ 600 px JPEG of the item from its cached preview (display.webp for photos, poster.webp for
  * videos, else thumb.webp), or null when there is none or ffmpeg fails; the email goes without it.
@@ -149,7 +168,7 @@ export async function emailThumbnail(id: string, kind: Kind | null): Promise<Buf
 	const src = order.map((v) => cacheFile(id, v)).find((f) => fs.existsSync(f));
 	if (!src) return null;
 	try {
-		return await ffmpegJpeg(src);
+		return await inTurn(() => ffmpegJpeg(src));
 	} catch (e) {
 		console.warn(`[removal] no picture for ${id}: ${(e as Error).message}`);
 		return null;

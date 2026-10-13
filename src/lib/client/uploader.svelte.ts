@@ -8,16 +8,14 @@
  * empty files) is skipped. tus-js-client is loaded on first use, in the browser only.
  */
 import type { DetailedError, Upload } from 'tus-js-client';
-import { isIOS, isObviouslyNotMedia, looksLikeVideo } from '#lib/media/allowlist';
-import { isFinished, POLL_HIDDEN_MS, POLL_VISIBLE_MS, retryUpload } from './status';
+import { isIOS, isObviouslyNotMedia, looksLikeVideo, withoutExtension } from '#lib/media/allowlist';
+import { isFinished, POLL_HIDDEN_MS, POLL_VISIBLE_MS, retryUpload, STATUS_BATCH } from './status';
 import type { MediaStatusDTO } from '#lib/shared/media-types';
 
 /** 50 MiB: under Cloudflare's 100 MB request limit (and BODY_SIZE_LIMIT=64M). */
 export const CHUNK_SIZE = 50 * 1024 * 1024;
 export const RETRY_DELAYS = [0, 1000, 3000, 5000, 10_000, 20_000, 60_000];
 export const PARALLEL_UPLOADS = 2;
-/** /api/status answers at most this many ids per request. */
-const STATUS_BATCH = 100;
 const PREVIEW_WIDTH = 240;
 /** iOS: one preview at a time, small files only (memory); elsewhere a few at once. */
 const PREVIEW_LIMITS = {
@@ -43,6 +41,8 @@ export class UploadItem {
 	readonly key = nextKey++;
 	readonly file: File;
 	readonly video: boolean;
+	/** The album it goes to, fixed when it was picked. */
+	readonly albumId: number;
 	stage = $state<Stage>('waiting');
 	/** Bytes sent so far. */
 	sent = $state(0);
@@ -56,22 +56,29 @@ export class UploadItem {
 	problem = $state<string | null>(null);
 	/** "Try again" in flight. */
 	retrying = $state(false);
+	/**
+	 * /api/status stopped answering for it (the admin removed it, or this browser's sign-in
+	 * changed): there is nothing more to follow, so the tile stays at "✓ Sent".
+	 */
+	gone = $state(false);
 	upload: Upload | null = null;
 
-	constructor(file: File) {
+	constructor(file: File, albumId: number) {
 		this.file = file;
+		this.albumId = albumId;
 		this.video = looksLikeVideo(file);
 	}
 
+	/** The picked file's name without its extension ("IMG_1234"), as on the album page. */
 	get name(): string {
-		return this.file.name || (this.video ? 'Video' : 'Photo');
+		return withoutExtension(this.file.name).trim() || (this.video ? 'Video' : 'Photo');
 	}
 
 	/** Nothing more will happen without the user doing something. */
 	get settled(): boolean {
 		if (this.stage === 'skipped' || this.stage === 'error') return true;
 		if (this.stage !== 'sent') return false;
-		return this.mediaId === null || (this.server !== null && isFinished(this.server.status));
+		return this.mediaId === null || this.gone || (this.server !== null && isFinished(this.server.status));
 	}
 
 	/** "Try again" applies: the upload failed, or the server reports a retryable failure. */
@@ -99,12 +106,44 @@ export interface UploadBatchOptions {
 	albumId: () => number;
 	/** Every file of the batch has settled and at least one was sent. */
 	ondone?: () => void;
+	/**
+	 * After `ondone`, hand the sent files over to the page (which lists them itself): their tiles
+	 * make way for a one-line `summary`. Tiles only the uploader knows about (not sent, or skipped)
+	 * stay.
+	 */
+	clearOnDone?: () => boolean;
+}
+
+/** What became of the files handed over after a batch finished (UploadBatchOptions.clearOnDone). */
+export interface DoneSummary {
+	added: number;
+	/** Already in this album. */
+	already: number;
+	failed: number;
+	/** Sent, with nothing more known about them. */
+	sent: number;
+}
+
+/** "Done! 3 added." / "Done! 2 added. 1 couldn't be added — see below." / "1 couldn't be added — see below." */
+export function summaryText(s: DoneSummary): string {
+	const ok = [
+		...(s.added ? [`${s.added} added`] : []),
+		...(s.already ? [`${s.already} already in this album`] : []),
+		...(s.sent ? [`${s.sent} sent`] : [])
+	];
+	const lines = [
+		...(ok.length > 0 ? [`Done! ${ok.join(' · ')}.`] : []),
+		...(s.failed ? [`${s.failed} couldn't be added — see below.`] : [])
+	];
+	return lines.join(' ') || 'Done!';
 }
 
 export class UploadBatch {
 	items = $state<UploadItem[]>([]);
 	/** iOS: the picker closed but its files haven't arrived yet. */
 	gap = $state(false);
+	/** With clearOnDone: what became of the files handed over to the page since the batch began. */
+	summary = $state<DoneSummary | null>(null);
 
 	/** Files that go to the server in this batch (not skipped). */
 	readonly toSend = $derived(this.items.filter((i) => i.stage !== 'skipped'));
@@ -127,6 +166,8 @@ export class UploadBatch {
 	#previewActive = 0;
 	#previewCount = 0;
 	#wakeLock: WakeLockSentinel | null = null;
+	/** A wake lock request is on its way (so overlapping calls don't take two). */
+	#wakeLockPending = false;
 	#picking = false;
 	#gapTimer: ReturnType<typeof setTimeout> | null = null;
 	#destroyed = false;
@@ -170,10 +211,10 @@ export class UploadBatch {
 	/** New files from the picker: tiles at once, then uploads and previews. */
 	add(files: Iterable<File>): void {
 		this.pickerClosed();
-		if (this.allSettled) this.#clear();
+		const albumId = this.#opts.albumId();
 		const added: UploadItem[] = [];
 		for (const file of files) {
-			const item = new UploadItem(file);
+			const item = new UploadItem(file, albumId);
 			if (isObviouslyNotMedia(file)) {
 				item.stage = 'skipped';
 				item.problem = NOT_MEDIA_TEXT;
@@ -181,6 +222,7 @@ export class UploadBatch {
 			added.push(item);
 		}
 		if (added.length === 0) return;
+		if (this.allSettled || this.items.length === 0) this.#clear();
 		this.#doneFired = false;
 		this.items.push(...added);
 		this.#queuePreviews(added.filter((i) => i.stage !== 'skipped'));
@@ -220,7 +262,7 @@ export class UploadBatch {
 	}
 
 	async #send(item: UploadItem): Promise<void> {
-		const albumId = String(this.#opts.albumId());
+		const albumId = String(item.albumId);
 		let finished = false;
 		const finish = (stage: 'sent' | 'error', problem: string | null = null) => {
 			if (finished) return;
@@ -266,12 +308,34 @@ export class UploadBatch {
 		if (this.#destroyed || this.#doneFired || !this.allSettled || !this.items.some((i) => i.stage === 'sent')) return;
 		this.#doneFired = true;
 		this.#opts.ondone?.();
+		if (this.#opts.clearOnDone?.()) this.#handOver();
+	}
+
+	/** clearOnDone: the sent files' tiles make way for the summary (the page shows them now). */
+	#handOver(): void {
+		const summary: DoneSummary = { ...(this.summary ?? { added: 0, already: 0, failed: 0, sent: 0 }) };
+		const kept: UploadItem[] = [];
+		for (const i of this.items) {
+			if (i.stage !== 'sent') {
+				kept.push(i);
+				continue;
+			}
+			const status = i.gone ? null : i.server?.status;
+			if (status === 'ready') summary.added++;
+			else if (status === 'duplicate') summary.already++;
+			else if (status === 'failed') summary.failed++;
+			else summary.sent++;
+			if (i.preview) URL.revokeObjectURL(i.preview);
+		}
+		this.items = kept;
+		this.summary = summary;
 	}
 
 	/** A new batch after the previous one settled: forget the old tiles. */
 	#clear(): void {
 		for (const i of this.items) if (i.preview) URL.revokeObjectURL(i.preview);
 		this.items = [];
+		this.summary = null;
 		this.#previewQueue = [];
 		this.#previewCount = 0;
 	}
@@ -302,13 +366,17 @@ export class UploadBatch {
 		let next = this.#hidden() ? POLL_HIDDEN_MS : POLL_VISIBLE_MS;
 		try {
 			for (let at = 0; at < ids.length; at += STATUS_BATCH) {
-				const q = encodeURIComponent(ids.slice(at, at + STATUS_BATCH).join(','));
+				const asked = new Set(ids.slice(at, at + STATUS_BATCH));
+				const q = encodeURIComponent([...asked].join(','));
 				const res = await fetch(`/api/status?ids=${q}`, { headers: { accept: 'application/json' } });
 				if (!res.ok) throw new Error(`status ${res.status}`);
 				const byId = new Map(((await res.json()) as MediaStatusDTO[]).map((r) => [r.id, r]));
 				for (const item of this.items) {
-					const s = item.mediaId ? byId.get(item.mediaId) : undefined;
+					if (!item.mediaId || !asked.has(item.mediaId)) continue;
+					const s = byId.get(item.mediaId);
+					// Left out of the answer: removed, or no longer ours to see. Stop asking.
 					if (s) item.server = s;
+					else item.gone = true;
 				}
 			}
 		} catch {
@@ -357,11 +425,12 @@ export class UploadBatch {
 	// --- wake lock -------------------------------------------------------------------
 
 	async #holdWakeLock(): Promise<void> {
-		if (this.#wakeLock || this.#destroyed || !('wakeLock' in navigator) || this.#hidden()) return;
+		if (this.#wakeLock || this.#wakeLockPending || this.#destroyed || !('wakeLock' in navigator) || this.#hidden()) return;
+		this.#wakeLockPending = true;
 		try {
 			const lock = await navigator.wakeLock.request('screen');
 			if (this.#destroyed || !this.sending) {
-				void lock.release();
+				void lock.release().catch(() => {});
 				return;
 			}
 			this.#wakeLock = lock;
@@ -370,6 +439,8 @@ export class UploadBatch {
 			});
 		} catch {
 			// not allowed right now (battery saver, hidden tab): the copy still says keep it open
+		} finally {
+			this.#wakeLockPending = false;
 		}
 	}
 

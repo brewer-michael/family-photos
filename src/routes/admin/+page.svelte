@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { enhance } from '$app/forms';
+	import { enhance, type SubmitFunction } from '$app/forms';
 	import type { PageProps } from './$types';
 	import Icon from '#lib/components/Icon.svelte';
 	import AdminIcon from '#lib/components/admin/AdminIcon.svelte';
@@ -20,6 +20,21 @@
 		saved: 'Email saved to the outbox',
 		failed: "Email didn't send"
 	};
+
+	/** Forms being sent right now, by key: their buttons are disabled, so a double tap does it once. */
+	let busy = $state<Record<string, boolean>>({});
+	const submitting =
+		(key: string, opts: { reset?: boolean } = {}): SubmitFunction =>
+		() => {
+			busy[key] = true;
+			return async ({ update }) => {
+				try {
+					await update(opts);
+				} finally {
+					busy[key] = false;
+				}
+			};
+		};
 </script>
 
 <svelte:head>
@@ -34,11 +49,11 @@
 		<p class="notice">{warning}</p>
 	{/each}
 	{#if data.email.problem}
-		<p class="notice warn"><AdminIcon name="mail" /> {data.email.problem} <a href="#email">Email</a></p>
+		<p class="notice warn"><AdminIcon name="mail" /> {data.email.problem} <a class="tap" href="#email">Email</a></p>
 	{/if}
 	{#if data.selfCheck && !data.selfCheck.ok}
 		<p class="notice warn">
-			Some photos or videos can't be added until the media tools are fixed. <a href="#tools">See what's missing</a>
+			Some photos or videos can't be added until the media tools are fixed. <a class="tap" href="#tools">See what's missing</a>
 		</p>
 	{/if}
 
@@ -88,17 +103,21 @@
 							{/if}
 							<div class="actions">
 								{#if f.hasSource}
-									<form method="POST" action="?/retry" use:enhance>
+									<form method="POST" action="?/retry" use:enhance={submitting(f.id)}>
 										<input type="hidden" name="id" value={f.id} />
-										<button type="submit" class="btn"><Icon name="retry" /> Try again<span class="visually-hidden">: {f.name}</span></button>
+										<button type="submit" class="btn" disabled={busy[f.id]}>
+											<Icon name="retry" /> Try again<span class="visually-hidden">: {f.name}</span>
+										</button>
 									</form>
 									<a class="btn" href="/admin/original/{f.id}" download>
 										<Icon name="save" /> Download original<span class="visually-hidden">: {f.name}</span>
 									</a>
 								{/if}
-								<form method="POST" action="?/trashFailed" use:enhance>
+								<form method="POST" action="?/trashFailed" use:enhance={submitting(f.id)}>
 									<input type="hidden" name="id" value={f.id} />
-									<button type="submit" class="btn btn-danger"><Icon name="trash" /> Move to trash<span class="visually-hidden">: {f.name}</span></button>
+									<button type="submit" class="btn btn-danger" disabled={busy[f.id]}>
+										<Icon name="trash" /> Move to trash<span class="visually-hidden">: {f.name}</span>
+									</button>
 								</form>
 							</div>
 						</div>
@@ -122,8 +141,8 @@
 		{/if}
 		<Note result={result('email')} />
 		{#if data.email.to}
-			<form method="POST" action="?/testEmail" use:enhance>
-				<button type="submit" class="btn"><AdminIcon name="mail" /> Send test email</button>
+			<form method="POST" action="?/testEmail" use:enhance={submitting('testEmail')}>
+				<button type="submit" class="btn" disabled={busy.testEmail}><AdminIcon name="mail" /> Send test email</button>
 			</form>
 		{/if}
 		{#if data.email.failedRequests.length > 0}
@@ -132,9 +151,11 @@
 				{#each data.email.failedRequests as e (e.id)}
 					<li class="failed-email">
 						<span>From {e.requester}{e.error ? `: ${e.error}` : ''}</span>
-						<form method="POST" action="?/resendEmail" use:enhance>
+						<form method="POST" action="?/resendEmail" use:enhance={submitting(`resend-${e.id}`)}>
 							<input type="hidden" name="id" value={e.id} />
-							<button type="submit" class="btn"><AdminIcon name="mail" /> Resend<span class="visually-hidden"> the email about {e.requester}'s request</span></button>
+							<button type="submit" class="btn" disabled={busy[`resend-${e.id}`]}>
+								<AdminIcon name="mail" /> Resend<span class="visually-hidden"> the email about {e.requester}'s request</span>
+							</button>
 						</form>
 					</li>
 				{/each}
@@ -145,7 +166,7 @@
 	<section class="section" id="tools" aria-labelledby="tools-title">
 		<h2 id="tools-title"><Icon name="computer" /> Media tools</h2>
 		{#if !data.selfCheck}
-			<p>Not checked yet. That happens when the app starts; reload this page in a minute.</p>
+			<p>Not checked yet. That happens when the app starts.</p>
 		{:else}
 			{#if data.selfCheck.ok}
 				<p>Everything needed to get photos and videos ready is in place.</p>
@@ -166,6 +187,10 @@
 				</dl>
 			</details>
 		{/if}
+		<Note result={result('tools')} />
+		<form method="POST" action="?/checkTools" use:enhance={submitting('tools')}>
+			<button type="submit" class="btn" disabled={busy.tools}><Icon name="retry" /> {busy.tools ? 'Checking…' : 'Check again'}</button>
+		</form>
 	</section>
 
 	<section class="section" id="storage" aria-labelledby="storage-title">
@@ -176,7 +201,7 @@
 			<dt>Archived originals</dt>
 			<dd>{data.storage.originals} ({plural(data.storage.originalsCount, 'item', 'items')})</dd>
 			<dt>In the trash</dt>
-			<dd><a href="/admin/trash">{plural(data.storage.trash, 'item', 'items')}</a></dd>
+			<dd><a class="tap" href="/admin/trash">{plural(data.storage.trash, 'item', 'items')}</a></dd>
 		</dl>
 		{#if !data.storage.keepOriginals}
 			<p class="muted">New originals are not kept (KEEP_ORIGINALS is off).</p>
@@ -195,8 +220,8 @@
 		{/if}
 		{#if data.storage.outdated > 0}
 			<p>{plural(data.storage.outdated, 'item was', 'items were')} made by an older version of this app and can be redone from the originals.</p>
-			<form method="POST" action="?/reprocessOutdated" use:enhance>
-				<button type="submit" class="btn"><Icon name="retry" /> Redo them</button>
+			<form method="POST" action="?/reprocessOutdated" use:enhance={submitting('reprocess')}>
+				<button type="submit" class="btn" disabled={busy.reprocess}><Icon name="retry" /> Redo them</button>
 			</form>
 		{/if}
 	</section>
@@ -207,20 +232,20 @@
 		<ul class="rows">
 			{#each data.albums as a (a.id)}
 				<li class="card album">
-					<h3><a href="/album/{a.id}">{a.title}</a></h3>
+					<h3><a class="tap" href="/album/{a.id}">{a.title}</a></h3>
 					<p class="muted small">
 						{plural(a.visible, 'item', 'items')} showing{a.total > a.visible ? `, ${a.total} in all (including unfinished, failed and trashed)` : ''}
 					</p>
 					<div class="actions">
 						<details class="rename">
 							<summary class="btn"><Icon name="pencil" /> Rename<span class="visually-hidden"> {a.title}</span></summary>
-							<form method="POST" action="?/renameAlbum" use:enhance={() => async ({ update }) => update({ reset: false })}>
+							<form method="POST" action="?/renameAlbum" use:enhance={submitting(`rename-${a.id}`, { reset: false })}>
 								<input type="hidden" name="id" value={a.id} />
 								<div class="field">
 									<label for="album-title-{a.id}">New name</label>
 									<input id="album-title-{a.id}" class="input" name="title" value={a.title} maxlength="200" required />
 								</div>
-								<button type="submit" class="btn btn-primary"><Icon name="check" /> Save name</button>
+								<button type="submit" class="btn btn-primary" disabled={busy[`rename-${a.id}`]}><Icon name="check" /> Save name</button>
 							</form>
 						</details>
 						{#if a.isDefault}
@@ -283,6 +308,14 @@
 	}
 	.warn {
 		border-left-color: var(--danger);
+	}
+	/* Links on their own get the same 56 px tap height as buttons. */
+	.tap {
+		display: inline-flex;
+		align-items: center;
+		min-height: var(--tap);
+		max-width: 100%;
+		overflow-wrap: anywhere;
 	}
 	.rows,
 	.plain {

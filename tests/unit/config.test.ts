@@ -98,6 +98,13 @@ describe('loadConfig()', () => {
 		expect(c.warnings).toEqual([]);
 	});
 
+	it('TRUSTED_PROXIES accepts the "cloudflare" keyword, alone or with other entries', () => {
+		expect(loadConfig({ ...base, TRUSTED_PROXIES: 'Cloudflare' }).trustedProxies).toEqual(['cloudflare']);
+		expect(loadConfig({ ...base, TRUSTED_PROXIES: 'private, cloudflare' }).trustedProxies).toEqual(['private', 'cloudflare']);
+		expect(() => loadConfig({ ...base, TRUSTED_PROXIES: 'none,cloudflare' })).toThrow(/cannot be combined/);
+		expect(() => loadConfig({ ...base, TRUSTED_PROXIES: 'cloudflare/24' })).toThrow(/"private" or "cloudflare"/);
+	});
+
 	it('SMTP on 587 is STARTTLS (secure=false)', () => {
 		expect(loadConfig({ ...base, SMTP_HOST: 'smtp.example.com' }).smtp).toMatchObject({ port: 587, secure: false });
 	});

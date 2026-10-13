@@ -126,7 +126,10 @@
 			max-width: 14cm;
 			margin: 0 auto;
 			break-inside: avoid;
-			break-after: page;
+		}
+		/* A new page before every card but the first (after every card would leave a blank last page). */
+		.qr-card + .qr-card {
+			break-before: page;
 		}
 		.cards.grid {
 			display: grid;
@@ -135,7 +138,9 @@
 		}
 		.cards.grid .qr-card {
 			max-width: none;
-			break-after: auto;
+		}
+		.cards.grid .qr-card + .qr-card {
+			break-before: auto;
 		}
 		.cards.grid .code {
 			width: 5.5cm;

@@ -16,7 +16,8 @@ import {
 	type MemoryDTO,
 	type PendingDTO,
 	type SaveTargetDTO,
-	type TileDTO
+	type TileDTO,
+	type ViewItemDTO
 } from '#lib/client/dto';
 
 /** Tiles per album page (first load and each "Show more"). */
@@ -81,6 +82,32 @@ export function pendingTiles(albumId: number, device: string | null): PendingDTO
 			name: cleanStem(stemOf(r.source_name)),
 			posterUrl: fs.existsSync(cacheFile(r.id, 'poster')) ? mediaUrl(r.id, 'poster') : null
 		}));
+}
+
+/**
+ * True when the viewer must show the canonical file: display.webp holds only the first frame.
+ * GIFs (animated WebPs become GIFs too) and APNGs (kept as uploaded, so the PNG still moves).
+ */
+export function showsCanonical(row: Pick<media.MediaRow, 'canonical_ext' | 'source_mime'>): boolean {
+	return row.canonical_ext === 'gif' || (row.canonical_ext === 'png' && row.source_mime === 'image/apng');
+}
+
+/** The big photo or video on /view/[id] (a ready row). */
+export function viewItem(row: media.MediaRow): ViewItemDTO {
+	const kind = row.kind ?? 'photo';
+	const v = row.pipeline_version;
+	return {
+		id: row.id,
+		kind,
+		src: mediaUrl(row.id, kind === 'video' || showsCanonical(row) ? 'file' : 'display', { v }),
+		placeholderUrl: mediaUrl(row.id, kind === 'video' ? 'poster' : 'thumb', { v }),
+		width: row.width,
+		height: row.height,
+		durationMs: row.duration_ms,
+		takenAt: row.taken_at,
+		takenMs: row.taken_ms,
+		by: row.uploaded_by_name
+	};
 }
 
 export function saveTarget(row: media.MediaRow, name: string = downloadName(row)): SaveTargetDTO {

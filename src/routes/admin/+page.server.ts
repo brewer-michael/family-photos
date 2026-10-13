@@ -5,7 +5,7 @@ import { cacheFile, outboxDir } from '#lib/server/paths';
 import { rotateAccess } from '#lib/server/auth';
 import { mailHealth, sendMail } from '#lib/server/mail';
 import { resendRemovalEmail } from '#lib/server/removal';
-import { getSelfCheck } from '#lib/server/selfcheck';
+import { getSelfCheck, runSelfCheck } from '#lib/server/selfcheck';
 import { formatBytes } from '#lib/server/disk';
 import {
 	ERROR_CODE_LABELS,
@@ -24,6 +24,7 @@ import * as media from '#lib/server/repo/media';
 import * as requests from '#lib/server/repo/requests';
 import { albumTitles, listAlbums } from '#lib/server/repo/admin';
 import { getDefaultAlbumId } from '#lib/server/repo/settings';
+import { tx } from '#lib/server/db';
 import { mediaUrl } from '#lib/client/dto';
 import { ValidationError } from '#lib/shared/errors';
 import { REMOVAL_REASON_LABELS, isMediaId } from '#lib/shared/media-types';
@@ -133,7 +134,8 @@ export const actions: Actions = {
 		requireAdmin(locals);
 		const id = mediaIdOf(await request.formData());
 		const row = id ? media.getById(id) : undefined;
-		if (!row) return problem(404, 'failed', "We couldn't find that item.");
+		if (!row || row.deleted_at !== null) return problem(404, 'failed', "We couldn't find that item.");
+		if (row.status !== 'failed') return problem(409, 'failed', `${row.source_name} is already being tried again, or worked.`);
 		switch (retryItem(row.id)) {
 			case 'received':
 			case 'queued':
@@ -145,14 +147,28 @@ export const actions: Actions = {
 		}
 	},
 
-	/** Moves a failed item to the trash (deleted for good after 30 days, with its file). */
+	/**
+	 * Moves a failed item to the trash (deleted for good after 30 days, with its file). Only failed
+	 * items: everything else is removed through its removal request or album.
+	 */
 	trashFailed: async ({ request, locals }) => {
 		requireAdmin(locals);
 		const id = mediaIdOf(await request.formData());
 		const row = id ? media.getById(id) : undefined;
-		if (!row) return problem(404, 'failed', "We couldn't find that item.");
-		media.softDelete(row.id, 'Upload that did not work, removed by the admin');
+		if (!row || row.deleted_at !== null) return problem(404, 'failed', "We couldn't find that item.");
+		if (row.status !== 'failed') return problem(409, 'failed', `${row.source_name} isn't a failed upload any more, so it was left alone.`);
+		tx(() => {
+			media.softDelete(row.id, 'Upload that did not work, removed by the admin');
+			requests.resolveAllForMedia(row.id, 'approved', 'removed');
+		});
 		return done('failed', `${row.source_name} is in the trash now.`);
+	},
+
+	/** "Check again" for the media tools (and free space). */
+	checkTools: async ({ locals }) => {
+		requireAdmin(locals);
+		const check = await runSelfCheck();
+		return done('tools', check.ok ? 'Checked again: everything is in place.' : 'Checked again. What is missing is listed above.');
 	},
 
 	testEmail: async ({ locals }) => {
@@ -189,7 +205,12 @@ export const actions: Actions = {
 	deleteOriginals: async ({ locals }) => {
 		requireAdmin(locals);
 		const { count, bytes } = await deleteArchivedOriginals();
-		return done('storage', count === 0 ? 'There were no archived originals to delete.' : `Deleted ${count} archived originals and freed ${formatBytes(bytes)}.`);
+		return done(
+			'storage',
+			count === 0
+				? 'There were no archived originals to delete.'
+				: `Deleted ${count} archived ${count === 1 ? 'original' : 'originals'} and freed ${formatBytes(bytes)}.`
+		);
 	},
 
 	reprocessOutdated: async ({ locals }) => {

@@ -1,11 +1,11 @@
 /**
  * The media self-check against fake ffmpeg/ffprobe/heif/exiftool scripts (so the result doesn't
- * depend on the machine's tools). Each test re-imports the modules: ffmpegCaps() caches per process.
+ * depend on the machine's tools). Each test re-imports the modules: ffmpegCaps() and the photo
+ * lane's heifTools() cache per process.
  */
 import fs from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { parseHeifDecoders } from '#lib/server/selfcheck';
 import { setEnv, testEnv } from '../helpers/env';
 
 const ORIGINAL_PATH = process.env.PATH;
@@ -68,8 +68,9 @@ function fakeTools(t: FakeTools = {}): void {
 		'-decoders': (t.decoders ?? DECODERS).join('\n')
 	});
 	script('ffprobe', { '-version': 'ffprobe version 7.1.1-1+b1 Copyright (c) 2007-2025 the FFmpeg developers' });
-	script('heif-dec', { '--version': '1.19.8', '--list-decoders': t.heifDecoders ?? HEIF_DECODERS });
-	script('heif-info', { '--version': '1.19.8' });
+	const help = (tool: string) => ` ${tool}  libheif version: 1.19.8\n------------------\nUsage: ${tool} [options]\n  --disable-limits  disable all security limits`;
+	script('heif-dec', { '--help': help('heif-dec'), '--list-decoders': t.heifDecoders ?? HEIF_DECODERS });
+	script('heif-info', { '--help': help('heif-info') });
 	script('exiftool', { '-ver': '13.10' });
 	setEnv({
 		FFMPEG_BIN: path.join(bin, 'ffmpeg'),
@@ -83,6 +84,11 @@ function fakeTools(t: FakeTools = {}): void {
 async function fresh() {
 	vi.resetModules();
 	return import('#lib/server/selfcheck');
+}
+
+/** The photo lane's own report, from the same (fresh) module instance the self-check used. */
+async function photoReport() {
+	return (await import('../../src/worker/photo/tools')).photoToolsReport();
 }
 
 beforeEach(() => {
@@ -113,11 +119,13 @@ describe('runSelfCheck', () => {
 			ffmpeg: 'ffmpeg version 7.1.1-1+b1',
 			ffprobe: 'ffprobe version 7.1.1-1+b1',
 			'ffmpeg decoders': '10 video, 1 audio',
-			'heif decoder': 'heif-dec 1.19.8',
-			'heif decoders': 'HEIC: libde265, ffmpeg; AVIF: dav1d',
-			'heif-info': '1.19.8',
 			exiftool: '13.10'
 		});
+		// The HEIF decoder as the photo lane sees it.
+		const photo = await photoReport();
+		expect(photo.problems).toEqual([]);
+		expect(r.tools).toMatchObject(photo.tools);
+		expect(r.tools['heif-dec']).toContain('1.19.8');
 		const { configDir, photosDir } = testEnv();
 		expect(r.tools[`free space ${configDir}`]).toMatch(/ (KB|MB|GB|TB)$/);
 		expect(r.tools[`free space ${photosDir}`]).toMatch(/ (KB|MB|GB|TB)$/);
@@ -133,35 +141,47 @@ describe('runSelfCheck', () => {
 			decoders: DECODERS.filter((d) => !/ (hevc|libjxl) /.test(d)),
 			heifDecoders: HEIF_DECODERS.replace('- dav1d = dav1d v1.5.1\n', '')
 		});
-		fs.rmSync(path.join(bin, 'heif-info'));
 		setEnv({ EXIFTOOL_BIN: path.join(bin, 'no-exiftool') });
 		const { runSelfCheck } = await fresh();
 		const r = await runSelfCheck();
 		expect(r.ok).toBe(false);
 		const all = r.problems.join('\n');
+		// The video lane's own words (capsProblems) plus the video decoders.
 		expect(all).toContain('no libx264 encoder');
 		expect(all).toContain('no zscale filter');
 		expect(all).toContain('AMBIENT_VIEWING_ENVIRONMENT');
-		expect(all).toContain("can't decode iPhone (HEVC) videos, JPEG XL photos");
-		expect(all).toContain('no dav1d decoder plugin');
+		expect(all).toContain("ffmpeg can't decode iPhone (HEVC) videos, so those uploads will fail.");
+		// The photo lane's own words (photoToolsReport): no dav1d plugin, no JPEG XL decoder.
+		const photo = await photoReport();
+		expect(photo.problems).toHaveLength(2);
+		expect(photo.problems.join('\n')).toContain('dav1d');
+		expect(r.problems).toEqual(expect.arrayContaining(photo.problems));
 		expect(all).not.toContain('libde265');
-		expect(all).toContain('heif-info could not be run: not installed');
 		expect(all).toContain('exiftool');
 		expect(r.tools.exiftool).toBeUndefined();
 		expect(console.error).toHaveBeenCalledWith(expect.stringContaining('PROBLEM(S) WITH THE MEDIA TOOLS'));
 	});
 
-	it('falls back to heif-convert (libheif 1.17) and honours HEIF_DEC_BIN', async () => {
+	it('reports each problem once: the photo and video checks do not overlap', async () => {
+		fakeTools({ decoders: DECODERS.filter((d) => !/ (hevc|libjxl|jpeg2000|bmp|psd) /.test(d)) });
+		const r = await (await fresh()).runSelfCheck();
+		const photo = await photoReport();
+		expect(photo.problems).toHaveLength(1); // the still-image decoders, in one line
+		expect(r.problems).toEqual(["ffmpeg can't decode iPhone (HEVC) videos, so those uploads will fail.", ...photo.problems]);
+	});
+
+	it('uses the HEIF decoder the photo lane uses: heif-convert (libheif 1.17) or HEIF_DEC_BIN', async () => {
 		fakeTools();
 		fs.renameSync(path.join(bin, 'heif-dec'), path.join(bin, 'heif-convert'));
 		let r = await (await fresh()).runSelfCheck();
-		expect(r.tools['heif decoder']).toBe('heif-convert 1.19.8');
+		expect(r.tools['heif-convert']).toContain('1.19.8');
 		expect(r.problems).toEqual([]);
 
 		fs.renameSync(path.join(bin, 'heif-convert'), path.join(bin, 'my-heif'));
 		setEnv({ HEIF_DEC_BIN: path.join(bin, 'my-heif') });
 		r = await (await fresh()).runSelfCheck();
-		expect(r.tools['heif decoder']).toBe(`${path.join(bin, 'my-heif')} 1.19.8`);
+		expect(r.tools['my-heif']).toContain('1.19.8');
+		expect(r.problems).toEqual([]);
 	});
 
 	it('says so when there is no HEIF decoder or ffmpeg at all', async () => {
@@ -170,7 +190,10 @@ describe('runSelfCheck', () => {
 		setEnv({ FFMPEG_BIN: path.join(bin, 'nope'), FFPROBE_BIN: path.join(bin, 'nope') });
 		const r = await (await fresh()).runSelfCheck();
 		const all = r.problems.join('\n');
-		expect(all).toContain("No HEIF decoder (heif-dec or heif-convert) could be run, so iPhone photos can't be added.");
+		const photo = await photoReport();
+		expect(photo.problems.join('\n')).toContain('heif-convert');
+		expect(r.problems).toEqual(expect.arrayContaining(photo.problems));
+		expect(r.tools).toMatchObject(photo.tools);
 		expect(all).toContain(`ffmpeg (${path.join(bin, 'nope')}) could not be run: not installed. Videos can't be added.`);
 		expect(all).toContain('ffprobe');
 	});
@@ -189,6 +212,29 @@ describe('runSelfCheck', () => {
 		]);
 	});
 
+	it('says so when heif-info is missing (every HEIF decode needs it)', async () => {
+		fakeTools();
+		fs.rmSync(path.join(bin, 'heif-info'));
+		const { runSelfCheck } = await fresh();
+		const r = await runSelfCheck();
+		expect(r.ok).toBe(false);
+		expect(r.problems).toEqual(["heif-info (heif-info) is not installed, so iPhone photos can't be added."]);
+	});
+
+	it('checks the exiftool the lanes use: EXIFTOOL_PATH counts when EXIFTOOL_BIN is unset', async () => {
+		fakeTools();
+		const fake = path.join(bin, 'exiftool');
+		setEnv({ EXIFTOOL_BIN: undefined, EXIFTOOL_PATH: fake });
+		try {
+			const { exiftoolBinary } = await import('../../src/worker/exiftool');
+			expect(exiftoolBinary()).toBe(fake);
+			const { runSelfCheck } = await fresh();
+			expect((await runSelfCheck()).tools.exiftool).toBe('13.10');
+		} finally {
+			setEnv({ EXIFTOOL_PATH: undefined });
+		}
+	});
+
 	it('shares one run between concurrent callers', async () => {
 		fakeTools();
 		const { runSelfCheck } = await fresh();
@@ -200,14 +246,19 @@ describe('runSelfCheck', () => {
 	});
 });
 
-describe('parseHeifDecoders', () => {
-	it('reads the decoder ids of each section (heif-dec 1.19 and heif-convert 1.17 print the same)', () => {
-		expect(parseHeifDecoders(HEIF_DECODERS)).toEqual({
-			HEIC: ['libde265', 'ffmpeg'],
-			AVIF: ['dav1d'],
-			JPEG: [],
-			'JPEG 2000': []
-		});
-		expect(parseHeifDecoders('')).toEqual({});
+describe('exiftool binary (worker lanes)', () => {
+	const saved = { bin: process.env.EXIFTOOL_BIN, path: process.env.EXIFTOOL_PATH };
+	afterEach(() => {
+		setEnv({ EXIFTOOL_BIN: saved.bin, EXIFTOOL_PATH: saved.path });
+	});
+
+	it('reads EXIFTOOL_BIN like the self-check, and EXIFTOOL_PATH only when that is unset', async () => {
+		const { exiftoolBinary } = await import('../../src/worker/exiftool');
+		setEnv({ EXIFTOOL_BIN: '/opt/exiftool/exiftool', EXIFTOOL_PATH: '/old/exiftool' });
+		expect(exiftoolBinary()).toBe('/opt/exiftool/exiftool');
+		setEnv({ EXIFTOOL_BIN: ' ', EXIFTOOL_PATH: '/old/exiftool' });
+		expect(exiftoolBinary()).toBe('/old/exiftool');
+		setEnv({ EXIFTOOL_BIN: undefined, EXIFTOOL_PATH: undefined });
+		expect(exiftoolBinary()).toBe(fs.existsSync('/usr/bin/exiftool') ? '/usr/bin/exiftool' : undefined);
 	});
 });

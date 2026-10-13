@@ -10,6 +10,7 @@ import { simpleParser } from 'mailparser';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
 	BACKUPS_KEPT,
+	DIGEST_MIN_GAP_MS,
 	FIRST_RUN_DELAY_MS,
 	backupDatabase,
 	purgeDuplicates,
@@ -272,6 +273,16 @@ describe('hourly: failure email', () => {
 		expect(emails()).toHaveLength(2);
 	});
 
+	it('allows a few minutes of slack, so a timer that fires a little early still sends', async () => {
+		const t0 = Date.now();
+		failNow('IMG_0005.HEIC', t0 - 60_000);
+		expect(await sendFailureDigest(t0)).toBe('saved');
+		failNow('IMG_0006.HEIC', t0 + 60_000);
+		expect(await sendFailureDigest(t0 + DIGEST_MIN_GAP_MS - 1)).toBe('skipped');
+		expect(await sendFailureDigest(t0 + HOUR - 60_000)).toBe('saved');
+		expect(DIGEST_MIN_GAP_MS).toBeGreaterThanOrEqual(50 * 60_000);
+	});
+
 	it('keeps the failures for the next hour when sending fails', async () => {
 		const t0 = Date.now();
 		failNow('IMG_0004.HEIC', t0 - 60_000);
@@ -296,6 +307,34 @@ describe('scheduling', () => {
 		await vi.waitFor(() => expect(fs.readdirSync(backupsDir()).some((n) => n.endsWith('.sqlite'))).toBe(true), { timeout: 10_000 });
 
 		stopMaintenance();
+	});
+
+	it('emails failures on the first hourly run and again on the next one, an hour later', async () => {
+		vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] });
+		const emails = () => (fs.existsSync(outboxDir()) ? fs.readdirSync(outboxDir()).filter((f) => f.endsWith('.eml')) : []);
+		const fail = (name: string) => media.markFailed(received(album, name), 'corrupt', 'broken');
+		fail('IMG_0007.HEIC');
+		startMaintenance();
+
+		await vi.advanceTimersByTimeAsync(FIRST_RUN_DELAY_MS);
+		await vi.waitFor(() => expect(emails()).toHaveLength(1), { timeout: 10_000 });
+		// The daily run started at the same time; let it finish before the clock moves on.
+		await vi.waitFor(() => expect(fs.readdirSync(backupsDir()).some((n) => n.endsWith('.sqlite'))).toBe(true), { timeout: 10_000 });
+
+		fail('IMG_0008.HEIC');
+		await vi.advanceTimersByTimeAsync(HOUR - 1000);
+		expect(emails()).toHaveLength(1);
+		await vi.advanceTimersByTimeAsync(1000); // the hourly timer: 59 minutes after the first email
+		await vi.waitFor(() => expect(emails()).toHaveLength(2), { timeout: 10_000 });
+	});
+
+	it('the daily run also deletes saved emails older than 90 days', async () => {
+		fs.mkdirSync(outboxDir(), { recursive: true });
+		const old = touchFile(path.join(outboxDir(), '2026-01-01T00-00-00-000Z-0badc0de.eml'), 91 * DAY);
+		const recent = touchFile(path.join(outboxDir(), '2026-10-01T00-00-00-000Z-0badc0de.eml'), 10 * DAY);
+		await runDaily();
+		expect(exists(old)).toBe(false);
+		expect(exists(recent)).toBe(true);
 	});
 
 	it('stopMaintenance clears every timer', () => {

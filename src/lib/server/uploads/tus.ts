@@ -11,11 +11,16 @@
  *   server; anything the client sent under those keys is discarded.
  * - Creation (onUploadCreate): the album must exist and not be deleted, and /photos must have
  *   2 × Upload-Length + 2 GiB free, else 413 with words for the uploader. Over MAX_UPLOAD_GB → 413.
+ *   An empty file (Upload-Length: 0) → 400: it can't be a photo or video.
  * - HEAD/PATCH (onIncomingRequest) only from the device that created the upload, else 403.
  * - Finish (onUploadFinish): media.insertReceived() (idempotent per token), wake intake, answer at
  *   once with `X-Media-Id: <ulid>`. No hashing happens inside the request (Cloudflare's 100 s
- *   limit); the intake step does it. A HEAD of a finished upload carries X-Media-Id too, so a
- *   client that resumes a completed upload still learns which item it became.
+ *   limit); the intake step does it. If the album was deleted while the file was on its way, the
+ *   item is still recorded (in that album, so restoring the album brings it back) and logged.
+ * - A HEAD of a finished upload carries X-Media-Id too, so a client that resumes a completed
+ *   upload still learns which item it became. If the finish step failed (e.g. the database was
+ *   busy), tus-js-client's retry is such a HEAD: the item is recorded then, or the HEAD answers
+ *   500 so the client tries again later.
  * - CSRF: tus-js-client's creation POST has no Content-Type, which SvelteKit 3 checks like a form
  *   post: its Origin must match the site's. Browsers always send Origin on POST; server.js makes the
  *   site's own origin right over plain HTTP. allowedOrigins [] sends no CORS headers at all.
@@ -31,8 +36,9 @@ import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
 import { wakeIntake } from '#lib/server/intake';
 import { formatBytes, freeBytes, hasRoomForUpload, spaceNeededForUpload } from '#lib/server/disk';
+import { errorDetail } from '#lib/shared/errors';
 
-export const UPLOAD_PATH = '/api/upload';
+const UPLOAD_PATH = '/api/upload';
 /** namingFunction output: 16 random bytes, base64url. */
 const TOKEN_RE = /^[A-Za-z0-9_-]{22}$/;
 
@@ -82,6 +88,33 @@ function uploaderOf(req: Request): Uploader {
 	return { deviceId: device.d, name: device.n };
 }
 
+/**
+ * Records a finished upload as a `received` item (idempotent per upload token), wakes intake and
+ * returns the media id. Throws when the upload lost its details or the database refused.
+ */
+function recordFinished(upload: Upload): string {
+	const meta = upload.metadata ?? {};
+	const albumId = Number(meta.albumId);
+	if (!meta.device || !meta.name || !Number.isInteger(albumId)) reject(500, 'The upload lost its details.');
+	const album = albums.get(albumId, { includeDeleted: true });
+	if (!album) reject(404, "That album isn't here any more.");
+	const id = media.insertReceived({
+		uploadToken: upload.id,
+		albumId,
+		sourceName: meta.filename ?? 'upload',
+		sourceSize: upload.size ?? upload.offset,
+		clientMtimeMs: meta.lastModified ? Number(meta.lastModified) : null,
+		uploadedByName: meta.name,
+		uploadedByDevice: meta.device
+	});
+	if (album.deleted_at !== null) {
+		console.warn(
+			`[upload] ${id} (${meta.filename ?? 'upload'} from ${meta.name}) arrived after its album ${albumId} "${album.title}" was deleted; it is kept there, so restoring the album brings it back`
+		);
+	}
+	void wakeIntake();
+	return id;
+}
 
 let server: Server | null = null;
 
@@ -102,6 +135,7 @@ function tusServer(): Server {
 			const albumId = Number(meta.albumId);
 			if (!Number.isInteger(albumId) || !albums.get(albumId)) reject(404, "That album isn't here any more.");
 			if (upload.size === undefined) reject(400, 'Upload-Length is required.');
+			if (upload.size === 0) reject(400, "That one isn't a photo or video.");
 			const free = await freeBytes(photosRoot());
 			if (!hasRoomForUpload(free, upload.size)) {
 				console.warn(
@@ -135,20 +169,7 @@ function tusServer(): Server {
 		},
 
 		async onUploadFinish(_req, upload) {
-			const meta = upload.metadata ?? {};
-			const albumId = Number(meta.albumId);
-			if (!meta.device || !meta.name || !Number.isInteger(albumId)) reject(500, 'The upload lost its details.');
-			const id = media.insertReceived({
-				uploadToken: upload.id,
-				albumId,
-				sourceName: meta.filename ?? 'upload',
-				sourceSize: upload.size ?? upload.offset,
-				clientMtimeMs: meta.lastModified ? Number(meta.lastModified) : null,
-				uploadedByName: meta.name,
-				uploadedByDevice: meta.device
-			});
-			void wakeIntake();
-			return { headers: { 'X-Media-Id': id } };
+			return { headers: { 'X-Media-Id': recordFinished(upload) } };
 		},
 
 		onResponseError(_req, err) {
@@ -162,6 +183,18 @@ function tusServer(): Server {
 	return s;
 }
 
+/**
+ * The media id of a complete upload, for a HEAD. An upload with no item yet is one whose finish
+ * step failed (onUploadFinish threw, the client got a 500 and is now resuming): record it now.
+ */
+async function itemOfFinishedUpload(token: string): Promise<string> {
+	const row = media.getByUploadToken(token);
+	if (row) return row.id;
+	const id = recordFinished(await tusServer().datastore.getUpload(token));
+	console.warn(`[upload] ${id}: recorded on the uploader's retry, after its finish step had failed`);
+	return id;
+}
+
 export const tusHandler: TusHandler = {
 	async handle(event) {
 		const req = event.request;
@@ -172,8 +205,12 @@ export const tusHandler: TusHandler = {
 			const offset = res.headers.get('upload-offset');
 			const token = new URL(req.url).pathname.split('/').pop() ?? '';
 			if (offset !== null && offset === res.headers.get('upload-length') && TOKEN_RE.test(token)) {
-				const row = media.getByUploadToken(token);
-				if (row) res.headers.set('X-Media-Id', row.id);
+				try {
+					res.headers.set('X-Media-Id', await itemOfFinishedUpload(token));
+				} catch (e) {
+					console.error(`[upload] could not record finished upload ${token}; the uploader will retry:`, errorDetail(e, 500));
+					return plain(500, 'Something went wrong. Please try again.');
+				}
 			}
 		}
 		return res;

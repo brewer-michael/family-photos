@@ -41,7 +41,8 @@ const keepsProfile = (m: Metadata) => m.hasProfile && (m.space === 'srgb' || m.s
 /**
  * Writes `<outBase>.jpg` (or `.png` when `lossless` or the image has real transparency, i.e. an
  * alpha channel that is actually used). `input` is a source sharp reads directly (JPEG, PNG,
- * WebP, TIFF) or a decoded PNG.
+ * WebP, TIFF) or a decoded PNG. A `lossless` 16-bit source (a rotated 16-bit PNG) stays 16-bit;
+ * otherwise sharp writes 8 bits per sample (a 10-bit HEIF's precision is not kept, §2).
  */
 export async function encodeCanonical(input: string, outBase: string, opts: { lossless: boolean }): Promise<Encoded> {
 	try {
@@ -52,6 +53,8 @@ export async function encodeCanonical(input: string, outBase: string, opts: { lo
 		if (meta.hasAlpha && !alpha) p = p.removeAlpha();
 		if (keepsProfile(meta)) p = p.keepIccProfile(); // tags the profile, does not transform pixels
 		p = p.keepExif();
+		// sharp ends every pipeline in 8-bit sRGB unless told otherwise.
+		if (png && opts.lossless && meta.depth === 'ushort') p = p.toColourspace(meta.channels <= 2 ? 'grey16' : 'rgb16');
 		p = png
 			? p.png({ compressionLevel: 6 })
 			: p.jpeg({ quality: 92, chromaSubsampling: '4:2:0', optimiseCoding: true, progressive: false, mozjpeg: false });

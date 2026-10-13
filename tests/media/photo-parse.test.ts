@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 import { testEnv } from '../helpers/env';
 import { parseHeifInfo } from '../../src/worker/photo/heif';
 import { displayP3Icc, embedIccInPng } from '../../src/worker/photo/icc';
-import { hasExif, parseExifDate, parseOffset, photoMeta, resolveGps, resolveTaken } from '../../src/worker/photo/metadata';
+import { exiftoolTransient, hasExif, parseExifDate, parseOffset, photoMeta, resolveGps, resolveTaken } from '../../src/worker/photo/metadata';
 import { decoderOrder, parseDecoderList, type HeifTools } from '../../src/worker/photo/tools';
 
 const INFO_117 = `MIME type: image/heic
@@ -117,6 +117,7 @@ describe('decoder list', () => {
 	const tools = (decoders: HeifTools['decoders']): HeifTools => ({
 		decBin: 'heif-dec',
 		infoBin: 'heif-info',
+		infoFound: true,
 		version: '1.19.8',
 		decoders,
 		decDisableLimits: true,
@@ -206,9 +207,44 @@ describe('GPS and other source facts', () => {
 			{ 'Apple:ContentIdentifier': 'A1B2-C3', 'QuickTime:ColorPrimaries': 12, 'File:FileType': 'HEIC' },
 			{ clientMtimeMs: null, uploadedMs: 1 }
 		);
-		expect(meta).toMatchObject({ contentId: 'A1B2-C3', colorPrimaries: 12, fileType: 'HEIC' });
+		expect(meta).toMatchObject({ contentId: 'A1B2-C3', colorPrimaries: 12, fileType: 'HEIC', transfer: null, orientation: null });
 		expect(hasExif({ 'File:FileType': 'PNG' })).toBe(false);
 		expect(hasExif({ 'IFD0:Make': 'Apple' })).toBe(true);
+	});
+
+	it('reads the nclx transfer (HDR) and the IFD0 orientation', () => {
+		const meta = photoMeta(
+			{ 'QuickTime:TransferCharacteristics': 18, 'IFD0:Orientation': 6, 'IFD1:Orientation': 1 },
+			{ clientMtimeMs: null, uploadedMs: 1 }
+		);
+		expect(meta).toMatchObject({ transfer: 18, orientation: 6 });
+	});
+});
+
+describe('exiftool failures', () => {
+	it('treats timeouts, a missing or dead exiftool and disk trouble as transient', () => {
+		for (const e of [
+			Object.assign(new Error('timeout: waited 60000ms'), { name: 'TaskTimeoutError' }),
+			Object.assign(new Error('spawn /usr/bin/exiftool ENOENT'), { code: 'ENOENT' }),
+			new Error('BatchCluster has ended, cannot enqueue -TagsFromFile'),
+			new Error('Process terminated before task completed'),
+			new Error('Error: Error writing output file - /photos/.work/x/x.jpg'),
+			new Error('Error: Error renaming temporary file to /photos/.work/x/x.jpg'),
+			Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' })
+		]) {
+			expect(exiftoolTransient(e), e.message).toBe(true);
+		}
+	});
+
+	it('treats exiftool refusing a file as permanent', () => {
+		for (const msg of [
+			'Error: Bad format (0) for IFD0 entry 3 - /photos/.work/x/x.jpg',
+			'Error: Error writing ExifIFD - /photos/.work/x/x.jpg',
+			'Error: Not a valid JPEG - /photos/.work/x/x.jpg',
+			'Error: Corrupted JPEG - /photos/.work/x/x.jpg'
+		]) {
+			expect(exiftoolTransient(new Error(msg)), msg).toBe(false);
+		}
 	});
 });
 

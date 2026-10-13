@@ -1,4 +1,9 @@
-<!-- Album name / when / about fields (new album, and editing by its creator or the admin). -->
+<!--
+	Album name / when / about fields (new album, and editing by its creator or the admin).
+	The inputs use defaultValue, not value: hydrating a `value` would wipe anything typed before the
+	page hydrated. Both actions redirect on success, so enhance's form reset never shows a stale
+	default. (Svelte's SSR doesn't render a textarea's defaultValue, so that one keeps `value`.)
+-->
 <script lang="ts">
 	import { enhance } from '$app/forms';
 	import Icon from './Icon.svelte';
@@ -31,7 +36,7 @@
 			required
 			maxlength="200"
 			autocomplete="off"
-			value={title ?? ''}
+			defaultValue={title ?? ''}
 			aria-invalid={invalid('title')}
 			aria-describedby="{idPrefix}-title-hint"
 		/>
@@ -45,7 +50,7 @@
 			name="whenText"
 			maxlength="200"
 			autocomplete="off"
-			value={whenText ?? ''}
+			defaultValue={whenText ?? ''}
 			aria-invalid={invalid('whenText')}
 			aria-describedby="{idPrefix}-when-hint"
 		/>

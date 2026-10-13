@@ -1,7 +1,8 @@
 /**
  * Decoder detection and the HEIF failure paths that need a particular libheif: the real tools are
  * detected as installed (heif-dec on libheif ≥ 1.18, heif-convert on 1.17), and small wrapper
- * scripts around them (via HEIF_DEC_BIN) stand in for heif-dec 1.19 hitting a security limit.
+ * scripts around them (via HEIF_DEC_BIN) stand in for heif-dec and heif-info 1.19 hitting a
+ * security limit.
  */
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -19,6 +20,7 @@ import { PHOTO_FIXTURES } from '../helpers/photo-fixtures';
 import type { WorkerContext } from '../../src/worker/context';
 import { endExiftool } from '../../src/worker/exiftool';
 import { processPhoto } from '../../src/worker/photo';
+import { readHeifInfo } from '../../src/worker/photo/heif';
 import { ffmpegImageTools, forgetPhotoTools, heifTools, photoToolProblems, photoToolsReport } from '../../src/worker/photo/tools';
 
 const onPath = (bin: string) => {
@@ -80,6 +82,32 @@ exit 1
 		{ mode: 0o755 }
 	);
 	return file;
+}
+
+/**
+ * A heif-info stand-in next to `dec` (so HEIF_DEC_BIN picks it up): `--help` advertises
+ * --disable-limits, a run with --disable-limits goes to the real heif-info without the flag, and
+ * any other run fails with libheif's security-limit error. Every call is appended to calls.log.
+ */
+function fakeHeifInfo(dec: string): { calls: () => string[] } {
+	const dir = path.dirname(dec);
+	const log = path.join(dir, 'calls.log');
+	fs.writeFileSync(
+		path.join(dir, 'heif-info'),
+		`#!/bin/sh
+echo "$*" >> "${log}"
+case " $* " in
+  *" --help "*) echo "      --disable-limits           disable all security limits"; exit 0;;
+  *" --disable-limits "*)
+    for a do shift; [ "$a" = "--disable-limits" ] || set -- "$@" "$a"; done
+    exec heif-info "$@";;
+esac
+echo "Could not read HEIF/AVIF file: Memory allocation error: Security limit exceeded: Number of image items exceeds the maximum" >&2
+exit 1
+`,
+		{ mode: 0o755 }
+	);
+	return { calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').filter((l) => !l.includes('--help')) : []) };
 }
 
 async function enqueue(file: string): Promise<string> {
@@ -171,6 +199,38 @@ describe('HEIF security limits', () => {
 		forgetPhotoTools();
 		const e = await failure(await enqueue(path.join(PHOTO_FIXTURES, 'o1.heic')));
 		expect(e.code).toBe('too_large');
+	});
+
+	it('retries heif-info once with --disable-limits for a file of at most 100 MB', async () => {
+		const dec = fakeHeifDec('info-limits', { disableLimits: true });
+		const info = fakeHeifInfo(dec);
+		setEnv({ HEIF_DEC_BIN: dec });
+		forgetPhotoTools();
+		const id = await enqueue(path.join(PHOTO_FIXTURES, 'o1.heic'));
+		const logs: string[] = [];
+		await processPhoto(id, context(logs));
+		expect(media.getById(id)?.status).toBe('ready');
+		expect(logs.some((l) => l.includes('retrying heif-info with --disable-limits'))).toBe(true);
+		expect(info.calls()).toEqual([expect.not.stringContaining('--disable-limits'), expect.stringContaining('--disable-limits')]);
+	});
+
+	it('never runs heif-info without limits on a file over 100 MB', async () => {
+		const dec = fakeHeifDec('info-big', { disableLimits: true });
+		const info = fakeHeifInfo(dec);
+		setEnv({ HEIF_DEC_BIN: dec });
+		forgetPhotoTools();
+		const tools = await heifTools();
+		expect(tools.infoDisableLimits).toBe(true);
+		const err = await readHeifInfo(path.join(PHOTO_FIXTURES, 'o1.heic'), tools, {
+			sizeBytes: 100 * 1024 * 1024 + 1,
+			signal: new AbortController().signal,
+			log: () => undefined
+		}).then(
+			() => null,
+			(e: unknown) => e
+		);
+		expect(MediaError.is(err) && err.code).toBe('too_large');
+		expect(info.calls()).toHaveLength(1);
 	});
 
 	it('is a retryable failure when the decoder cannot start', async () => {

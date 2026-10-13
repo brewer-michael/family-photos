@@ -7,7 +7,7 @@
  * the decoded PNG and the pixels would otherwise be read as sRGB, so embedIccInPng() tags the PNG
  * before sharp sees it. The fixture generator also tags its P3 test images with the profile. Keep
  * this module free of non-erasable TypeScript and of imports other than node:*
- * (tests/fixtures/photo/generate.mjs imports it directly).
+ * (tests/fixtures/photo/generate.ts imports it directly).
  */
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';

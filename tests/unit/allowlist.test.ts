@@ -10,7 +10,8 @@ import {
 	isAppleWebKit,
 	isIOS,
 	isObviouslyNotMedia,
-	looksLikeVideo
+	looksLikeVideo,
+	withoutExtension
 } from '#lib/media/allowlist';
 
 const UA = {
@@ -86,6 +87,18 @@ describe('allowlist', () => {
 		expect(extensionOf('no-extension')).toBe('');
 		expect(extensionOf('.hidden')).toBe('hidden');
 		expect(extensionOf('dir.d/file')).toBe('');
+	});
+});
+
+describe('withoutExtension', () => {
+	it('drops the last extension and any folder, like the album page does', () => {
+		expect(withoutExtension('IMG_1234.HEIC')).toBe('IMG_1234');
+		expect(withoutExtension('beach.day.MOV')).toBe('beach.day');
+		expect(withoutExtension('photos/2024/IMG_1.jpg')).toBe('IMG_1');
+		expect(withoutExtension('C:\\Users\\Rose\\Lake.png')).toBe('Lake');
+		expect(withoutExtension('no extension')).toBe('no extension');
+		expect(withoutExtension('.hidden')).toBe('.hidden');
+		expect(withoutExtension('')).toBe('');
 	});
 });
 

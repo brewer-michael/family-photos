@@ -34,6 +34,10 @@ export interface PhotoMeta {
 	contentId: string | null;
 	/** nclx colour primaries of a HEIF/AVIF (12 = Display P3), when exiftool reports them. */
 	colorPrimaries: number | null;
+	/** nclx transfer characteristics of a HEIF/AVIF (16 = PQ, 18 = HLG: HDR). */
+	transfer: number | null;
+	/** EXIF Orientation of the source (IFD0), when present. */
+	orientation: number | null;
 	/** exiftool's FileType, e.g. 'JPEG', 'NEF'. */
 	fileType: string | null;
 }
@@ -139,6 +143,8 @@ export function photoMeta(tags: SourceTags, fallback: { clientMtimeMs: number | 
 		gps: resolveGps(tags),
 		contentId: str(find(tags, 'ContentIdentifier', (g) => g === 'Apple')),
 		colorPrimaries: num(find(tags, 'ColorPrimaries', (g) => g === 'QuickTime')),
+		transfer: num(find(tags, 'TransferCharacteristics', (g) => g === 'QuickTime')),
+		orientation: num(find(tags, 'Orientation', (g) => g === 'IFD0')),
 		fileType: str(find(tags, 'FileType', (g) => g === 'File'))
 	};
 }
@@ -157,4 +163,23 @@ export async function copyExif(src: string, dest: string): Promise<void> {
 		writeArgs: ['-overwrite_original', '-TagsFromFile', src, '-EXIF:all', '--Orientation', '--IFD1:all'],
 		ignoreMinorErrors: true
 	});
+}
+
+/** Copies all of a RAW's tags into its extracted JPEG preview, including Orientation. */
+export async function copyRawTags(src: string, dest: string): Promise<void> {
+	await exiftool().write(dest, {}, { writeArgs: ['-overwrite_original', '-TagsFromFile', src, '-all:all'], ignoreMinorErrors: true });
+}
+
+const EXIFTOOL_TRANSIENT_CODE = /\b(ENOENT|EACCES|EPIPE|ENOSPC|EIO|EDQUOT|EROFS)\b/;
+const EXIFTOOL_TRANSIENT_TEXT =
+	/timeout|timed out|BatchCluster has ended|stdin unexpectedly closed|terminated before task completed|\bspawn\b|no space left|disk quota|input\/output error|Error (writing output file|creating|renaming temporary file)/i;
+
+/**
+ * An exiftool failure that is not about the file and may pass on a later attempt: a timeout,
+ * exiftool not starting or dying, or a full or unwritable disk. Anything else (exiftool refusing
+ * the file's tags) fails the same way every time.
+ */
+export function exiftoolTransient(e: unknown): boolean {
+	const msg = e instanceof Error ? `${e.name} ${e.message} ${(e as NodeJS.ErrnoException).code ?? ''}` : String(e);
+	return EXIFTOOL_TRANSIENT_CODE.test(msg) || EXIFTOOL_TRANSIENT_TEXT.test(msg);
 }

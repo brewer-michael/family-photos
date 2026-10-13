@@ -12,11 +12,15 @@ import { GiB, freeBytes } from '#lib/server/disk';
 import { wakeIntake } from '#lib/server/intake';
 import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
-import { incomingPath } from '#lib/server/paths';
+import { incomingDir, incomingPath } from '#lib/server/paths';
 import * as uploadRoute from '../../src/routes/api/upload/[...path]/+server';
 import { freshDb } from '../helpers/env';
 
 vi.mock('#lib/server/intake', () => ({ wakeIntake: vi.fn(async () => {}) }));
+vi.mock('#lib/server/repo/media', async (importOriginal) => {
+	const real = await importOriginal<typeof import('#lib/server/repo/media')>();
+	return { ...real, insertReceived: vi.fn(real.insertReceived) };
+});
 vi.mock('#lib/server/disk', async (importOriginal) => ({
 	...(await importOriginal<typeof import('#lib/server/disk')>()),
 	freeBytes: vi.fn()
@@ -158,6 +162,17 @@ describe('creating an upload', () => {
 		expect((await create(size)).status).toBe(201);
 	});
 
+	it('refuses empty files', async () => {
+		expect((await create(10)).status).toBe(201); // the FileStore's folder exists from here on
+		const before = fs.readdirSync(incomingDir()).length;
+		const res = await create(0);
+		expect(res.status).toBe(400);
+		expect(await res.text()).toBe("That one isn't a photo or video.");
+		expect(fs.readdirSync(incomingDir())).toHaveLength(before);
+		expect(media.listReceived()).toEqual([]);
+		expect(wakeIntake).not.toHaveBeenCalled();
+	});
+
 	it('requires Upload-Length (no deferred length)', async () => {
 		const res = await call('POST', '/api/upload', {
 			headers: { 'Upload-Defer-Length': '1', 'Upload-Metadata': metadata({ albumId: String(album) }), cookie: cookie() }
@@ -219,6 +234,67 @@ describe('sending and finishing', () => {
 		expect(again.status).toBe(204);
 		expect(again.headers.get('x-media-id')).toBe(id);
 		expect(media.listReceived()).toHaveLength(1);
+	});
+
+	it('keeps an upload whose album was deleted on the way, in that album, and logs it', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const bytes = randomBytes(100);
+		const token = tokenOf(await create(bytes.length));
+		albums.softDelete(album);
+		const res = await patch(token, 0, bytes);
+		expect(res.status).toBe(204);
+		const id = res.headers.get('x-media-id')!;
+		expect(media.getById(id)).toMatchObject({ status: 'received', album_id: album, upload_token: token });
+		expect(wakeIntake).toHaveBeenCalledTimes(1);
+		expect(warn).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`^\\[upload\\] ${id} .*was deleted.*restoring the album brings it back`)));
+		warn.mockRestore();
+	});
+
+	it('records a finished upload on the retry when the finish step failed', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const bytes = randomBytes(200);
+		const token = tokenOf(await create(bytes.length));
+		const busy = () => {
+			throw new Error('database is locked');
+		};
+		vi.mocked(media.insertReceived).mockImplementationOnce(busy);
+		const last = await patch(token, 0, bytes);
+		expect(last.status).toBe(500);
+		expect(media.getByUploadToken(token)).toBeUndefined();
+
+		// tus-js-client retries with a HEAD; while the database is still busy, that fails too.
+		vi.mocked(media.insertReceived).mockImplementationOnce(busy);
+		const busyHead = await head(token);
+		expect(busyHead.status).toBe(500);
+		expect(busyHead.headers.get('upload-offset')).toBeNull();
+		expect(media.getByUploadToken(token)).toBeUndefined();
+
+		// The next HEAD records the item and answers like a normal finished upload.
+		const res = await head(token);
+		expect(res.status).toBe(200);
+		expect(res.headers.get('upload-offset')).toBe('200');
+		const id = res.headers.get('x-media-id')!;
+		expect(id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+		expect(media.getById(id)).toMatchObject({
+			status: 'received',
+			upload_token: token,
+			album_id: album,
+			source_size: 200,
+			uploaded_by_device: LINDA.d,
+			uploaded_by_name: LINDA.n
+		});
+		expect(wakeIntake).toHaveBeenCalledTimes(1);
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining(`${id}: recorded on the uploader's retry`));
+		// Later HEADs find the same item.
+		expect((await head(token)).headers.get('x-media-id')).toBe(id);
+		expect(media.listReceived()).toHaveLength(1);
+		// An unfinished upload is never recorded by a HEAD.
+		const other = tokenOf(await create(10));
+		expect((await head(other)).headers.get('x-media-id')).toBeNull();
+		expect(media.getByUploadToken(other)).toBeUndefined();
+		warn.mockRestore();
+		error.mockRestore();
 	});
 
 	it('only lets the device that created an upload continue or inspect it', async () => {

@@ -54,34 +54,47 @@ test.describe('access over plain HTTP', () => {
 		await expect(page.getByRole('alert')).toContainText("doesn't work any more");
 	});
 
-	test('the 11th wrong code gets the rate-limit message (429)', async ({ browser, baseURL }, testInfo) => {
-		// Own rate-limit bucket so other tests from 127.0.0.1 are unaffected: the peer is loopback
-		// (a trusted proxy by default), so x-real-ip is believed. It must be a real IP address.
-		const n = (testInfo.project.name === 'mobile' ? 10 : 20) + testInfo.retry;
-		const context = await browser.newContext({
-			...testInfo.project.use,
-			baseURL,
-			extraHTTPHeaders: { 'x-real-ip': `198.51.100.${n}` }
-		});
-		const page = await context.newPage();
+	test('the 11th wrong code gets the rate-limit message (429), even from a new address', async ({ page, context }, testInfo) => {
+		// A browser that has signed in before (it keeps its device cookie, e.g. after "Reset access").
+		// It is limited by device as well as by address, and its wrong codes count in the allowance
+		// of known devices, not in the one strangers share with every other test's first sign-in.
+		// The peer is loopback (a trusted proxy by default), so x-real-ip is believed. It must be a
+		// real IP address; a new one for every try shows the device limit holds anyway.
+		const net = (testInfo.project.name === 'mobile' ? 100 : 150) + 12 * testInfo.retry;
+		const from = (i: number) => page.setExtraHTTPHeaders({ 'x-real-ip': `192.0.2.${net + i}` });
+		await from(0);
+		await login(page, 'Cousin Lee'); // the device cookie is set on /name
+		await context.clearCookies({ name: 'fp_access' });
 		await page.goto('/login');
-		for (let i = 1; i <= 10; i++) {
-			await page.getByLabel('Family code').fill(`wrong code ${i}`);
+		const submit = async () => {
 			const [res] = await Promise.all([
 				page.waitForResponse((r) => r.url().includes('/login') && r.request().method() === 'POST'),
 				page.getByRole('button', { name: 'Come in' }).click()
 			]);
-			expect(res.status()).toBe(400);
+			return res.status();
+		};
+		for (let i = 1; i <= 10; i++) {
+			await from(i);
+			await page.getByLabel('Family code').fill(`wrong code ${i}`);
+			expect(await submit(), `attempt ${i}`).toBe(400);
 			await expect(page.getByRole('alert')).toContainText("didn't work");
 		}
+		await from(11);
 		await page.getByLabel('Family code').fill('blue lake cabin'); // even the right code is refused now
-		const [res] = await Promise.all([
-			page.waitForResponse((r) => r.url().includes('/login') && r.request().method() === 'POST'),
-			page.getByRole('button', { name: 'Come in' }).click()
-		]);
-		expect(res.status()).toBe(429);
+		expect(await submit()).toBe(429);
 		await expect(page.getByRole('alert')).toContainText('Too many tries');
-		await context.close();
+	});
+
+	test('an address that matches no page: the family code first, then a friendly not-found page', async ({ page }) => {
+		await page.goto('/no-such-page');
+		await expect(page).toHaveURL(/\/login\?next=%2Fno-such-page$/);
+		await login(page, 'Cousin Max');
+		const res = await page.goto('/no-such-page');
+		expect(res?.status()).toBe(404);
+		await expect(page.getByRole('heading', { name: "We couldn't find that" })).toBeVisible();
+		await expect(page.getByText("It may have been moved or removed, or it isn't ready yet.")).toBeVisible();
+		await page.getByRole('link', { name: 'Go to all albums' }).click();
+		await expect(page.getByRole('link', { name: 'Everyday Photos' })).toBeVisible();
 	});
 
 	test('/admin requires the admin password; leaving admin mode keeps family access', async ({ page }) => {

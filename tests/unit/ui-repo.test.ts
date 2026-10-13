@@ -6,7 +6,7 @@ import * as media from '#lib/server/repo/media';
 import * as memories from '#lib/server/repo/memories';
 import * as ui from '#lib/server/repo/ui';
 import { cacheFile } from '#lib/server/paths';
-import type { Kind } from '#lib/shared/media-types';
+import type { CanonicalExt, Kind } from '#lib/shared/media-types';
 import { freshDb } from '../helpers/env';
 
 const DEV_A = 'deviceAAAAAAAAAAAAAAAA';
@@ -25,14 +25,17 @@ function received(albumId: number, o: { device?: string; name?: string } = {}): 
 	});
 }
 
-function ready(albumId: number, o: { name?: string; kind?: Kind; takenMs?: number; pv?: number } = {}): string {
+function ready(
+	albumId: number,
+	o: { name?: string; kind?: Kind; takenMs?: number; pv?: number; mime?: string; ext?: CanonicalExt } = {}
+): string {
 	const id = received(albumId, { name: o.name });
 	const kind = o.kind ?? 'photo';
-	media.markQueued(id, { kind, sourceMime: 'x/y', sourceSha256: `sha${seq}`, estCostS: null });
+	media.markQueued(id, { kind, sourceMime: o.mime ?? 'x/y', sourceSha256: `sha${seq}`, estCostS: null });
 	media.claimForProcessing(id);
 	media.markReady(id, {
 		conversion: 'transcode',
-		canonicalExt: kind === 'video' ? 'mp4' : 'jpg',
+		canonicalExt: o.ext ?? (kind === 'video' ? 'mp4' : 'jpg'),
 		canonicalSize: 1234,
 		width: 4032,
 		height: 3024,
@@ -109,6 +112,36 @@ describe('repo/ui', () => {
 			size: 1234,
 			takenMs: 1000
 		});
+	});
+
+	it('the viewer shows display.webp for still photos, the file itself for videos and moving pictures', () => {
+		const still = ready(albumId, { mime: 'image/heic', pv: 2 });
+		expect(ui.viewItem(media.getById(still)!)).toEqual({
+			id: still,
+			kind: 'photo',
+			src: `/media/${still}/display?v=2`,
+			placeholderUrl: `/media/${still}/thumb?v=2`,
+			width: 4032,
+			height: 3024,
+			durationMs: null,
+			takenAt: '2024-07-04T11:22:31-07:00',
+			takenMs: Date.UTC(2024, 6, 4, 18, 22, 31),
+			by: 'Aunt Linda'
+		});
+		const video = ready(albumId, { kind: 'video', mime: 'video/quicktime' });
+		expect(ui.viewItem(media.getById(video)!)).toMatchObject({
+			kind: 'video',
+			src: `/media/${video}/file?v=1`,
+			placeholderUrl: `/media/${video}/poster?v=1`,
+			durationMs: 42_000
+		});
+		// display.webp holds only the first frame: GIFs (animated WebPs become GIFs) and APNGs play as the file.
+		const src = (o: { mime: string; ext: CanonicalExt }) => ui.viewItem(media.getById(ready(albumId, o))!).src;
+		expect(src({ mime: 'image/gif', ext: 'gif' })).toMatch(/\/file\?v=1$/);
+		expect(src({ mime: 'image/webp', ext: 'gif' })).toMatch(/\/file\?v=1$/);
+		expect(src({ mime: 'image/apng', ext: 'png' })).toMatch(/\/file\?v=1$/);
+		expect(src({ mime: 'image/png', ext: 'png' })).toMatch(/\/display\?v=1$/);
+		expect(src({ mime: 'image/webp', ext: 'png' })).toMatch(/\/display\?v=1$/);
 	});
 
 	it('memories know who may edit and delete them', () => {

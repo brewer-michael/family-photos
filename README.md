@@ -95,9 +95,11 @@ Click **Apply**. When the container is running:
 
 1. Open the **WebUI** (or your `PUBLIC_URL`), type the family code and your name. You're in.
 2. Go to `/admin` and sign in with the admin password.
-3. Under **Media tools**, check that it says everything is in place.
-4. Under **Email**, press **Send test email**.
-5. Under **QR cards**, print cards for the family (see [QR cards](#qr-cards-and-resetting-access)).
+3. Under **Media tools**, check that it says "Everything needed to get photos and videos ready is in
+   place."
+4. Under **Email**, press **Send test email** (the button is there once `ADMIN_EMAIL` is set).
+5. Under **QR cards**, press **Open the QR cards** and print cards for the family (see
+   [QR cards](#qr-cards-and-resetting-access)).
 
 ## Putting it on the internet safely
 
@@ -140,12 +142,30 @@ Good to know:
    somewhere else, put its IP address there instead (comma-separated, ranges like `172.17.0.0/16` are
    fine).
 
+**With Cloudflare in front of NPM** (the domain's DNS record is proxied, the orange cloud in
+Cloudflare): keep `TRUSTED_PROXIES=private`. Visitors are still told apart, by the address Cloudflare
+reports for them, and phones and computers at home that reach NPM directly each count on their own.
+Cloudflare's 100 MB request limit and its terms for video (see Option A) apply then too.
+
 ### Why TRUSTED_PROXIES matters
 
 Wrong family codes are limited to 10 tries per visitor every 15 minutes. To tell visitors apart, the
 app believes the visitor address that Cloudflare or NPM passes on, but only when the request really
 comes from one of the `TRUSTED_PROXIES`. Everyone else's claims are ignored, so nobody can fake their
-way around the limit. QR cards keep working even while typing the code is paused.
+way around the limit. When the request went through two proxies (Cloudflare, then NPM), the one in
+the middle is skipped, so visitors aren't all counted as that one proxy.
+
+| How the site is reached | `TRUSTED_PROXIES` |
+|---|---|
+| Cloudflare Tunnel, with `cloudflared` on your server or home network | `private` (the default) |
+| Nginx Proxy Manager on your server or home network, with or without Cloudflare in front | `private` (the default) |
+| Nginx Proxy Manager somewhere else | its IP address |
+| Cloudflare connecting straight to the app's port, with nothing in between | `cloudflare` (Cloudflare's own address ranges) |
+
+On top of that, once strangers have typed 100 wrong family codes in 15 minutes (50 wrong admin
+passwords), typing it pauses for browsers that have never signed in here. Phones and computers that
+have signed in before keep an allowance of their own, so an attack by strangers can't lock the family
+out. QR cards keep working throughout.
 
 The site also tells search engines not to index it, and every page except sign-in needs the family
 code.
@@ -159,8 +179,8 @@ Without `SMTP_HOST`, nothing is sent: each email is saved as an `.eml` file in
 `/mnt/user/appdata/family-photos/outbox/`. Any mail program (Apple Mail, Outlook, Thunderbird) opens
 them.
 
-Port 587 uses STARTTLS; port 465 uses TLS from the start. After changing these settings, use **Send
-test email** on the admin page.
+Port 587 uses STARTTLS; port 465 uses TLS from the start. After changing these settings, press **Send
+test email** under **Email** on the admin page.
 
 **Gmail** (needs 2-Step Verification; create an app password at Google Account → Security → App
 passwords):
@@ -198,14 +218,15 @@ site title with `SMTP_USER` (if it's an email address) or `ADMIN_EMAIL`.
 
 ## QR cards and resetting access
 
-**Printing QR cards.** On the admin page, open **QR cards**. There's one card for the whole site and
-one for each album. Pointing a phone camera at a card signs that person straight in (and opens the
-album, for album cards); they're asked for their first name once. They're handy for anyone who'd
-rather not type a code.
+**Printing QR cards.** On the admin page, press **Open the QR cards** (or use **QR cards** at the top
+of any admin page). There's one card for the whole site and one for each album. Pointing a phone
+camera at a card signs that person straight in (and opens the album, for album cards); they're asked
+for their first name once. They're handy for anyone who'd rather not type a code.
 
 **Reset access.** If the family code or a card ended up with someone it shouldn't have, press
-**Reset access** on the admin page. Everyone is signed out on every device and has to type the family
-code again, and every printed card stops working, so print new ones. You stay signed in.
+**Reset access…** at the bottom of the admin page and confirm with **Yes, reset access**. Everyone
+is signed out on every device and has to type the family code again, and every printed card stops
+working, so print new ones. You stay signed in.
 
 **Changing the family code.** Change `FAMILY_PASSWORD` in the template and click **Apply**. That also
 signs everyone out and stops old cards. Names and everything people added stay as they are.
@@ -235,10 +256,14 @@ and downloads.
 
 **Duplicates.** The same file sent twice to the same album is only added once.
 
-**What doesn't work.** Things that aren't photos or videos (PDFs, documents, drawings saved as SVG,
-some rare video types) can't be added. They show up on the admin page under **Uploads that didn't
-work**, with their file kept, and you get an email. The person who sent it sees "We couldn't add this
-one. Michael has been told."
+**What doesn't work.** Documents, PDFs, music, zip files and drawings saved as SVG are turned away on
+the phone or computer before they're sent: the person sees "That one isn't a photo or video." and
+nothing reaches the server, so you aren't told. Files that look like a photo or video but turn out
+not to be one, and some rare video types, are sent but can't be added. The person who sent it sees
+"We couldn't add this one. Michael has been told." (with your `ADMIN_NAME`), the file is kept, it
+shows up on the admin page under **Uploads that didn't work** with **Try again**, **Download
+original** and **Move to trash**, and you get an email (at most one an hour). When something only
+went wrong for the moment, the person sees "This one didn't work." and can try again themselves.
 
 **Originals archive (`KEEP_ORIGINALS`).** With the default `true`, whenever a file had to be
 converted, the file exactly as the phone sent it is moved to `/photos/originals/`. Only you, as admin,
@@ -248,8 +273,8 @@ converter, and you have the untouched original if something ever looks wrong.
 The cost is storage: for a busy family (3,000 iPhone photos and 100 minutes of 4K video a year) the
 site needs about 35 GB a year without the archive and about 85 GB with it. A 1 TB share lasts more
 than 10 years either way. Set `KEEP_ORIGINALS=false` to stop keeping new originals; **Delete all
-archived originals** on the admin page frees the space already used. Uploads that didn't work always
-keep their file, so they can be tried again.
+archived originals** under **Storage** on the admin page frees the space already used. Uploads that
+didn't work always keep their file, so they can be tried again.
 
 **Limits.** One file can be up to `MAX_UPLOAD_GB` (50 GB) and a video up to `MAX_VIDEO_MINUTES`
 (120 minutes).
@@ -318,20 +343,24 @@ like `[entrypoint] cgroup v2: cpu.weight=… ` shows the CPU share. If the next 
 Lower `VIDEO_THREADS` (e.g. `2`) to leave more cores free, or raise it to finish videos sooner. CPU
 pinning set in Unraid is respected.
 
-**Emails don't arrive.** On the admin page, press **Send test email**; it shows the error if sending
-failed. Without `SMTP_HOST`, look in `/mnt/user/appdata/family-photos/outbox/` instead. Also check
-the spam folder, that Gmail uses an app password, and that `SMTP_FROM` is an address your provider
-allows. Requests whose email failed can be resent from the admin page.
+**Emails don't arrive.** On the admin page, under **Email**, press **Send test email**; it shows the
+error if sending failed. Without `SMTP_HOST`, look in `/mnt/user/appdata/family-photos/outbox/`
+instead. Also check the spam folder, that Gmail uses an app password, and that `SMTP_FROM` is an
+address your provider allows. Removal requests whose email failed are listed under **Request emails
+that didn't send**, each with a **Resend** button.
 
 **Uploads stall or fail through the proxy.** With NPM, check `client_max_body_size 64m;` in the proxy
 host's Advanced tab. Uploads continue where they stopped; keeping the page open finishes them.
 
 **Family members are told "Too many tries".** They typed a wrong code 10 times in 15 minutes and must
-wait, or, if it happens to everyone, the proxy isn't in `TRUSTED_PROXIES`, so everyone looks like one
-visitor. QR cards work in the meantime.
+wait. If it happens to everyone, either the proxy isn't in `TRUSTED_PROXIES`, so everyone looks like
+one visitor (see [Why TRUSTED_PROXIES matters](#why-trusted_proxies-matters)), or strangers are
+guessing the code; then only browsers that have never signed in here have to wait. QR cards work in
+the meantime.
 
 **The admin page lists problems under "Media tools".** The official image always has everything; make
-sure you're running it (Repository `ghcr.io/brewer-michael/family-photos`) and update it.
+sure you're running it (Repository `ghcr.io/brewer-michael/family-photos`) and update it. Then press
+**Check again** there.
 
 **Forgot the admin password.** Set a new `ADMIN_PASSWORD` in the template and click **Apply**.
 
@@ -359,7 +388,7 @@ Set in the Unraid template. Empty means "use the default". Unraid also passes yo
 | `MAX_UPLOAD_GB` | 50 | Largest single file, in GB |
 | `MAX_VIDEO_MINUTES` | 120 | Longest video |
 | `VIDEO_THREADS` | auto | CPU threads per video; auto is half the cores, at least 2 |
-| `TRUSTED_PROXIES` | private | Who may report the visitor's address: IPs, ranges, `private` or `none` |
+| `TRUSTED_PROXIES` | private | Who may report the visitor's address: IPs, ranges, `private`, `cloudflare` or `none` |
 | `PUID`, `PGID` | 99, 100 | Owner of the files the app writes |
 | `UMASK` | 022 | Permissions for new files (`002` adds group write) |
 
@@ -389,15 +418,15 @@ Run it locally:
 
 ```sh
 npm ci --ignore-scripts && npm run prepare
-cp .env.example .env        # then delete the CONFIG_DIR and PHOTOS_DIR lines (defaults: ./data/…)
-                            # and set PUBLIC_URL=http://localhost:5173
+cp .env.example .env        # then set PUBLIC_URL=http://localhost:5173 (data goes to ./data/)
 npm run build:worker        # the web app starts the media worker from build-worker/
 node --env-file=.env node_modules/vite/bin/vite.js dev
 ```
 
-`--ignore-scripts` keeps npm from compiling better-sqlite3, which ships ready-made binaries; a plain
-`npm ci` works too when Python and a C++ compiler are installed. The Dockerfile and CI install the same
-way.
+`--ignore-scripts` keeps npm from compiling better-sqlite3, which ships ready-made binaries for
+Linux, macOS and Windows and loads them by itself, on Node 22 and 24 alike. A plain `npm ci` needs
+Python and a C++ compiler for that compile step and fails without them. The Dockerfile and CI
+install the same way.
 
 `npm run dev:worker` rebuilds the worker on change. For the production build:
 `npm run build`, then `node --env-file=.env server.js` (with `PUBLIC_URL=http://localhost:3000`).
@@ -413,13 +442,15 @@ way.
 
 **Continuous integration** (`.github/workflows/`):
 
-- `ci.yml`, on every push and pull request: check, unit tests, build and end-to-end tests on Node 22
-  and 24; plus **media-parity**, which runs `npm run test:media` inside `node:24-trixie-slim` with
-  exactly the image's media packages (installed by `docker/media-tools.sh`), so tests that skip on a
-  laptop run there.
-- `docker.yml`, on `main`, `v*` tags and pull requests: builds the image, smoke-tests it
+- `ci.yml`, on pushes to `main` and on pull requests (or run by hand): check, unit tests, build and
+  end-to-end tests on Node 22 and 24; **media-parity**, which runs `npm run test:media` inside
+  `node:24-trixie-slim` with exactly the image's media packages (installed by
+  `docker/media-tools.sh`), so tests that skip on a laptop run there; and a lint job for the Unraid
+  template (`xmllint`) and the shell scripts (`sh -n`, ShellCheck).
+- `docker.yml`, on `main`, `v*` tags and pull requests: builds the image and smoke-tests it
   (`scripts/ci-docker-smoke.sh`: healthy, sign-in page served, files owned by 99:100, both worker
-  lanes start, time zone, media self-check passes) and, except for pull requests, pushes it to
+  lanes start, a writable home folder, time zone, media self-check passes). Except for pull requests,
+  a second job, the only one allowed to write packages, then pushes it to
   `ghcr.io/brewer-michael/family-photos`.
 
 ## Release checklist (real devices)

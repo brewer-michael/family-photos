@@ -57,9 +57,12 @@ test('a photo goes from the picker to a finished tile', async ({ page, isMobile 
 
 	const tiles = page.getByRole('list', { name: 'Your photos and videos' }).getByRole('listitem');
 	await expect(tiles).toHaveCount(2);
-	const photo = tiles.filter({ hasText: 'IMG_0420.JPG' });
-	const pdf = tiles.filter({ hasText: 'Tax return.pdf' });
+	// Tiles name files without their extension, like the album page.
+	const photo = tiles.filter({ hasText: 'IMG_0420' });
+	const pdf = tiles.filter({ hasText: 'Tax return' });
 	await expect(pdf).toContainText("That one isn't a photo or video.");
+	await expect(pdf).not.toContainText('.pdf');
+	await expect(photo).not.toContainText('.JPG');
 	await expect(page.getByText('Sending 1 of 1…')).toBeVisible();
 	await expect(page.getByText('Keep this screen open until it says Done.')).toBeVisible();
 	await expect(photo).toContainText(/Sending… \d+%/);
@@ -92,13 +95,20 @@ test('picking the same photo again says it is already in the album', async ({ pa
 	await page.goto(`/album/${album}?add`);
 	const bytes = await jpeg();
 	await pick(page, [{ name: 'IMG_0001.JPG', mimeType: 'image/jpeg', buffer: bytes }]);
-	const tiles = page.getByRole('list', { name: 'Your photos and videos' }).getByRole('listitem');
-	await expect(tiles.first()).toContainText(FINISHED, { timeout: 45_000 });
+	// The album page uses clearOnDone: a finished batch collapses to one summary line, and the photo
+	// moves to the grid (or, if it failed, to the page's own "Still on their way" list).
+	const uploader = page.locator('.uploader');
+	const tiles = uploader.getByRole('list', { name: 'Your photos and videos' }).getByRole('listitem');
+	await expect(uploader.locator('.summary')).toContainText(/Done! 1 added\.|1 couldn't be added/, { timeout: 45_000 });
+	await expect(tiles).toHaveCount(0);
 	// Only a live item (not a failed one) makes the second copy a duplicate.
 	const first = readRows<{ status: string }>('SELECT status FROM media WHERE album_id = ?', album)[0].status;
 	test.skip(first !== 'ready', 'the photo lane did not add the first copy, so there is nothing to duplicate');
+	await expect(page.locator('a[href^="/view/"]')).toHaveCount(1);
 
 	await pick(page, [{ name: 'IMG_0001 copy.JPG', mimeType: 'image/jpeg', buffer: bytes }]);
-	await expect(tiles).toHaveCount(1); // the finished batch made way for the new one
-	await expect(tiles.first()).toContainText('✓ Already in this album', { timeout: 30_000 });
+	// A new batch starts a new summary.
+	await expect(uploader.locator('.summary')).toHaveText('Done! 1 already in this album.', { timeout: 30_000 });
+	await expect(tiles).toHaveCount(0);
+	await expect(page.locator('a[href^="/view/"]')).toHaveCount(1);
 });

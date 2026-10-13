@@ -12,6 +12,7 @@ import {
 	deleteArchivedOriginals,
 	deleteItemFiles,
 	emptyTrash,
+	listOutdated,
 	removeInside,
 	reprocessOutdated,
 	restoreItem,
@@ -145,6 +146,32 @@ describe('trash', () => {
 		expect(media.getById(b)?.deleted_at).toBeNull();
 	});
 
+	it('leaves items that intake or a lane is still working on for the next purge', async () => {
+		const setStatus = (id: string, status: string) => getDb().prepare('UPDATE media SET status = ? WHERE id = ?').run(status, id);
+		const taking = received(album); // intake may be reading its upload
+		const converting = ready(album); // e.g. "Redo them", then removed: a lane is writing it
+		const waiting = ready(album); // queued, but the queue never claims trashed rows
+		const withVideo = ready(album); // its Live Photo video is being converted
+		const video = ready(album);
+		getDb().prepare('UPDATE media SET live_photo_of = ? WHERE id = ?').run(withVideo, video);
+		setStatus(converting, 'processing');
+		setStatus(waiting, 'queued');
+		setStatus(video, 'processing');
+		for (const id of [taking, converting, waiting, withVideo]) media.softDelete(id, 'x');
+
+		expect(await emptyTrash()).toBe(1);
+		expect(media.getById(waiting)).toBeUndefined();
+		expect(fs.existsSync(libraryPath(waiting, 'jpg'))).toBe(false);
+		for (const id of [taking, converting, withVideo, video]) expect(media.getById(id), id).toBeDefined();
+		expect(fs.existsSync(libraryPath(converting, 'jpg'))).toBe(true);
+
+		// Once they have settled, the next purge takes them (the video with its photo).
+		for (const id of [taking, converting, video]) setStatus(id, 'failed');
+		expect(await emptyTrash()).toBe(3);
+		for (const id of [taking, converting, withVideo, video]) expect(media.getById(id), id).toBeUndefined();
+		expect(fs.existsSync(libraryPath(video, 'jpg'))).toBe(false);
+	});
+
 	it('a restore asked for during a purge waits for it (and finds the item gone)', async () => {
 		const a = ready(album);
 		media.softDelete(a, 'x');
@@ -181,7 +208,11 @@ describe('archived originals and redoing', () => {
 	it('queues items made by an older pipeline again and wakes the lanes', async () => {
 		const old = ready(album, { pipelineVersion: 0 });
 		ready(album);
+		const trashed = ready(album, { pipelineVersion: 0 }); // can't be redone, so not counted
+		media.softDelete(trashed, 'x');
+		expect(listOutdated().map((r) => r.id)).toEqual([old]);
 		expect(await reprocessOutdated()).toBe(1);
+		expect(listOutdated()).toEqual([]);
 		expect(media.getById(old)?.status).toBe('queued');
 		expect(wakeQueue).toHaveBeenCalledTimes(1);
 	});
@@ -264,6 +295,22 @@ describe('/admin/requests/[id]', () => {
 		expect(ok).toMatchObject({ ok: true, message: 'Moved to “Other”.' });
 		expect(media.getById(id)?.album_id).toBe(other);
 		expect(requests.get(rid)).toMatchObject({ status: 'approved', resolved_action: 'moved' });
+	});
+
+	it('Move also approves the other "Wrong album" requests for the item, and leaves the rest pending', async () => {
+		const id = ready(album);
+		const ask2 = (device: string, reason: 'wrong_album' | 'in_it') =>
+			requests.create({ mediaId: id, requesterName: 'Cousin Sam', requesterDevice: device, reason }).request.id;
+		const reviewed = ask2('deviceCCCCCCCCCCCCCCCC', 'wrong_album');
+		const same = ask2('deviceDDDDDDDDDDDDDDDD', 'wrong_album');
+		const other = ask2('deviceEEEEEEEEEEEEEEEE', 'in_it');
+		const unrelated = requests.create({ mediaId: ready(album), requesterName: 'Jo', requesterDevice: 'deviceFFFFFFFFFFFFFFFF', reason: 'wrong_album' }).request.id;
+
+		const res = await requestActions.move(event(ADMIN, { params: { id: String(reviewed) }, form: { album: String(defaultAlbum) } }));
+		expect(res).toMatchObject({ ok: true });
+		for (const r of [reviewed, same]) expect(requests.get(r)).toMatchObject({ status: 'approved', resolved_action: 'moved' });
+		expect(requests.get(other)?.status).toBe('pending');
+		expect(requests.get(unrelated)?.status).toBe('pending');
 	});
 
 	it('Dismiss changes nothing but the request; family members are refused', async () => {

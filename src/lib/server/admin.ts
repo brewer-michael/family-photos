@@ -109,7 +109,8 @@ function exclusive<T>(fn: () => T | Promise<T>): Promise<T> {
 
 /**
  * Deletes items trashed more than `olderThanMs` ago for good: files first, then rows (a crash in
- * between leaves rows whose files are gone, and the next purge finishes them). Returns how many
+ * between leaves rows whose files are gone, and the next purge finishes them). Items still being
+ * taken in or converted wait for the next purge (see adminRepo.trashedBefore). Returns how many
  * items (not counting hidden Live Photo videos) were deleted.
  */
 export function purgeTrash(olderThanMs: number, now: number = Date.now()): Promise<number> {
@@ -162,9 +163,14 @@ export function deleteArchivedOriginals(): Promise<{ count: number; bytes: numbe
 	});
 }
 
-/** Ready items made by an older pipeline whose archived original lets them be redone. */
+/**
+ * Ready items, not in the trash, made by an older pipeline whose archived original lets them be
+ * redone: exactly the rows media.markForReprocess() accepts, so "Redo them" never finds nothing.
+ */
 export function listOutdated(): media.MediaRow[] {
-	return media.listBelowPipelineVersion(PIPELINE_VERSION).filter((r) => r.source_kept === 1 && r.source_ext);
+	return media
+		.listBelowPipelineVersion(PIPELINE_VERSION)
+		.filter((r) => r.deleted_at === null && r.source_kept === 1 && r.source_ext !== null && r.kind !== null);
 }
 
 /** Queues every outdated item again from its archived original. Returns how many. */

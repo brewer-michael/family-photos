@@ -318,7 +318,7 @@ describe('media lifecycle', () => {
 		expect(media.statusForIds([])).toEqual([]);
 	});
 
-	it('soft delete / restore / trash / purge (Live Photo video follows its photo)', () => {
+	it('soft delete / restore / trash (Live Photo video follows its photo)', () => {
 		const photo = ready(defaultAlbum, 'lp-photo', 1000, { contentId: 'ABC' });
 		const video = ready(defaultAlbum, 'lp-video', 1000, { kind: 'video', contentId: 'ABC', durationMs: 3000 });
 		expect(media.getById(video)!.live_photo_of).toBe(photo); // paired on ready
@@ -333,13 +333,7 @@ describe('media lifecycle', () => {
 		expect(media.restore(photo)).toEqual({ ok: true });
 		expect(media.getById(video)!.deleted_at).toBeNull();
 		expect(media.listByAlbum(defaultAlbum).items.map((m) => m.id)).toEqual([photo]);
-
-		media.softDelete(photo, 'again');
-		expect(media.purgeTrashOlderThan(30 * 86400_000)).toEqual([]); // too recent
-		const purged = media.purgeTrashOlderThan(30 * 86400_000, Date.now() + 31 * 86400_000);
-		expect(purged.map((r) => r.id).sort()).toEqual([photo, video].sort());
-		expect(media.getById(photo)).toBeUndefined();
-		expect(media.getById(video)).toBeUndefined();
+		// Purging the trash for good is admin.purgeTrash (tests/unit/maintenance.test.ts).
 	});
 
 	it('pairs Live Photos whichever finishes first, but not long videos', () => {
@@ -388,6 +382,24 @@ describe('media lifecycle', () => {
 		media.softDelete(reupload, 'make room');
 		expect(media.restore(photo)).toEqual({ ok: true });
 		expect(media.livePhotoVideoFor(photo)!.id).toBe(video);
+	});
+
+	it('a refused move or restore names the photo, not the hidden Live Photo video it collides with', () => {
+		const other = albums.create({ title: 'Other', createdByName: null, createdByDevice: null });
+		// The other album has a Live Photo whose video has the same bytes as ours.
+		const theirPhoto = ready(other.id, 'vis-their-photo', 1, { contentId: 'THEIRS' });
+		const theirVideo = ready(other.id, 'vis-video', 1, { kind: 'video', contentId: 'THEIRS', durationMs: 2000 });
+		expect(media.getById(theirVideo)!.live_photo_of).toBe(theirPhoto);
+		const photo = ready(defaultAlbum, 'vis-photo', 1, { contentId: 'OURS' });
+		ready(defaultAlbum, 'vis-video', 1, { kind: 'video', contentId: 'OURS', durationMs: 2000 });
+		expect(media.move(photo, other.id)).toEqual({ ok: false, reason: 'duplicate', conflictId: theirPhoto });
+
+		// Trashed, then the same Live Photo is uploaded again: restore names the new photo.
+		media.softDelete(photo, 'oops');
+		const again = ready(defaultAlbum, 'vis-photo-again', 1, { contentId: 'AGAIN' });
+		const againVideo = ready(defaultAlbum, 'vis-video', 1, { kind: 'video', contentId: 'AGAIN', durationMs: 2000 });
+		expect(media.getById(againVideo)!.live_photo_of).toBe(again);
+		expect(media.restore(photo)).toEqual({ ok: false, reason: 'duplicate', conflictId: again });
 	});
 
 	it('storage totals', () => {

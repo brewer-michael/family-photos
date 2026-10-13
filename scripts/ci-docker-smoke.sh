@@ -5,6 +5,7 @@
 #   - becomes healthy (the image's HEALTHCHECK) and answers /healthz and the sign-in page,
 #   - writes its data as 99:100 and gives /photos' top-level folders to 99:100,
 #   - can start both media worker lanes as 99:100 (scripts/smoke-worker.mjs),
+#   - runs the app with a HOME it can write to (not root's),
 #   - has a working time zone and passes the app's media-tools self-check.
 #
 #   scripts/ci-docker-smoke.sh <image>
@@ -86,6 +87,17 @@ for lane in photo video; do
 	docker exec -u 99:100 -w /app "$name" node scripts/smoke-worker.mjs "$lane" || fail "the $lane worker lane did not start"
 done
 echo 'ok: both worker lanes start as 99:100'
+
+# Read as 99:100: only the process's own user may read its environment.
+app_home=$(docker exec -u 99:100 "$name" sh -c '
+	for p in /proc/[0-9]*; do
+		[ "$(tr "\0" " " <"$p/cmdline" 2>/dev/null)" = "node server.js " ] || continue
+		tr "\0" "\n" <"$p/environ" | sed -n "s/^HOME=//p"
+		break
+	done')
+[ -n "$app_home" ] || fail 'could not read the HOME of the app process'
+docker exec -u 99:100 "$name" test -w "$app_home" || fail "the app's HOME ($app_home) is not writable for 99:100"
+echo "ok: the app's HOME ($app_home) is writable"
 
 case $(docker exec "$name" date +%Z) in
 CDT | CST) echo 'ok: TZ is applied' ;;

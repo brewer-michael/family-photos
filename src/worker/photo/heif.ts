@@ -10,7 +10,10 @@
  *   failure the next one is tried. A timeout is not retried (the photo job would overrun).
  * - Timeout 180 s, 360 s with more than one top-level image.
  * - "Security limit exceeded" → one retry with --disable-limits when the tool supports it and
- *   the primary image is ≤ 250 MP and the file ≤ 100 MB; otherwise too_large.
+ *   the file is ≤ 100 MB (heif-info, before the size is known) and the primary image ≤ 250 MP
+ *   (heif-dec); otherwise too_large.
+ * - Image sequences (avis/msf1 brands): the primary still is decoded. heif-convert (libheif 1.17)
+ *   refuses those files ("unsupported HEIF/AVIF file type"), so they fail as unsupported there.
  * - heif-dec stops at the first image it can't decode, so a broken non-primary image fails the
  *   item as corrupt (the source is kept for the admin).
  */
@@ -41,7 +44,8 @@ const INFO_TIMEOUT_MS = DECODE_TIMEOUT_MS;
 const DISABLE_LIMITS_MAX_PIXELS = 250_000_000;
 const DISABLE_LIMITS_MAX_BYTES = 100 * 1024 * 1024;
 const LIMIT_RE = /security limit exceeded/i;
-const UNSUPPORTED_RE = /unsupported (feature|codec|filetype|image type)|no decoding plugin|not a supported format/i;
+const UNSUPPORTED_RE =
+	/unsupported (feature|codec|filetype|image type)|unsupported HEIF\/AVIF file type|no decoding plugin|not a supported format/i;
 
 /**
  * Parses heif-info output (the same `image:` lines in libheif 1.17 and 1.19; 1.19 adds `tiles:`).
@@ -78,11 +82,20 @@ function runFailure(e: unknown, what: string): MediaError | null {
 	return null;
 }
 
-/** heif-info on the source, retried with --disable-limits when needed and supported. */
-export async function readHeifInfo(src: string, tools: HeifTools, signal: AbortSignal): Promise<HeifInfo> {
+export interface ReadHeifInfoOptions {
+	sizeBytes: number;
+	signal: AbortSignal;
+	log: (msg: string) => void;
+}
+
+/**
+ * heif-info on the source, retried with --disable-limits when needed, supported and the file is
+ * ≤ 100 MB (the image size is not known yet).
+ */
+export async function readHeifInfo(src: string, tools: HeifTools, opts: ReadHeifInfoOptions): Promise<HeifInfo> {
 	const attempt = async (disableLimits: boolean): Promise<HeifInfo> => {
 		const args = [...(disableLimits ? ['--disable-limits'] : []), src];
-		const { stdout } = await run(tools.infoBin, args, { timeoutMs: INFO_TIMEOUT_MS, signal });
+		const { stdout } = await run(tools.infoBin, args, { timeoutMs: INFO_TIMEOUT_MS, signal: opts.signal });
 		const info = parseHeifInfo(stdout.toString('utf8'));
 		if (!info) throw new MediaError('corrupt', 'heif-info listed no images');
 		return info;
@@ -95,7 +108,8 @@ export async function readHeifInfo(src: string, tools: HeifTools, signal: AbortS
 		if (MediaError.is(e)) throw e;
 		const tail = stderrTail(e);
 		if (LIMIT_RE.test(tail)) {
-			if (!tools.infoDisableLimits) throw new MediaError('too_large', `heif-info: ${tail}`);
+			if (!tools.infoDisableLimits || opts.sizeBytes > DISABLE_LIMITS_MAX_BYTES) throw new MediaError('too_large', `heif-info: ${tail}`);
+			opts.log(`HEIF security limit hit reading the file; retrying heif-info with --disable-limits (${opts.sizeBytes} bytes)`);
 			try {
 				return await attempt(true);
 			} catch (e2) {

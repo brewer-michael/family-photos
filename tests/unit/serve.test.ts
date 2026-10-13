@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { ifRangeAllows, isAnimatedPng, noneMatch, parseRange, serveFile } from '#lib/server/serve';
+import { ifRangeAllows, noneMatch, parseRange, serveFile } from '#lib/server/serve';
 import { testEnv } from '../helpers/env';
 
 describe('parseRange', () => {
@@ -147,24 +147,5 @@ describe('serveFile', () => {
 				for (;;) if ((await reader.read()).done) return 'ended';
 			})().catch(() => 'errored')
 		).resolves.toMatch(/ended|errored/);
-	});
-});
-
-describe('helpers', () => {
-	it('spots animated PNGs (acTL before IDAT)', async () => {
-		const chunk = (type: string, data = Buffer.alloc(0)) => {
-			const len = Buffer.alloc(4);
-			len.writeUInt32BE(data.length);
-			return Buffer.concat([len, Buffer.from(type, 'latin1'), data, Buffer.alloc(4)]);
-		};
-		const sig = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-		const dir = testEnv().root;
-		const apng = path.join(dir, 'a.png');
-		const still = path.join(dir, 's.png');
-		fs.writeFileSync(apng, Buffer.concat([sig, chunk('IHDR', Buffer.alloc(13)), chunk('acTL', Buffer.alloc(8)), chunk('IDAT')]));
-		fs.writeFileSync(still, Buffer.concat([sig, chunk('IHDR', Buffer.alloc(13)), chunk('IDAT'), chunk('IEND')]));
-		expect(await isAnimatedPng(apng)).toBe(true);
-		expect(await isAnimatedPng(still)).toBe(false);
-		expect(await isAnimatedPng(path.join(dir, 'missing.png'))).toBe(false);
 	});
 });

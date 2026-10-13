@@ -1,4 +1,8 @@
-<!-- "What should we call you?" — asked once per device. Works without JavaScript. -->
+<!--
+	"What should we call you?" — asked once per device. Works without JavaScript.
+	defaultValue, not value: on a slow phone someone may start typing before the page hydrates, and
+	hydrating a `value` would wipe what they typed.
+-->
 <script lang="ts">
 	import type { PageProps } from './$types';
 	import Icon from '#lib/components/Icon.svelte';
@@ -32,7 +36,7 @@
 				enterkeyhint="done"
 				maxlength="40"
 				required
-				value={data.currentName ?? ''}
+				defaultValue={data.currentName ?? ''}
 				aria-invalid={!!form?.message}
 				aria-describedby={describedBy}
 			/>

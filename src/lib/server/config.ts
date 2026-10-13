@@ -46,7 +46,10 @@ export interface Config {
 	photosDir: string;
 	/** HEIF_DEC_BIN override; null → detect heif-dec, then heif-convert. */
 	heifDecBin: string | null;
-	/** EXIFTOOL_BIN override; null → worker decides (/usr/bin/exiftool, else vendored). */
+	/**
+	 * EXIFTOOL_BIN, else the older EXIFTOOL_PATH (the same order as the worker lanes'
+	 * exiftoolBinary()); null → /usr/bin/exiftool, else what the lanes fall back to.
+	 */
 	exiftoolBin: string | null;
 	ffmpegBin: string;
 	ffprobeBin: string;
@@ -57,7 +60,7 @@ export interface Config {
 	/**
 	 * TRUSTED_PROXIES: socket peers whose cf-connecting-ip / x-real-ip headers are believed
 	 * (rate limiting). Entries are IPs, CIDRs, 'private' (loopback + private/link-local/ULA
-	 * ranges) or 'none'. Default ['private'].
+	 * ranges), 'cloudflare' (Cloudflare's published edge ranges) or 'none'. Default ['private'].
 	 */
 	trustedProxies: string[];
 	/** Non-fatal problems, shown on the admin page and logged at startup. */
@@ -231,7 +234,7 @@ export function loadConfig(env: Env = process.env): Config {
 		configDir,
 		photosDir,
 		heifDecBin: str(env, 'HEIF_DEC_BIN') ?? null,
-		exiftoolBin: str(env, 'EXIFTOOL_BIN') ?? null,
+		exiftoolBin: str(env, 'EXIFTOOL_BIN') ?? str(env, 'EXIFTOOL_PATH') ?? null,
 		ffmpegBin: str(env, 'FFMPEG_BIN') ?? 'ffmpeg',
 		ffprobeBin: str(env, 'FFPROBE_BIN') ?? 'ffprobe',
 		port,
@@ -242,7 +245,10 @@ export function loadConfig(env: Env = process.env): Config {
 	};
 }
 
-/** Validates TRUSTED_PROXIES (comma-separated IPs, CIDRs, 'private' or 'none'); default ['private']. */
+/**
+ * Validates TRUSTED_PROXIES (comma-separated IPs, CIDRs, 'private', 'cloudflare' or 'none');
+ * default ['private'].
+ */
 function parseTrustedProxies(raw: string | undefined, problems: string[]): string[] {
 	if (raw === undefined) return ['private'];
 	const entries = raw
@@ -250,14 +256,14 @@ function parseTrustedProxies(raw: string | undefined, problems: string[]): strin
 		.map((e) => e.trim().toLowerCase())
 		.filter(Boolean);
 	for (const e of entries) {
-		if (e === 'private' || e === 'none') continue;
+		if (e === 'private' || e === 'cloudflare' || e === 'none') continue;
 		const [addr, bits, extra] = e.split('/');
 		const family = isIP(addr);
 		const maxBits = family === 6 ? 128 : 32;
 		const okBits = bits === undefined || (/^\d{1,3}$/.test(bits) && Number(bits) <= maxBits);
 		if (family === 0 || !okBits || extra !== undefined) {
 			problems.push(
-				`TRUSTED_PROXIES entry "${e}" is not valid; use IP addresses or ranges like 172.17.0.0/16, or "private".`
+				`TRUSTED_PROXIES entry "${e}" is not valid; use IP addresses or ranges like 172.17.0.0/16, "private" or "cloudflare".`
 			);
 		}
 	}

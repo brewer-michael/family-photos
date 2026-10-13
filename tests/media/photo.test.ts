@@ -32,6 +32,7 @@ import {
 	QUAD,
 	QUAD_EXIF,
 	expectedQuadrants,
+	storedPoint,
 	type Rgb
 } from '../helpers/photo-fixtures';
 import { zeroItemData } from '../helpers/photo-heif';
@@ -201,6 +202,12 @@ async function expectPatches(file: string, opts: { asCoded?: boolean } = {}): Pr
 	return worst;
 }
 
+/** 16-bit samples as stored (no orientation applied), 3 channels. */
+async function samples16(file: string): Promise<{ data: Uint16Array; width: number; height: number }> {
+	const { data, info } = await sharp(file).toColourspace('rgb16').raw({ depth: 'ushort' }).toBuffer({ resolveWithObject: true });
+	return { data: new Uint16Array(data.buffer.slice(data.byteOffset, data.byteOffset + data.length)), width: info.width, height: info.height };
+}
+
 function iccDescription(file: string): string | undefined {
 	return exif(file)['ICC_Profile:ProfileDescription'] as string | undefined;
 }
@@ -368,6 +375,28 @@ describe('HEIF', () => {
 		await expectCommitted(c, { ext: 'jpg', conversion: 'transcode', width: 800, height: 533 });
 	});
 
+	it('converts the primary still of an AVIF image sequence (unsupported on libheif 1.17)', async () => {
+		expect(await detectFile(photo('sequence.avif'))).toMatchObject({ kind: 'photo', subtype: 'avif', brand: 'avis', animated: true });
+		const [major, minor] = (heif.version ?? '0.0').split('.').map(Number);
+		if (path.basename(heif.decBin) === 'heif-convert' || major < 1 || (major === 1 && minor < 18)) {
+			// heif-convert refuses every file whose main brand isn't heic/heix/avif/mif1/mif2.
+			const e = await expectFailure(photo('sequence.avif'), 'unsupported');
+			expect(e.detail).toMatch(/unsupported HEIF\/AVIF file type/);
+			return;
+		}
+		const c = await convert(photo('sequence.avif'));
+		await expectCommitted(c, { ext: 'jpg', conversion: 'transcode', width: 64, height: 48 });
+		expect(c.row.source_ext).toBe('avif');
+		const px = await pixels(c.canonical);
+		expect(deltaE2000(meanRgb(px, 8, 8, 48, 32), FRAMES[0] as Rgb)).toBeLessThan(3);
+	});
+
+	it('converts an HLG (HDR) HEIC without tone mapping and logs that for the admin', async () => {
+		const c = await convert(photo('hlg.heic'));
+		expect(c.row).toMatchObject({ conversion: 'transcode', canonical_ext: 'jpg', width: 64, height: 48 });
+		expect(logs.filter((l) => !l.startsWith('INFO'))).toEqual([expect.stringMatching(/^WARN .*HDR photo shown without tone mapping \(HLG\)/)]);
+	});
+
 	it('rotates an iPhone grid image with irot 270 and EXIF Orientation 6 exactly once', async () => {
 		const c = await convert(vendored('arrow.heic'));
 		await expectCommitted(c, { ext: 'jpg', conversion: 'transcode', width: 3024, height: 4032 });
@@ -503,6 +532,27 @@ describe('PNG and GIF', () => {
 		const px = await pixels(c.canonical);
 		expect([px.width, px.height]).toEqual([H, W]);
 		await expectQuadrants(px, 6, 0.5);
+	});
+
+	it('rotates a 16-bit PNG with EXIF Orientation 6 losslessly, keeping all 16 bits', async () => {
+		const c = await convert(photo('orient6-16bit.png'));
+		await expectCommitted(c, { ext: 'png', conversion: 'transcode', width: 48, height: 64 });
+		expect([undefined, 1]).toContain(orientationOf(exif(c.canonical)));
+		const m = await sharp(c.canonical).metadata();
+		expect([m.depth, m.channels]).toEqual(['ushort', 3]);
+		const src = await samples16(photo('orient6-16bit.png'));
+		const got = await samples16(c.canonical);
+		expect(src.data.some((v) => v % 257 !== 0), 'the fixture uses the low byte').toBe(true);
+		let mismatched = 0;
+		for (let y = 0; y < got.height; y++) {
+			for (let x = 0; x < got.width; x++) {
+				const [sx, sy] = storedPoint(6, x, y, got.width, got.height);
+				for (let ch = 0; ch < 3; ch++) {
+					if (got.data[(y * got.width + x) * 3 + ch] !== src.data[(sy * src.width + sx) * 3 + ch]) mismatched++;
+				}
+			}
+		}
+		expect(mismatched).toBe(0);
 	});
 
 	it('keeps an APNG as it is; the thumbnail is its first frame', async () => {
@@ -649,6 +699,15 @@ describe('sources and commits', () => {
 		expect(media.getById(q.id)?.status).toBe('queued');
 	});
 
+	it('never fails a committed item when the source cannot be archived', async () => {
+		// An extension originals/ refuses: archiving fails after markReady(), which must only log.
+		const q = await enqueue(photo('o1.heic'));
+		getDb().prepare('UPDATE media SET source_ext = ? WHERE id = ?').run('he.ic', q.id);
+		await processPhoto(q.id, context());
+		expect(media.getById(q.id)).toMatchObject({ status: 'ready', source_kept: 0 });
+		expect(logs.filter((l) => !l.startsWith('INFO'))).toEqual([expect.stringMatching(/^ERROR .*could not archive the source/)]);
+	});
+
 	it('fails cleanly when the source is gone', async () => {
 		const q = await enqueue(photo('o1.jpg'));
 		fs.rmSync(q.src);
@@ -660,7 +719,7 @@ describe('sources and commits', () => {
 	});
 });
 
-/** Peak resident memory of a decoder run, from /proc/<pid>/status VmHWM (Linux). */
+/** Peak resident memory of a decoder run: /proc/<pid>/status VmHWM (Linux), polled until it exits. */
 function decoderPeakRss(cmd: string, args: string[]): Promise<{ ms: number; peakMb: number }> {
 	return new Promise((resolve, reject) => {
 		const started = Date.now();
@@ -673,7 +732,7 @@ function decoderPeakRss(cmd: string, args: string[]): Promise<{ ms: number; peak
 			} catch {
 				// exited between polls
 			}
-		}, 20);
+		}, 10);
 		child.on('error', reject);
 		child.on('close', (code) => {
 			clearInterval(poll);
@@ -683,48 +742,98 @@ function decoderPeakRss(cmd: string, args: string[]): Promise<{ ms: number; peak
 	});
 }
 
+/**
+ * Bundles tests/helpers/photo-perf-runner.ts with the worker's Vite config (our code bundled,
+ * node_modules external) into `dir`; bare imports resolve through a node_modules link.
+ */
+async function buildPerfRunner(dir: string): Promise<string> {
+	const { build } = await import('vite');
+	await build({
+		configFile: path.resolve('vite.worker.config.ts'),
+		logLevel: 'error',
+		build: {
+			ssr: path.resolve('tests/helpers/photo-perf-runner.ts'),
+			outDir: dir,
+			emptyOutDir: false,
+			sourcemap: false,
+			rolldownOptions: { output: { entryFileNames: 'runner.js' } }
+		}
+	});
+	fs.symlinkSync(path.resolve('node_modules'), path.join(dir, 'node_modules'));
+	return path.join(dir, 'runner.js');
+}
+
+/** processPhoto() for a claimed row in a fresh process started like the photo lane. */
+function runIsolated(runner: string, id: string): Promise<{ ms: number; peakMb: number; idleMb: number }> {
+	return new Promise((resolve, reject) => {
+		const child = spawn(process.execPath, ['--max-old-space-size=512', runner, id], { stdio: ['ignore', 'pipe', 'pipe'] });
+		let out = '';
+		let err = '';
+		child.stdout.on('data', (b: Buffer) => (out += b.toString('utf8')));
+		child.stderr.on('data', (b: Buffer) => (err += b.toString('utf8')));
+		child.on('error', reject);
+		child.on('close', (code) => {
+			if (code !== 0) return reject(new Error(`perf runner exited ${code}: ${err.trim().slice(-2000)}`));
+			resolve(JSON.parse(out.trim().split('\n').at(-1)!) as { ms: number; peakMb: number; idleMb: number });
+		});
+	});
+}
+
+/**
+ * Time and peak memory of one 12 MP and one 48 MP HEIC (docs/media-pipeline.md §8), each in a
+ * fresh process so earlier tests can't raise the high-water mark. The synthetic photos are
+ * encoded at -q 85, which gives about the size of a real iPhone HEIC (≈ 3 MB at 12 MP). The
+ * numbers are printed, not asserted (see tests/media/README.md); only the time has a ceiling.
+ */
 describe('performance', () => {
-	it.each([
-		[12, 4000, 3000],
-		[48, 8000, 6000]
-	])('records time and peak memory for a %i MP HEIC', async (mp, width, height) => {
-		let encoders = '';
+	let runner: string | null = null;
+	let encoders = '';
+	beforeAll(async () => {
 		try {
 			encoders = execFileSync('heif-enc', ['--list-encoders'], { encoding: 'utf8' });
 		} catch {
 			// heif-enc missing
 		}
-		if (!/x265/.test(encoders)) {
+		if (/x265/.test(encoders)) runner = await buildPerfRunner(fs.mkdtempSync(path.join(testEnv().root, 'perf-runner-')));
+	});
+
+	it.each([
+		[12, 4000, 3000],
+		[48, 8000, 6000]
+	])('records time and peak memory for a %i MP HEIC', async (mp, width, height) => {
+		if (!runner) {
 			console.warn(`skipped: heif-enc with the x265 encoder is needed to build the ${mp} MP test image`);
 			return;
 		}
 		const dir = fs.mkdtempSync(path.join(testEnv().root, `perf${mp}-`));
-		const raw = Buffer.alloc(width * height * 3);
+		// Smooth gradients with gentle waves: no flat areas, no noise (noise would make the file far
+		// bigger than a real photo's).
+		const raw = new Uint8ClampedArray(width * height * 3);
 		for (let y = 0; y < height; y++) {
 			for (let x = 0; x < width; x++) {
 				const i = (y * width + x) * 3;
-				raw[i] = (x * 255) / width;
-				raw[i + 1] = (y * 255) / height;
-				raw[i + 2] = ((x >> 4) ^ (y >> 4)) & 255;
+				const wave = Math.sin(x / 37) * Math.cos(y / 53) * 40;
+				raw[i] = (x * 200) / width + 30 + wave;
+				raw[i + 1] = (y * 200) / height + 30 - wave;
+				raw[i + 2] = 128 + Math.sin((x + y) / 23) * 60;
 			}
 		}
 		await sharp(raw, { raw: { width, height, channels: 3 } }).png({ compressionLevel: 1 }).toFile(path.join(dir, 'src.png'));
 		const heic = path.join(dir, `${mp}mp.heic`);
-		execFileSync('heif-enc', ['-q', '50', path.join(dir, 'src.png'), '-o', heic]);
+		execFileSync('heif-enc', ['-q', '85', path.join(dir, 'src.png'), '-o', heic]);
+		fs.rmSync(path.join(dir, 'src.png'));
 
 		const decoder = decoderOrder(heif, 'hevc')[0];
 		const dec = await decoderPeakRss(heif.decBin, ['-d', decoder, '--quiet', '--png-compression-level', '1', heic, path.join(dir, 'dec.png')]);
-		const rssBefore = process.resourceUsage().maxRSS;
-		const started = Date.now();
-		const c = await convert(heic);
-		const ms = Date.now() - started;
-		const rssAfter = process.resourceUsage().maxRSS;
-		await expectCommitted(c, { ext: 'jpg', conversion: 'transcode', width, height });
+		const q = await enqueue(heic);
+		const lane = await runIsolated(runner, q.id);
+		const row = media.getById(q.id)!;
+		expect(row).toMatchObject({ status: 'ready', conversion: 'transcode', canonical_ext: 'jpg', width, height });
 		console.info(
 			`[perf] ${mp} MP HEIC (${width}×${height}, ${(fs.statSync(heic).size / 1e6).toFixed(1)} MB): ` +
-				`processPhoto ${(ms / 1000).toFixed(1)} s; ${path.basename(heif.decBin)} -d ${decoder} alone ${(dec.ms / 1000).toFixed(1)} s, ` +
-				`peak RSS ${dec.peakMb} MB; test process (sharp) peak RSS ${Math.round(rssAfter / 1024)} MB (was ${Math.round(rssBefore / 1024)} MB)`
+				`processPhoto ${(lane.ms / 1000).toFixed(1)} s, photo lane process peak RSS ${lane.peakMb} MB (idle ${lane.idleMb} MB); ` +
+				`${path.basename(heif.decBin)} -d ${decoder} alone ${(dec.ms / 1000).toFixed(1)} s, peak RSS ${dec.peakMb} MB`
 		);
-		expect(ms).toBeLessThan(mp === 48 ? 240_000 : 120_000);
+		expect(lane.ms).toBeLessThan(mp === 48 ? 240_000 : 120_000);
 	});
 });

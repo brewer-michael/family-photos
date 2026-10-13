@@ -37,7 +37,17 @@ import {
 import { ffmpegDecode } from './photo/ffmpeg';
 import { decodeHeif, readHeifInfo } from './photo/heif';
 import { displayP3Icc, embedIccInPng } from './photo/icc';
-import { copyExif, hasExif, photoMeta, readSourceTags, type PhotoMeta, type SourceTags, type Taken } from './photo/metadata';
+import {
+	copyExif,
+	copyRawTags,
+	exiftoolTransient,
+	hasExif,
+	photoMeta,
+	readSourceTags,
+	type PhotoMeta,
+	type SourceTags,
+	type Taken
+} from './photo/metadata';
 import { RAW_FILE_TYPES, rawPreview } from './photo/raw';
 import { ffmpegImageTools, heifTools, photoToolProblems } from './photo/tools';
 
@@ -45,6 +55,8 @@ import { ffmpegImageTools, heifTools, photoToolProblems } from './photo/tools';
 const MAX_PIXELS = 268_402_689;
 /** nclx colour_primaries of Display P3 (SMPTE EG 432-1). */
 const NCLX_DISPLAY_P3 = 12;
+/** nclx transfer_characteristics of HDR photos: PQ (SMPTE ST 2084) and HLG (ARIB STD-B67). */
+const NCLX_HDR_TRANSFER: Readonly<Record<number, string>> = { 16: 'PQ', 18: 'HLG' };
 
 interface Canonical extends Encoded {
 	conversion: Conversion;
@@ -139,7 +151,10 @@ export async function processPhoto(id: string, ctx: WorkerContext): Promise<void
 		}
 		if (!committed) throw new MediaError('retryable', `media ${id} is no longer processing; not committed`);
 		ctx.log.info(`photo ${id}: ${det.subtype} → ${canon.ext} (${canon.conversion}) ${shown.width}×${shown.height} in ${Date.now() - started} ms`);
-		await settleSource(job, canon, keep, sourceExt, row.canonical_ext);
+		// Committed: nothing below may fail the item (src/worker/README.md).
+		await settleSource(job, canon, keep, sourceExt, row.canonical_ext).catch((e: unknown) => {
+			ctx.log.error(`photo ${id}: could not settle the source`, { error: errorDetail(e, 500) });
+		});
 	} finally {
 		await Promise.all([tmp, work].map((d) => fs.rm(d, { recursive: true, force: true }).catch(() => undefined)));
 	}
@@ -210,40 +225,66 @@ async function buildCanonical(job: Job): Promise<Canonical> {
 	}
 }
 
-/** HEIF/AVIF: primary image → PNG (Display P3 ICC added when only nclx says P3) → JPEG/PNG. */
+/**
+ * HEIF/AVIF: primary image → PNG (Display P3 ICC added when only nclx says P3) → JPEG/PNG.
+ * HDR (PQ/HLG) photos are converted without tone mapping in v1 (§2): logged for the admin.
+ */
 async function fromHeif(job: Job): Promise<Encoded> {
 	const { id, src, ctx } = job;
+	const log = (msg: string) => ctx.log.info(`photo ${id}: ${msg}`);
 	const tools = await heifTools();
-	const info = await readHeifInfo(src, tools, ctx.signal);
+	const info = await readHeifInfo(src, tools, { sizeBytes: job.sizeBytes, signal: ctx.signal, log });
 	const primary = info.images[info.primaryIndex];
 	checkPixels(primary.width, primary.height);
 	const dec = await decodeHeif(src, ctx.paths.tmpDir(id), info, tools, {
 		codec: job.det.subtype === 'avif' ? 'av1' : 'hevc',
 		sizeBytes: job.sizeBytes,
 		signal: ctx.signal,
-		log: (msg) => ctx.log.info(`photo ${id}: ${msg}`)
+		log
 	});
 	if (primary.colorProfile === 'nclx' && job.meta.colorPrimaries === NCLX_DISPLAY_P3) {
 		await embedIccInPng(dec, displayP3Icc(), 'Display P3');
 	}
+	const hdr = job.meta.transfer === null ? undefined : NCLX_HDR_TRANSFER[job.meta.transfer];
+	if (hdr) ctx.log.warn(`photo ${id}: HDR photo shown without tone mapping (${hdr}); it may look flat`);
 	return encodeCanonical(dec, job.outBase, { lossless: false });
 }
 
-/** RAW: the embedded preview becomes the canonical JPEG as it is (tags copied, not re-encoded). */
+/**
+ * RAW: the embedded preview becomes the canonical JPEG as it is (tags copied, not re-encoded).
+ * When exiftool can't copy the tags for a reason a retry won't fix, the preview is kept without
+ * them (the row already has the date and place) unless it needs the RAW's Orientation to show
+ * upright: then the item fails as corrupt.
+ */
 async function fromRaw(job: Job): Promise<Canonical> {
 	const preview = await rawPreview(job.src, job.ctx.paths.workDir(job.id));
+	try {
+		await copyRawTags(job.src, preview);
+	} catch (err) {
+		const detail = `exiftool could not copy the RAW's tags: ${errorDetail(err, 500)}`;
+		if (exiftoolTransient(err)) throw new MediaError('retryable', detail);
+		const o = job.meta.orientation;
+		if (o !== null && o !== 1) throw new MediaError('corrupt', `${detail} (the preview needs Orientation ${o})`);
+		job.ctx.log.warn(`photo ${job.id}: kept the RAW preview without the RAW's tags`, { error: detail });
+	}
 	const file = `${job.outBase}.jpg`;
 	await fs.rename(preview, file);
 	return { file, ext: 'jpg', conversion: 'transcode' };
 }
 
-/** Decoders that drop EXIF (TIFF, ffmpeg): copy date, camera and place from the source. */
+/**
+ * Decoders that drop EXIF (TIFF, ffmpeg): copy date, camera and place from the source. When
+ * exiftool can't, for a reason a retry won't fix, the canonical file is kept without them (the
+ * row already has the date and place) rather than failing a good photo.
+ */
 async function withSourceExif(job: Job, e: Encoded): Promise<Encoded> {
 	if (!hasExif(job.tags)) return e;
 	try {
 		await copyExif(job.src, e.file);
 	} catch (err) {
-		throw new MediaError('retryable', `exiftool could not copy the source's EXIF: ${errorDetail(err, 500)}`);
+		const detail = `exiftool could not copy the source's EXIF: ${errorDetail(err, 500)}`;
+		if (exiftoolTransient(err)) throw new MediaError('retryable', detail);
+		job.ctx.log.warn(`photo ${job.id}: kept without the source's EXIF`, { error: detail });
 	}
 	return e;
 }
@@ -279,19 +320,21 @@ async function fsyncPath(p: string): Promise<void> {
 }
 
 /**
- * After the commit (never throws): a transcode's source is archived in originals/ (KEEP_ORIGINALS)
- * or deleted; a passthrough source already became the canonical file. A reprocessed item whose
- * canonical extension changed loses its old library file.
+ * After the commit (never throws; every failure is logged): a transcode's source is archived in
+ * originals/ (KEEP_ORIGINALS) or deleted; a passthrough source already became the canonical file.
+ * A reprocessed item whose canonical extension changed loses its old library file.
  */
 async function settleSource(job: Job, canon: Canonical, keep: boolean, sourceExt: string, previousExt: string | null): Promise<void> {
 	const { id, src, ctx } = job;
 	if (canon.conversion === 'transcode') {
-		const archived = ctx.paths.originalsPath(id, sourceExt);
 		try {
 			if (!keep) await fs.rm(src, { force: true });
-			else if (src !== archived) {
-				await fs.mkdir(path.dirname(archived), { recursive: true });
-				await fs.rename(src, archived);
+			else {
+				const archived = ctx.paths.originalsPath(id, sourceExt);
+				if (src !== archived) {
+					await fs.mkdir(path.dirname(archived), { recursive: true });
+					await fs.rename(src, archived);
+				}
 			}
 		} catch (e) {
 			ctx.log.error(`photo ${id}: could not ${keep ? 'archive' : 'delete'} the source`, { error: errorDetail(e, 500) });
@@ -303,6 +346,10 @@ async function settleSource(job: Job, canon: Canonical, keep: boolean, sourceExt
 		}
 	}
 	if (previousExt && previousExt !== canon.ext) {
-		await fs.rm(ctx.paths.libraryPath(id, previousExt), { force: true }).catch(() => undefined);
+		try {
+			await fs.rm(ctx.paths.libraryPath(id, previousExt), { force: true });
+		} catch (e) {
+			ctx.log.warn(`photo ${id}: could not remove the old .${previousExt} library file`, { error: errorDetail(e, 500) });
+		}
 	}
 }

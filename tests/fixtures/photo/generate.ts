@@ -7,7 +7,7 @@
  *
  * Node ≥ 22.18 runs the TypeScript directly. Needs sharp (node_modules), exiftool, heif-enc with
  * the x265 and aom encoders (libheif-plugin-x265, libheif-plugin-aomenc) and ffmpeg with libjxl,
- * libopenjpeg, bmp and apng.
+ * libopenjpeg, libaom-av1, bmp and apng.
  * The outputs are committed, so CI never needs the encoders. Colours and metadata come from
  * tests/helpers/photo-fixtures.ts, which the tests use for their expectations.
  */
@@ -117,6 +117,15 @@ run('heif-enc', ['-A', '-L', '-p', 'chroma=444', '--matrix_coefficients=0', out(
 const mc = execFileSync('exiftool', ['-s3', '-n', '-MatrixCoefficients', out('gbr-lossless.avif')], { encoding: 'utf8' }).trim();
 if (mc !== '0') throw new Error(`gbr-lossless.avif has matrix_coefficients=${mc}, expected 0`);
 
+// --- 16 bits per sample: PNG with EXIF Orientation 6, 10-bit HLG (HDR) HEIC ----------------------
+fs.writeFileSync(scratch('deep.rgb48'), rgb48(QUAD_SMALL));
+const deepPng = (file: string) =>
+	run('ffmpeg', ['-v', 'error', '-y', '-f', 'rawvideo', '-pix_fmt', 'rgb48be', '-s', `${QUAD_SMALL.width}x${QUAD_SMALL.height}`, '-i', scratch('deep.rgb48'), '-frames:v', '1', '-c:v', 'png', '-pix_fmt', 'rgb48be', file]);
+deepPng(out('orient6-16bit.png'));
+exiftool('-Orientation#=6', out('orient6-16bit.png'));
+deepPng(scratch('deep.png'));
+run('heif-enc', ['-q', '90', '-b', '10', '--colour_primaries=9', '--transfer_characteristic=18', '--matrix_coefficients=9', '--full_range_flag=0', scratch('deep.png'), '-o', out('hlg.heic')]);
+
 // --- PNG with EXIF Orientation 6; still and animated GIF; APNG ------------------------------------
 await quadRaw(QUAD).png().toFile(out('orient6.png'));
 exiftool('-Orientation#=6', ...QUAD_TAGS, out('orient6.png'));
@@ -125,6 +134,13 @@ const frames = await Promise.all(FRAMES.map(frame));
 await sharp(frames, { join: { animated: true } }).gif({ loop: 0, delay: 100 }).toFile(out('anim.gif'));
 frames.forEach((f, i) => fs.writeFileSync(scratch(`frame${i + 1}.png`), f));
 run('ffmpeg', ['-v', 'error', '-y', '-framerate', '10', '-i', scratch('frame%d.png'), '-plays', '0', '-f', 'apng', out('anim.png')]);
+// An AVIF image sequence ('avis' brand): ffmpeg also stores the first frame as the primary still.
+run('ffmpeg', [
+	'-v', 'error', '-y', '-framerate', '10', '-i', scratch('frame%d.png'),
+	'-vf', 'scale=out_color_matrix=bt601:out_range=tv,format=yuv420p',
+	'-color_primaries', 'bt709', '-color_trc', 'iec61966-2-1', '-colorspace', 'smpte170m', '-color_range', 'tv',
+	'-c:v', 'libaom-av1', '-crf', '10', '-cpu-used', '8', '-f', 'avif', out('sequence.avif')
+]);
 
 // --- WebP: lossy, lossless, lossy with transparency, animated -----------------------------------
 await quadRaw(QUAD).webp({ quality: 90 }).toFile(out('lossy.webp'));
@@ -172,6 +188,20 @@ fs.rmSync(tmp, { recursive: true, force: true });
 console.log(`photo fixtures written to ${OUT}`);
 
 // -------------------------------------------------------------------------------------------------
+
+/** Big-endian 16-bit RGB samples with low bits set, so an 8-bit round trip would show. */
+function rgb48({ width, height }: { width: number; height: number }): Buffer {
+	const buf = Buffer.alloc(width * height * 6);
+	for (let y = 0; y < height; y++) {
+		for (let x = 0; x < width; x++) {
+			const i = (y * width + x) * 6;
+			buf.writeUInt16BE(x * 1000 + 7, i);
+			buf.writeUInt16BE(y * 1300 + 3, i + 2);
+			buf.writeUInt16BE(((x * 37 + y * 101) * 11) % 65536, i + 4);
+		}
+	}
+	return buf;
+}
 
 /** Uncompressed 8-bit RGB PSD (header, empty sections, planar composite image data). */
 function psd({ width, height }: { width: number; height: number }, rgb: Buffer): Buffer {

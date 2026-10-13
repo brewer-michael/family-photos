@@ -132,29 +132,3 @@ export async function serveFile(request: Request, opts: ServeFileOptions): Promi
 		if (!streaming) await fh.close();
 	}
 }
-
-/**
- * True for an animated PNG (an `acTL` chunk before the first `IDAT`). The viewer shows
- * those as the canonical file, because display.webp only holds the first frame.
- */
-export async function isAnimatedPng(path: string): Promise<boolean> {
-	let fh: fs.FileHandle | undefined;
-	try {
-		fh = await fs.open(path, 'r');
-		const buf = Buffer.alloc(64 * 1024);
-		const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
-		let pos = 8; // PNG signature
-		while (pos + 8 <= bytesRead) {
-			const len = buf.readUInt32BE(pos);
-			const type = buf.toString('latin1', pos + 4, pos + 8);
-			if (type === 'acTL') return true;
-			if (type === 'IDAT' || type === 'IEND') return false;
-			pos += 12 + len;
-		}
-		return false;
-	} catch {
-		return false;
-	} finally {
-		await fh?.close();
-	}
-}

@@ -34,7 +34,9 @@ The **media worker** is a separate entry point, `src/worker/main.ts`. A second `
 - **Plain HTTP breaks SvelteKit's CSRF check.** adapter-node assumes `https` when the proto header is missing, so on plain HTTP (LAN access and e2e tests) form actions and tus POSTs fail it.
   - Fix: a custom **`server.js`** sets `x-forwarded-proto` from the socket when it's missing, then mounts `build/handler.js`.
   - The Dockerfile sets `PROTOCOL_HEADER=x-forwarded-proto` and `BODY_SIZE_LIMIT=64M`.
-  - Don't set `ADDRESS_HEADER`. Client IP is `cf-connecting-ip` ?? `x-real-ip` ?? the socket address, but the headers are believed only when the socket peer is a trusted proxy (`TRUSTED_PROXIES`, default loopback/private ranges). Rate limiting keys on both headers at once (IPv6 per /64) plus a global ceiling, because Cloudflare and NPM each pass the *other* header through from the client.
+  - Don't set `ADDRESS_HEADER`. Client IP is `cf-connecting-ip` ?? `x-real-ip` ?? the socket address, but the headers are believed only when the socket peer is a trusted proxy (`TRUSTED_PROXIES`, default loopback/private ranges; the `cloudflare` keyword adds Cloudflare's published ranges for Cloudflare → app directly). Rate limiting keys on both headers at once (IPv6 per /64) plus a global ceiling, because Cloudflare and NPM each pass the *other* header through from the client.
+  - Proxy hops: next to a `cf-connecting-ip`, an `x-real-ip` that is a Cloudflare edge or a trusted proxy is skipped (Cloudflare → NPM, cloudflared → NPM), so visitors behind one edge aren't limited together. `cf-connecting-ip` always counts (a Cloudflare address there is a Worker, keyed on its own), and an `x-real-ip` on its own always counts (each LAN device reaching NPM directly has its own key).
+  - Browsers with a valid signed device cookie are keyed by device too and have a global ceiling of their own (same size) instead of being exempt, so a stranger flood can't lock the family out, and device ids minted with an old family code can't guess without limit.
 - **HEIC/HEVC always arrive at some point.** Desktops, the Files app, Samsung's high-efficiency mode and iPhone videos (usually HEVC, often HDR or Dolby Vision 8.4) all produce them. The server normalizes everything; the client never converts.
 - **Two libraries can't be trusted for this:**
   - sharp's prebuilt libvips can't decode HEVC.
@@ -64,7 +66,7 @@ The **media worker** is a separate entry point, `src/worker/main.ts`. A second `
 - `ADMIN_EMAIL`, `ADMIN_NAME`
 - `SITE_TITLE`
 - `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASS` (masked), `SMTP_FROM`
-- Advanced: `KEEP_ORIGINALS` (true), `MAX_UPLOAD_GB` (50), `MAX_VIDEO_MINUTES` (120), `VIDEO_THREADS` (auto: max(2, cores/2)), `TRUSTED_PROXIES` (private), `PUID` (99), `PGID` (100), `UMASK` (022)
+- Advanced: `KEEP_ORIGINALS` (true), `MAX_UPLOAD_GB` (50), `MAX_VIDEO_MINUTES` (120), `VIDEO_THREADS` (auto: max(2, cores/2)), `TRUSTED_PROXIES` (private; IPs/ranges, `private`, `cloudflare` or `none`), `PUID` (99), `PGID` (100), `UMASK` (022)
 - **ExtraParams** (required): `--cpu-shares=128 --memory=4g`
 - TZ is injected by Unraid.
 
@@ -154,7 +156,7 @@ tests/{unit,e2e,media}/  tests/fixtures/{heif (vendored + LICENSES.md), generate
 **`hooks.server.ts`:**
 - `init` (guarded):
   - validates config and runs migrations;
-  - runs the media self-check (ffmpeg has libx264, zscale, tonemap and sidedata; `heif-dec --list-decoders`; `exiftool -ver`);
+  - runs the media self-check, using each lane's own detection (the video lane's ffmpeg capabilities: libx264, zscale, tonemap, sidedata; the photo lane's HEIF decoder, its plugins and heif-info) plus ffprobe, the video/AAC decoders, `exiftool -ver` and free space;
   - starts the worker lanes and daily maintenance.
 - `handle`:
   - auth and name redirects, validating `next` against open redirects;

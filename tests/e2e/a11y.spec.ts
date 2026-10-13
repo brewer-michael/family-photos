@@ -1,6 +1,6 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
-import { FAMILY_CODE } from './helpers';
+import { adminLogin, FAMILY_CODE } from './helpers';
 import { seedAlbum, seedMedia } from './seed';
 
 // @axe-core/playwright is typed against the top-level playwright-core (a newer peer install than
@@ -24,7 +24,11 @@ test.describe('accessibility (axe: no serious or critical issues)', () => {
 			await page.setExtraHTTPHeaders({ 'x-real-ip': scheme === 'light' ? '198.51.100.61' : '198.51.100.62' });
 			await page.emulateMedia({ colorScheme: scheme, reducedMotion: 'reduce' });
 			const album = seedAlbum('Accessible album');
-			const photo = await seedMedia(album, { name: 'IMG_0001.HEIC', takenAt: '2024-07-04T12:00:00-07:00' });
+			const photo = await seedMedia(album, {
+				name: 'IMG_0001.HEIC',
+				takenAt: '2024-07-04T12:00:00-07:00',
+				original: Buffer.from('original')
+			});
 			await seedMedia(album, { name: 'IMG_0002.MOV', kind: 'video', takenAt: '2024-07-05T12:00:00-07:00' });
 
 			await page.goto('/login');
@@ -51,6 +55,12 @@ test.describe('accessibility (axe: no serious or critical issues)', () => {
 			await page.getByRole('button', { name: 'Ask to remove' }).click();
 			await expect(page.getByRole('dialog')).toBeVisible();
 			expect(await seriousViolations(page), 'remove dialog').toEqual([]);
+
+			// The admin's viewer has a "Download the original file" button too.
+			await adminLogin(page);
+			await page.goto(`/view/${photo}`);
+			await expect(page.getByRole('link', { name: 'Download the original file' })).toBeVisible();
+			expect(await seriousViolations(page), 'viewer for the admin').toEqual([]);
 		});
 	}
 });

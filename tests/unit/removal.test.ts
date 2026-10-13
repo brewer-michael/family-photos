@@ -5,11 +5,20 @@
  */
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import { simpleParser, type ParsedMail } from 'mailparser';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { createRemovalRequest, removalEmail, resendRemovalEmail, sendStuckRemovalEmails, THUMB_CID } from '#lib/server/removal';
+import {
+	createRemovalRequest,
+	emailThumbnail,
+	removalEmail,
+	resendRemovalEmail,
+	sendStuckRemovalEmails,
+	THUMB_CID,
+	THUMB_CONCURRENCY
+} from '#lib/server/removal';
 import { getDb } from '#lib/server/db';
 import { cacheFile, outboxDir } from '#lib/server/paths';
 import * as albums from '#lib/server/repo/albums';
@@ -189,6 +198,32 @@ describe('createRemovalRequest', () => {
 		const rid = await ask(id);
 		expect(await settled(rid)).toMatchObject({ email_status: 'failed', email_error: expect.stringContaining('ADMIN_EMAIL') });
 		expect(outboxFiles()).toEqual([]);
+	});
+});
+
+describe('emailThumbnail', () => {
+	it(`runs at most ${THUMB_CONCURRENCY} ffmpeg processes at once; the others wait their turn`, async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-fake-ffmpeg-'));
+		const bin = path.join(dir, 'ffmpeg');
+		// Counts the copies running (one marker dir each) when it starts, then answers after a while.
+		fs.writeFileSync(
+			bin,
+			`#!/bin/sh\nmkdir "${dir}/run.$$"\nls -d "${dir}"/run.* | wc -l >> "${dir}/counts"\nsleep 0.3\nrmdir "${dir}/run.$$"\nprintf picture\n`,
+			{ mode: 0o755 }
+		);
+		const ids: string[] = [];
+		for (let i = 0; i < 5; i++) ids.push(await readyItem(album, { preview: [8, 8] }));
+		setEnv({ FFMPEG_BIN: bin });
+		try {
+			const pics = await Promise.all(ids.map((id) => emailThumbnail(id, 'photo')));
+			expect(pics.map((p) => p?.toString())).toEqual(Array(5).fill('picture'));
+			const counts = fs.readFileSync(path.join(dir, 'counts'), 'utf8').trim().split('\n').map(Number);
+			expect(counts).toHaveLength(5);
+			expect(Math.max(...counts)).toBeLessThanOrEqual(THUMB_CONCURRENCY);
+		} finally {
+			setEnv({ FFMPEG_BIN: undefined });
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 

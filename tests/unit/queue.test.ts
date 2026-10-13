@@ -8,9 +8,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { getProgress, queuePosition, startQueue, stopQueue, wakeQueue, type QueueTimings } from '#lib/server/queue';
+import { DEFAULT_TIMINGS, getProgress, queuePosition, startQueue, stopQueue, wakeQueue, type QueueTimings } from '#lib/server/queue';
 import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
+import { setSourceDuration } from '#lib/server/repo/uploads';
+import { getDb } from '#lib/server/db';
 import { tmpRoot, workRoot } from '#lib/server/paths';
 import type { Kind } from '#lib/shared/media-types';
 import { freshDb, setEnv, testEnv } from '../helpers/env';
@@ -90,11 +92,29 @@ beforeEach(() => {
 	freshDb();
 	album = albums.create({ title: 'Queue test', createdByName: null, createdByDevice: null }).id;
 	logFile = path.join(testEnv().root, `worker-${Date.now()}-${++seq}.log`);
-	setEnv({ WORKER_ENTRY: FAKE_WORKER, FAKE_WORKER_LOG: logFile });
+	setEnv({ WORKER_ENTRY: FAKE_WORKER, FAKE_WORKER_LOG: logFile, FAKE_WORKER_HELLO: undefined });
 });
 
 afterEach(async () => {
 	await stopQueue();
+	vi.restoreAllMocks();
+});
+
+const lanesStarted = (lane: Kind) => events().filter((e) => e.type === 'start' && e.lane === lane).length;
+
+describe('limits', () => {
+	it('defaults to the limits in the spec', () => {
+		expect(DEFAULT_TIMINGS).toMatchObject({
+			photoTimeoutMs: 300_000,
+			bigPhotoTimeoutMs: 600_000,
+			bigPhotoBytes: 40_000_000,
+			videoBaseMs: 120_000,
+			videoPerSecondMs: 30_000,
+			stallMs: 180_000,
+			killGraceMs: 10_000,
+			minConfigFreeBytes: 2 * 1024 ** 3
+		});
+	});
 });
 
 describe('lanes', () => {
@@ -198,6 +218,21 @@ describe('failures', () => {
 		await settled(ok, 'ready');
 	});
 
+	it("kills a video job that outlives its hard cap (base + per second of the video's duration)", async () => {
+		vi.spyOn(console, 'warn').mockImplementation(() => {});
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		// It keeps sending progress, so only the hard cap can stop it: 200 ms + 400 ms × 2 s = 1 s.
+		// Without the duration the cap would be minutes (MAX_VIDEO_MINUTES).
+		const id = queued('hold', 'video', { estCostS: 1 });
+		expect(setSourceDuration(id, 2000)).toBe(true);
+		startQueue({ timings: { ...FAST, stallMs: 60_000, videoBaseMs: 200, videoPerSecondMs: 400 } });
+		await settled(id, 'failed', 15_000);
+		expect(row(id).attempts).toBe(3);
+		expect(row(id).error_code).toBe('retryable');
+		expect(row(id).error_detail).toContain('took longer than 1 s');
+		expect(jobs('video').filter((e) => e.id === id)).toHaveLength(3);
+	});
+
 	it('kills a photo job that runs too long, escalating to SIGKILL', async () => {
 		const stubborn = queued('stubborn');
 		const ok = queued('ok');
@@ -247,6 +282,41 @@ describe('start and stop', () => {
 		expect(row(id).attempts).toBe(2);
 	});
 
+	it('kills and respawns a lane that never says hello, then carries on once one does', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		vi.spyOn(console, 'error').mockImplementation(() => {});
+		setEnv({ FAKE_WORKER_HELLO: 'never' });
+		const id = queued('ok');
+		startQueue({ timings: { ...FAST, helloTimeoutMs: 200 } });
+		await vi.waitFor(() => expect(lanesStarted('photo')).toBeGreaterThanOrEqual(3), { timeout: 8000, interval: 20 });
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining('it did not start within'));
+		expect(jobs()).toHaveLength(0);
+		expect(row(id).status).toBe('queued');
+		expect(row(id).attempts).toBe(0);
+		// The next respawn starts normally (the lane inherits the environment at spawn time).
+		setEnv({ FAKE_WORKER_HELLO: undefined });
+		await settled(id, 'ready');
+		expect(row(id).attempts).toBe(1);
+	});
+
+	it('waits for a missing worker bundle, saying so once per lane, and starts once it exists', async () => {
+		const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+		const entry = path.join(testEnv().root, `bundle-${++seq}`, 'worker.js');
+		setEnv({ WORKER_ENTRY: entry });
+		const id = queued('ok');
+		startQueue({ timings: FAST });
+		await new Promise((r) => setTimeout(r, 450)); // several rechecks (respawnMaxMs = 100)
+		expect(events()).toEqual([]);
+		expect(error.mock.calls.filter((c) => String(c[0]).includes(`worker bundle ${entry} is missing`))).toHaveLength(2);
+		expect(row(id).status).toBe('queued');
+		// `npm run build:worker` finished: the bundle appears.
+		fs.mkdirSync(path.dirname(entry));
+		fs.symlinkSync(FAKE_WORKER, entry);
+		await settled(id, 'ready');
+		expect(lanesStarted('photo')).toBe(1);
+		expect(lanesStarted('video')).toBe(1);
+	});
+
 	it('waits while /config is short of space', async () => {
 		const id = queued('ok');
 		startQueue({ timings: { ...FAST, minConfigFreeBytes: Number.MAX_SAFE_INTEGER, diskRecheckMs: 100 } });
@@ -264,6 +334,18 @@ describe('start and stop', () => {
 		expect(events().filter((e) => e.type === 'shutdown')).toHaveLength(2);
 		expect(row(id).status).toBe('queued');
 		expect(row(id).attempts).toBe(1);
+	});
+
+	it('re-queues a job the shutdown aborted, even on its last attempt (the lane answers "failed" first)', async () => {
+		const id = queued('abortable');
+		getDb().prepare('UPDATE media SET attempts = 2 WHERE id = ?').run(id);
+		startQueue({ timings: FAST });
+		await vi.waitFor(() => expect(jobs('photo')).toHaveLength(1));
+		expect(row(id).attempts).toBe(3);
+		await stopQueue();
+		expect(row(id).status).toBe('queued');
+		expect(row(id).error_code).toBeNull();
+		expect(row(id).error_detail).toBe('Interrupted by a shutdown; re-queued');
 	});
 
 	it('SIGKILLs a lane that ignores the shutdown request', async () => {

@@ -5,7 +5,7 @@ import * as media from '#lib/server/repo/media';
 import { ALBUM_PAGE_SIZE, parseAlbumId, pendingTiles, toTile } from '#lib/server/repo/ui';
 import { ValidationError } from '#lib/shared/errors';
 
-const NOT_FOUND = { message: "We couldn't find that album. It may have been removed." };
+const NOT_FOUND = "We couldn't find that album. It may have been removed.";
 
 export const load: PageServerLoad = ({ params, locals, url }) => {
 	const album = albums.getSummary(parseAlbumId(params.id));
@@ -45,7 +45,7 @@ export const actions: Actions = {
 		const album = albums.get(parseAlbumId(params.id));
 		if (!album) error(404, NOT_FOUND);
 		if (!albums.canEdit(album, { role: locals.role, deviceId: locals.deviceId })) {
-			error(403, { message: 'Only the person who started this album can change it.' });
+			error(403, 'Only the person who started this album can change it.');
 		}
 		const form = await request.formData();
 		const values = { title: text(form.get('title')), whenText: text(form.get('whenText')), description: text(form.get('description')) };

@@ -150,7 +150,13 @@ export function streamZip(plan: ZipPlan, signal: AbortSignal): ReadableStream<Ui
 		signal.removeEventListener('abort', stop);
 		stop(); // the web stream was cancelled before the archive ended
 	});
-	archive.on('entry', appendNext);
+	// The finished entry's file may still be closing (its fd is released asynchronously): open the
+	// next one only once it has, so at most one file is ever open.
+	archive.on('entry', () => {
+		const prev = current;
+		if (prev && !prev.closed) prev.once('close', appendNext);
+		else appendNext();
+	});
 	archive.on('error', (e) => {
 		console.error('[zip]', e);
 		out.destroy(e);

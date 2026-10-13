@@ -91,8 +91,8 @@ heif-dec -d <ffmpegId> --quiet --png-compression-level 1 SRC /config/tmp/<id>/de
   - Writes the ICC profile into the PNG (iCCP) and EXIF into the PNG (eXIf) with **Orientation forced to 1**.
   - Writes 10-bit sources as 16-bit PNG.
 - **heif-dec decodes every top-level image** and exits on the first failure ([heif_dec.cc](https://github.com/strukturag/libheif/blob/v1.19.8/examples/heif_dec.cc)) [H]. If a non-primary image is corrupt, the item fails cleanly as `corrupt`: the source is archived, the admin is notified, and the uploader gets no retry loop.
-- **P3 tagged only by nclx (no ICC profile).** If exiftool reports nclx `ColorPrimaries` = P3 and there's no ICC profile, insert the Display P3 ICC into `dec.png` before sharp. Get those bytes once from `sharp(...).withIccProfile('p3')` output metadata [M].
-- **HDR camera HEIF (PQ/HLG `.HIF`)** is not tone-mapped in v1 and will look flat. This is a known limitation; it gets an admin note.
+- **P3 tagged only by nclx (no ICC profile).** If exiftool reports nclx `ColorPrimaries` = P3 and there's no ICC profile, insert the Display P3 ICC into `dec.png` before sharp. The profile is built in code (`displayP3Icc()` in `src/worker/photo/icc.ts`).
+- **HDR camera HEIF (PQ/HLG `.HIF`)** is not tone-mapped in v1 and will look flat. This is a known limitation; the photo lane logs a warning ("HDR photo shown without tone mapping").
 
 ### Other decoders
 - **JPEG XL, JPEG 2000, BMP, PSD:** `ffmpeg -v error -nostdin -i SRC -frames:v 1 -c:v png /config/tmp/<id>/dec.png`.
@@ -301,7 +301,7 @@ const vf = [...pre,
 | Timeouts | heif-dec 180/360 s. Photo job 300 s (600 s if > 100 MP); on overrun, SIGKILL the worker and respawn it. ffmpeg: if `out_time_us` hasn't advanced for 180 s, SIGTERM, then SIGKILL 10 s later. Hard cap `120 s + 30 × duration` |
 | Retries | `attempts++` in the same transaction that sets `processing`. On startup, rows with `attempts ≥ 3` → `failed` and an admin alert. Only `retryable` errors are retried |
 | Caps | `UPLOAD_MAX_BYTES` = 50 GiB (tus `maxSize`). `VIDEO_MAX_DURATION_S` = 7200. Source fps ≤ 240, dimensions ≤ 8192 (photos: ≤ ~268 MP). At tus create, require free space on `/photos` ≥ 2 × Upload-Length + 2 GiB. Before each job, require ≥ 2 GiB free on `/config` |
-| Startup self-check | ffmpeg has `libx264`, `zscale`, `tonemap`, `sidedata`, and `AMBIENT_VIEWING_ENVIRONMENT` (via `ffmpeg -h filter=sidedata`). Parse the decoder list. Check `heif-dec --list-decoders` and `exiftool -ver`. Then `rm -rf /config/tmp/* /photos/.work/*` and requeue interrupted jobs |
+| Startup self-check | Uses each lane's own detection, so it reports exactly what the lanes will do: the video lane's ffmpeg capabilities (`libx264`, `zscale`, `tonemap`, `sidedata`, and `AMBIENT_VIEWING_ENVIRONMENT` via `ffmpeg -h filter=sidedata`) and the photo lane's HEIF tools (`heif-dec`/`heif-convert --list-decoders`, the libde265/dav1d plugins, `heif-info`, ffmpeg's still-image decoders). It adds ffprobe, the video/AAC decoder list, `exiftool -ver` (`EXIFTOOL_BIN`, else `EXIFTOOL_PATH`, as the lanes read them) and free space. Then `rm -rf /config/tmp/* /photos/.work/*` and requeue interrupted jobs |
 
 ### Progress
 - ffmpeg `-progress pipe:1 -stats_period 1`. Parse `out_time_us`: `pct = min(99, ⌊100·t/expectedDur⌋)`. The ETA comes from `speed=` and is shown only as "about N minutes" or "a few minutes".
@@ -519,7 +519,7 @@ Only the uploader and the admin see unfinished tiles.
 Avoid anything from nokiatech/heif (non-commercial licence), exifr's `heic-single`/`heic-collection`, and pillow_heif's `nokia/` folder.
 
 ### Generated photo fixtures (committed, a few KB each)
-Built in a Docker `fixtures` stage: `debian:trixie-slim` + `libheif-examples libheif-plugin-x265 libheif-plugin-aomenc libimage-exiftool-perl`.
+As built: `node tests/fixtures/photo/generate.ts` regenerates all of them (tools and details in `tests/media/README.md`), including `orient6-16bit.png`, `hlg.heic` and `sequence.avif`. The original recipe:
 ```
 node gen-quad.mjs                                   # sharp: 256×192 four-colour quadrants → quad.jpg, quad-p3.jpg (withIccProfile('p3')), patches.png (24 colour patches, no ICC)
 for n in 1..8: exiftool -Orientation#=$n -o o$n.jpg quad.jpg && heif-enc -q 90 o$n.jpg -o o$n.heic

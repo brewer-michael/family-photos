@@ -1,8 +1,10 @@
 name: CI
 
+# Pushes run CI on main only: other branches are tested through their pull request, so its checks
+# don't run twice. Any branch can still be run by hand (workflow_dispatch).
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -14,6 +16,31 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The Unraid template is downloaded straight from main, and the shell scripts run in the image
+  # (docker/) or in CI (scripts/ci-*.sh), so a broken edit must fail here first.
+  lint:
+    name: Unraid template and shell scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install xmllint and ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxml2-utils shellcheck
+
+      - name: The Unraid template is well-formed XML
+        run: xmllint --noout unraid/family-photos.xml
+
+      # sh is dash on Ubuntu and in the image, so this also catches anything that isn't POSIX sh.
+      - name: The shell scripts parse and pass ShellCheck
+        run: |
+          for f in docker/*.sh scripts/ci-*.sh; do sh -n "$f"; done
+          shellcheck docker/*.sh scripts/ci-*.sh
+
   test:
     name: Check, unit and e2e tests (Node ${{ matrix.node }})
     runs-on: ubuntu-24.04
@@ -25,6 +52,8 @@ jobs:
         node: [22, 24]
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@v7
         with:
@@ -72,6 +101,8 @@ jobs:
     container: node:24-trixie-slim
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # Plus the x265 encoder plugin, which the tests use to build a very large HEIC with heif-enc.
       - name: Install the image's media tools

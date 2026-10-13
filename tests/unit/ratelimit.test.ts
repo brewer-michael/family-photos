@@ -134,6 +134,17 @@ describe('client identity', () => {
 		getClientAddress: () => addr
 	});
 
+	/** Number of attempts before the limiter refuses, for a sequence of requests. */
+	function attemptsUntilLimited(make: (i: number) => ReturnType<typeof ev>): number {
+		const rl = createRateLimiter({ max: 10, windowMs: 15 * 60_000, globalMax: 1000 });
+		for (let i = 0; i < 50; i++) {
+			const keys = clientKeys(make(i));
+			if (rl.check(keys, i).limited) return i;
+			rl.fail(keys, i);
+		}
+		return Infinity;
+	}
+
 	it('normalizes addresses', () => {
 		expect(normalizeIp('::ffff:192.168.1.20')).toBe('192.168.1.20');
 		expect(normalizeIp(' 2001:DB8::1 ')).toBe('2001:db8::1');
@@ -177,7 +188,7 @@ describe('client identity', () => {
 		expect(clientIp(ev({ 'x-real-ip': '2.2.2.2' }))).toBe('2.2.2.2');
 	});
 
-	it('skips forwarded addresses that are proxy hops (Cloudflare → NPM, cloudflared → NPM)', () => {
+	it('skips an X-Real-IP that is a proxy hop next to CF-Connecting-IP (Cloudflare → NPM, cloudflared → NPM)', () => {
 		// Cloudflare (orange cloud) → Nginx Proxy Manager: X-Real-IP is the Cloudflare edge.
 		const viaEdge = (visitor: string, edge = '162.158.10.20') =>
 			ev({ 'cf-connecting-ip': visitor, 'x-real-ip': edge }, '172.17.0.5');
@@ -190,9 +201,44 @@ describe('client identity', () => {
 		expect(
 			clientKeys(ev({ 'cf-connecting-ip': '203.0.113.7', 'x-real-ip': '198.51.100.1' }, '198.51.100.2'), ['198.51.100.0/24'])
 		).toEqual(['203.0.113.7']);
-		// Nothing but hops: the peer stands for the client.
-		expect(clientKeys(ev({ 'x-real-ip': '104.16.0.1' }, '172.17.0.5'))).toEqual(['172.17.0.5']);
-		expect(clientKeys(ev({ 'cf-connecting-ip': '10.1.1.1', 'x-real-ip': '::1' }, '172.17.0.5'))).toEqual(['172.17.0.5']);
+		// CF-Connecting-IP always counts, whatever it names; only X-Real-IP is dropped as a hop.
+		expect(clientKeys(ev({ 'cf-connecting-ip': '10.1.1.1', 'x-real-ip': '::1' }, '172.17.0.5'))).toEqual(['10.1.1.1']);
+		// X-Real-IP on its own always counts, even when it looks like a hop.
+		expect(clientKeys(ev({ 'x-real-ip': '104.16.0.1' }, '172.17.0.5'))).toEqual(['104.16.0.1']);
+	});
+
+	it('a Cloudflare Worker keeps a key of its own (CF-Connecting-IP is a Cloudflare address)', () => {
+		// Worker → Cloudflare → NPM: CF-Connecting-IP is the Worker's address, X-Real-IP the edge.
+		const worker = '2a06:98c0:3600::103';
+		expect(clientKeys(ev({ 'cf-connecting-ip': worker, 'x-real-ip': '162.158.10.20' }, '172.17.0.5'))).toEqual(['2a06:98c0:3600:0::/64']);
+		// Through cloudflared the Worker controls X-Real-IP, but rotating it doesn't escape the Worker's key.
+		expect(attemptsUntilLimited((i) => ev({ 'cf-connecting-ip': worker, 'x-real-ip': `104.16.0.${i}` }, '172.17.0.6'))).toBe(10);
+		expect(attemptsUntilLimited((i) => ev({ 'cf-connecting-ip': worker, 'x-real-ip': `198.51.100.${i}` }, '172.17.0.6'))).toBe(10);
+	});
+
+	it('devices at home reaching NPM directly are limited separately (X-Real-IP alone counts, even when private)', () => {
+		const lan = (ip: string) => ev({ 'x-real-ip': ip }, '172.17.0.5');
+		expect(clientKeys(lan('192.168.1.50'))).toEqual(['192.168.1.50']);
+		expect(clientIp(lan('192.168.1.50'))).toBe('192.168.1.50');
+		const rl = createRateLimiter({ max: 10, windowMs: 15 * 60_000, globalMax: 1000 });
+		for (let i = 0; i < 10; i++) rl.fail(clientKeys(lan('192.168.1.50')), i);
+		expect(rl.check(clientKeys(lan('192.168.1.50')), 20).limited).toBe(true);
+		expect(rl.check(clientKeys(lan('192.168.1.51')), 20)).toEqual({ limited: false, retryAfterS: 0, failures: 0 });
+	});
+
+	it('TRUSTED_PROXIES=cloudflare trusts Cloudflare\'s ranges as peers (Cloudflare → this app directly)', () => {
+		for (const ip of ['162.158.10.20', '104.16.0.1', '2400:cb00::1', '::ffff:173.245.48.1']) {
+			expect(isTrustedProxy(ip, ['cloudflare']), ip).toBe(true);
+		}
+		for (const ip of ['10.0.0.1', '127.0.0.1', '1.1.1.1', '2001:db8::1']) {
+			expect(isTrustedProxy(ip, ['cloudflare']), ip).toBe(false);
+		}
+		expect(isTrustedProxy('10.0.0.1', ['private', 'cloudflare'])).toBe(true);
+		expect(isTrustedProxy('162.158.10.20', ['private', 'cloudflare'])).toBe(true);
+		const direct = ev({ 'cf-connecting-ip': '203.0.113.7', 'x-real-ip': '198.51.100.9' }, '162.158.10.20');
+		expect(clientKeys(direct, ['cloudflare'])).toEqual(['203.0.113.7', '198.51.100.9']);
+		expect(clientIp(direct, ['cloudflare'])).toBe('203.0.113.7');
+		expect(clientKeys(direct, ['private'])).toEqual(['162.158.10.20']); // not trusted by default
 	});
 
 	it('knows Cloudflare\'s published ranges (edges of the embedded list)', () => {
@@ -218,17 +264,6 @@ describe('client identity', () => {
 		// and with TRUSTED_PROXIES=none even a LAN peer's headers are ignored
 		expect(clientKeys(ev({ 'x-real-ip': '2.2.2.2' }), ['none'])).toEqual(['10.0.0.9']);
 	});
-
-	/** Number of attempts before the limiter refuses, for a sequence of requests. */
-	function attemptsUntilLimited(make: (i: number) => ReturnType<typeof ev>): number {
-		const rl = createRateLimiter({ max: 10, windowMs: 15 * 60_000, globalMax: 1000 });
-		for (let i = 0; i < 50; i++) {
-			const keys = clientKeys(make(i));
-			if (rl.check(keys, i).limited) return i;
-			rl.fail(keys, i);
-		}
-		return Infinity;
-	}
 
 	it('rotating spoofed headers never escapes the limit (end to end through the limiter)', () => {
 		// Exposed directly: a public client rotating both headers.

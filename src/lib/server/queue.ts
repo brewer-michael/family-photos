@@ -221,7 +221,11 @@ function handleMessage(l: LaneState, m: WorkerToMain): void {
 			endJob(l);
 			l.crashes = 0;
 			try {
-				if (m.outcome === 'failed') recordFailure(m.id, m.errorCode ?? 'retryable', m.detail || 'failed without details');
+				const code = m.outcome === 'failed' ? (m.errorCode ?? 'retryable') : null;
+				// A lane being shut down aborts its job and answers `failed`/retryable: like a job cut
+				// short by the exit itself (onExit), it goes back in the queue and doesn't count as a failure.
+				if (stopping && code === 'retryable') media.requeue(m.id, 'Interrupted by a shutdown; re-queued');
+				else if (code) recordFailure(m.id, code, m.detail || 'failed without details');
 				else console.log(`[queue] ${m.id} ${m.outcome} (${l.lane}, ${secs(Date.now() - job.startedAt)})`);
 			} finally {
 				dispatch(l);

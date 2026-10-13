@@ -77,48 +77,28 @@ test.describe('access gate hardening', () => {
 		expect(named.headers()['location']).toBe('/');
 	});
 
-	test('rotating a spoofed CF-Connecting-IP behind a proxy does not escape the rate limit', async ({ request, baseURL }, testInfo) => {
-		// 127.0.0.1 is a trusted proxy peer: it plays Nginx Proxy Manager, which sets X-Real-IP and
-		// passes the client's own CF-Connecting-IP through.
-		const realIp = `198.51.100.${(testInfo.project.name === 'mobile' ? 30 : 40) + testInfo.retry}`;
-		const attempt = (i: number) =>
-			request.post('/login', {
-				form: { code: `wrong guess ${i}` },
-				headers: { origin: baseURL!, accept: 'text/html', 'x-real-ip': realIp, 'cf-connecting-ip': `203.0.113.${i}` },
-				maxRedirects: 0
-			});
-		for (let i = 1; i <= 10; i++) expect((await attempt(i)).status(), `attempt ${i}`).toBe(400);
-		expect((await attempt(11)).status()).toBe(429);
-		expect((await attempt(12)).status()).toBe(429);
-	});
-
-	test('Cloudflare → NPM: visitors behind the same Cloudflare edge are limited separately', async ({ request, baseURL }, testInfo) => {
-		// 127.0.0.1 plays Nginx Proxy Manager behind Cloudflare: X-Real-IP is a Cloudflare edge,
-		// CF-Connecting-IP the visitor.
+	test('behind a proxy the limit follows the visitor: made-up headers do not escape it, other visitors are not locked out', async ({ request, baseURL }, testInfo) => {
+		// Wrong codes from browsers that never signed in share one allowance (100 per 15 minutes)
+		// with every other test's first sign-in, so this test spends only 11 of them. More header
+		// combinations are covered in tests/unit/ratelimit.test.ts.
+		// 127.0.0.1 is a trusted proxy peer, so it can play Nginx Proxy Manager or cloudflared.
 		const base = (testInfo.project.name === 'mobile' ? 10 : 20) + 2 * testInfo.retry;
-		const attempt = (visitor: string) =>
+		const visitor = `192.0.2.${base}`;
+		const attempt = (headers: Record<string, string>) =>
 			request.post('/login', {
 				form: { code: 'not the code' },
-				headers: { origin: baseURL!, accept: 'text/html', 'x-real-ip': '162.158.99.1', 'cf-connecting-ip': visitor },
+				headers: { origin: baseURL!, accept: 'text/html', ...headers },
 				maxRedirects: 0
 			});
-		const noisy = `192.0.2.${base}`;
-		for (let i = 1; i <= 10; i++) expect((await attempt(noisy)).status(), `attempt ${i}`).toBe(400);
-		expect((await attempt(noisy)).status()).toBe(429);
-		expect((await attempt(`192.0.2.${base + 1}`)).status()).toBe(400); // not locked out by the noisy one
-	});
-
-	test('a known device rotating spoofed IPs is still limited (by its device cookie)', async ({ page, baseURL }, testInfo) => {
-		await login(page, 'Cousin Lee'); // the device cookie is set on /name
-		await page.context().clearCookies({ name: 'fp_access' }); // e.g. after "Reset access"
-		const net = testInfo.project.name === 'mobile' ? 100 : 150;
-		const attempt = (i: number) =>
-			page.request.post('/login', {
-				form: { code: `wrong ${i}` },
-				headers: { origin: baseURL!, accept: 'text/html', 'x-real-ip': `192.0.2.${net + i}`, 'cf-connecting-ip': `192.0.2.${net + 25 + i}` },
-				maxRedirects: 0
-			});
-		for (let i = 1; i <= 10; i++) expect((await attempt(i)).status(), `attempt ${i}`).toBe(400);
-		expect((await attempt(11)).status()).toBe(429);
+		// Cloudflare → NPM: X-Real-IP is the Cloudflare edge, CF-Connecting-IP the visitor.
+		const viaEdge = (ip: string) => attempt({ 'x-real-ip': '162.158.99.1', 'cf-connecting-ip': ip });
+		for (let i = 1; i <= 10; i++) expect((await viaEdge(visitor)).status(), `attempt ${i}`).toBe(400);
+		expect((await viaEdge(visitor)).status()).toBe(429);
+		// NPM alone: X-Real-IP is the visitor, who makes up a new CF-Connecting-IP.
+		expect((await attempt({ 'x-real-ip': visitor, 'cf-connecting-ip': `203.0.113.${base}` })).status()).toBe(429);
+		// cloudflared: CF-Connecting-IP is the visitor, who makes up a new X-Real-IP.
+		expect((await attempt({ 'cf-connecting-ip': visitor, 'x-real-ip': `198.51.100.${base + 100}` })).status()).toBe(429);
+		// Another visitor behind the same Cloudflare edge can still try.
+		expect((await viaEdge(`192.0.2.${base + 1}`)).status()).toBe(400);
 	});
 });

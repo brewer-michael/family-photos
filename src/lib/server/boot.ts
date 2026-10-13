@@ -5,7 +5,7 @@
 import { getConfig, ConfigError } from './config';
 import { ensureDirs } from './paths';
 import { closeDb, getDb } from './db';
-import { startIntake } from './intake';
+import { startIntake, stopIntake } from './intake';
 import { startQueue, stopQueue } from './queue';
 import { startMaintenance, stopMaintenance } from './maintenance';
 
@@ -18,12 +18,16 @@ const g = globalThis as G;
 
 let shuttingDown: Promise<void> | null = null;
 
-/** Stops lanes (killing worker children), timers and closes the DB. Idempotent. */
+/**
+ * Stops timers, intake (waiting for the item it is on) and the lanes (killing worker children),
+ * then closes the DB. Idempotent.
+ */
 export function shutdown(): Promise<void> {
 	shuttingDown ??= (async () => {
 		try {
 			stopMaintenance();
-			await stopQueue();
+			const stopped = await Promise.allSettled([stopIntake(), stopQueue()]);
+			for (const r of stopped) if (r.status === 'rejected') console.error('[shutdown]', r.reason);
 		} catch (e) {
 			console.error('[shutdown]', e);
 		} finally {

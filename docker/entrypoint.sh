@@ -8,8 +8,9 @@
 #     (first start, or PUID/PGID changed);
 #   - /photos (the share, can hold years of files): chowns only /photos and its top-level
 #     folders, never recursively;
-#   - applies UMASK and drops to PUID:PGID with setpriv, without supplementary groups.
-# Started with --user: runs the command as that user unchanged.
+#   - applies UMASK and drops to PUID:PGID with setpriv, without supplementary groups, with
+#     HOME=/tmp.
+# Started with --user: runs the command as that user (HOME=/tmp unless its own is writable).
 set -eu
 
 PUID=${PUID:-99}
@@ -77,7 +78,10 @@ umask "$UMASK"
 
 log_cgroup
 
+# The app user has no home folder in the image (and root's is closed to it). Tools that keep a
+# cache or settings under $HOME get a writable one that goes away with the container.
 if [ "$(id -u)" != 0 ]; then
+	[ -w "${HOME:-/}" ] || export HOME=/tmp
 	exec "$@"
 fi
 
@@ -99,4 +103,5 @@ for dir in "$PHOTOS_DIR" "$PHOTOS_DIR/library" "$PHOTOS_DIR/originals" "$PHOTOS_
 done
 
 log "Starting as $PUID:$PGID with umask $UMASK"
+export HOME=/tmp
 exec setpriv --reuid="$PUID" --regid="$PGID" --clear-groups -- "$@"

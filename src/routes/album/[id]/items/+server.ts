@@ -10,9 +10,9 @@ const MAX_LIMIT = 500;
 /** "Show more": the tiles after `?before=<cursor>` (`&limit=`, default one page) → { items, next }. */
 export const GET: RequestHandler = ({ params, url }) => {
 	const album = albums.get(parseAlbumId(params.id));
-	if (!album) error(404, { message: "We couldn't find that album." });
+	if (!album) error(404, "We couldn't find that album.");
 	const before = media.decodeCursor(url.searchParams.get('before'));
-	if (!before) error(400, { message: 'Missing or invalid cursor.' });
+	if (!before) error(400, 'Missing or invalid cursor.');
 	const asked = Number(url.searchParams.get('limit') ?? ALBUM_PAGE_SIZE);
 	const limit = Number.isInteger(asked) && asked > 0 ? Math.min(asked, MAX_LIMIT) : ALBUM_PAGE_SIZE;
 	const page = media.listByAlbum(album.id, { limit, before });

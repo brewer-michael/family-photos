@@ -11,12 +11,21 @@ ARG NODE_IMAGE=node:24-trixie-slim
 FROM ${NODE_IMAGE} AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
-# --ignore-scripts: no dependency needs an install script. npm 11 would otherwise run
-# `node-gyp rebuild` for better-sqlite3, which needs Python and a compiler, although the package
-# ships ready-made binaries (prebuilds/) and loads them by itself. sharp's binaries are npm packages.
+# --ignore-scripts: no dependency needs an install script. npm (10 and 11) would otherwise run
+# `node-gyp rebuild` for better-sqlite3, which fails here for lack of Python and a compiler,
+# although the package ships ready-made Node-API binaries (prebuilds/) and loads them by itself.
+# sharp's binaries are npm packages.
 RUN npm ci --ignore-scripts --no-audit --no-fund
 COPY . .
 RUN npm run build && npm prune --omit=dev --ignore-scripts --no-audit --no-fund
+# npm installs the musl (Alpine) builds of the native packages next to the glibc ones, and
+# better-sqlite3 carries binaries for every platform. On this glibc image sharp, lightningcss and
+# rolldown load their linux-<arch>(-gnu) package and better-sqlite3 its prebuilds/linux-<arch>.node,
+# so the rest goes. The last line fails the build if the two native modules the app uses don't load.
+RUN rm -rf node_modules/@img/sharp-linuxmusl-* node_modules/@img/sharp-libvips-linuxmusl-* \
+           node_modules/@rolldown/binding-*-musl node_modules/lightningcss-*-musl \
+ && find node_modules/better-sqlite3/prebuilds -type f ! -name "linux-$(node -p process.arch).node" -delete \
+ && node -e "new (require('better-sqlite3'))(':memory:').close(); require('sharp')"
 
 # --- runtime
 FROM ${NODE_IMAGE}

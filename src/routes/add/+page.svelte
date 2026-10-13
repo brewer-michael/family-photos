@@ -70,7 +70,7 @@
 						required
 						maxlength="200"
 						autocomplete="off"
-						value={form?.title ?? ''}
+						defaultValue={form?.title ?? ''}
 						aria-invalid={!!form?.error}
 						aria-describedby={form?.error ? 'new-title-hint new-title-error' : 'new-title-hint'}
 					/>

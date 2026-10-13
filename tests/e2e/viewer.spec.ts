@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { expect, test } from '@playwright/test';
 import { adminLogin, login } from './helpers';
 import { readRows, seedAlbum, seedMedia } from './seed';
@@ -161,6 +162,45 @@ test.describe('viewer', () => {
 		const res = await page.goto(`/view/${trashed}`);
 		expect(res?.status()).toBe(200);
 		await expect(page.getByText('This photo is in the trash.')).toBeVisible();
+	});
+
+	test('moving pictures show the file itself, not the still preview', async ({ page }) => {
+		const album = seedAlbum('Moving pictures');
+		const gif = await seedMedia(album, { name: 'dance.gif', moving: 'gif', takenAt: '2024-07-04T12:00:00-07:00' });
+		const apng = await seedMedia(album, { name: 'wave.png', moving: 'apng', takenAt: '2024-07-05T12:00:00-07:00' });
+		await login(page, 'Grandma Jo');
+		for (const id of [gif, apng]) {
+			await page.goto(`/view/${id}`);
+			const img = page.locator('img.media');
+			await expect(img, id).toHaveAttribute('src', new RegExp(`/media/${id}/file\\?v=1$`));
+			await expect.poll(() => img.evaluate((el: HTMLImageElement) => el.complete && el.naturalWidth), { message: id }).toBe(640);
+		}
+	});
+
+	test('the admin can download the original file; the family never sees that button', async ({ page }) => {
+		const album = seedAlbum('Originals');
+		const bytes = Buffer.from('the bytes exactly as they were uploaded');
+		const kept = await seedMedia(album, { name: 'IMG_0500.HEIC', takenAt: '2024-07-04T12:00:00-07:00', original: bytes });
+		const notKept = await seedMedia(album, { name: 'IMG_0501.JPG', takenAt: '2024-07-05T12:00:00-07:00' });
+		const button = page.getByRole('link', { name: 'Download the original file' });
+
+		await login(page, 'Grandma Jo');
+		await page.goto(`/view/${kept}`);
+		await expect(page.getByRole('img', { name: /added by Aunt Linda/ })).toBeVisible();
+		await expect(button).toHaveCount(0);
+
+		await adminLogin(page);
+		await page.goto(`/view/${kept}`);
+		await expect(button).toHaveAttribute('href', `/admin/original/${kept}`);
+		expect((await button.boundingBox())!.height).toBeGreaterThanOrEqual(56);
+		const [download] = await Promise.all([page.waitForEvent('download'), button.click()]);
+		expect(download.suggestedFilename()).toBe('IMG_0500.HEIC');
+		expect(fs.readFileSync(await download.path())).toEqual(bytes);
+
+		// Nothing archived (the upload itself became the file everyone sees): no button.
+		await page.goto(`/view/${notKept}`);
+		await expect(page.getByRole('img', { name: /added by Aunt Linda/ })).toBeVisible();
+		await expect(button).toHaveCount(0);
 	});
 
 	test('videos play the full file inline with a poster', async ({ page }) => {

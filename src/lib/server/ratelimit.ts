@@ -223,6 +223,7 @@ function trustedList(entries: readonly string[]): BlockList | null {
 			break;
 		}
 		if (e === 'private') privateRanges(list);
+		else if (e === 'cloudflare') for (const r of CLOUDFLARE_RANGES) addRange(list, r);
 		else addRange(list, e);
 	}
 	trustCache = { spec, list };
@@ -238,10 +239,13 @@ export function isTrustedProxy(peer: string, entries: readonly string[] = getCon
 }
 
 /**
- * Cloudflare's edge ranges as published at https://www.cloudflare.com/ips-v4 and /ips-v6, as of
- * 2026-10-13 (unchanged since 2021). Behind Cloudflare (orange cloud) → Nginx Proxy Manager,
- * NPM's X-Real-IP is the Cloudflare edge that connected to it, shared by every visitor who came
- * through that edge.
+ * Cloudflare's edge ranges: the lists Cloudflare publishes at https://www.cloudflare.com/ips-v4
+ * and /ips-v6, copied on 2026-10-13 from the daily mirror at github.com/lord-alfred/ipranges
+ * (cloudflare.com itself wasn't reachable from where this was written). Cloudflare rarely
+ * changes them, but compare with the published lists now and then.
+ *
+ * Used twice: TRUSTED_PROXIES=cloudflare trusts them as socket peers (Cloudflare connecting to
+ * this port directly), and an X-Real-IP naming one of them is a proxy hop (see clientIps()).
  */
 const CLOUDFLARE_RANGES = [
 	'173.245.48.0/20',
@@ -294,15 +298,24 @@ function headerIp(h: Headers, name: string): string | null {
  * The client's IPs as far as we can trust them, in priority order. Headers count only when the
  * socket peer is a trusted proxy (Cloudflare Tunnel / Nginx Proxy Manager on the LAN or Docker
  * network, see TRUSTED_PROXIES); a client reaching us directly is identified by its socket.
- * Header values that are proxy hops themselves are skipped; if none is left, the peer is used.
+ *
+ * CF-Connecting-IP always counts when present: Cloudflare and cloudflared set it themselves, and
+ * a Cloudflare address in it means a Cloudflare Worker, which keeps a key of its own.
+ * X-Real-IP is what NPM fills in from the address that connected to it. Next to CF-Connecting-IP
+ * it is skipped when it names a proxy hop (a Cloudflare edge, or a TRUSTED_PROXIES address such
+ * as cloudflared on the same Docker network), because then every visitor who came through that
+ * hop would share one limit. On its own it always counts, so each device at home reaching NPM
+ * directly keeps its own key. (The flip side: someone who reaches NPM from a trusted address can
+ * choose their CF-Connecting-IP. The global ceiling still applies to them.)
  */
 function clientIps(event: ClientEvent, entries?: readonly string[]): string[] {
 	const peer = socketAddress(event);
 	if (!peer || !isTrustedProxy(peer, entries)) return [peer ?? 'unknown'];
 	const h = event.request.headers;
-	const ips = [headerIp(h, 'cf-connecting-ip'), headerIp(h, 'x-real-ip')].filter(
-		(x): x is string => x !== null && !isProxyHop(x, entries)
-	);
+	const cf = headerIp(h, 'cf-connecting-ip');
+	let real = headerIp(h, 'x-real-ip');
+	if (cf !== null && real !== null && isProxyHop(real, entries)) real = null;
+	const ips = [cf, real].filter((x): x is string => x !== null);
 	return ips.length > 0 ? ips : [peer];
 }
 
@@ -310,9 +323,9 @@ function clientIps(event: ClientEvent, entries?: readonly string[]): string[] {
  * Rate-limit keys for a request: every trusted client IP (IPv6 by /64). Both headers count
  * because which one a proxy overwrites depends on the setup: Cloudflare sets cf-connecting-ip but
  * passes a client's x-real-ip through, Nginx Proxy Manager does the opposite. Keying on both means
- * a spoofed header can't escape the limit set on the real one. A header naming a proxy hop is
- * ignored (Cloudflare → NPM, or cloudflared → NPM on one Docker network): keying on it would make
- * everyone behind that hop share one limit.
+ * a spoofed header can't escape the limit set on the real one. An x-real-ip naming a proxy hop
+ * next to a cf-connecting-ip is ignored (Cloudflare → NPM, or cloudflared → NPM on one Docker
+ * network): keying on it would make everyone behind that hop share one limit.
  */
 export function clientKeys(event: ClientEvent, trustedProxies?: readonly string[]): string[] {
 	return [...new Set(clientIps(event, trustedProxies).map(ipKey))];

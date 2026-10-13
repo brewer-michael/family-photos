@@ -4,16 +4,13 @@ import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
 import * as memories from '#lib/server/repo/memories';
 import * as requests from '#lib/server/repo/requests';
-import { memoryList, saveTarget } from '#lib/server/repo/ui';
+import { memoryList, saveTarget, viewItem } from '#lib/server/repo/ui';
 import { createRemovalRequest } from '#lib/server/removal';
 import { publicOrigin } from '#lib/server/config';
-import { libraryPath } from '#lib/server/paths';
-import { isAnimatedPng } from '#lib/server/serve';
-import { mediaUrl, type ViewItemDTO } from '#lib/client/dto';
 import { ValidationError } from '#lib/shared/errors';
 import { isMediaId, REMOVAL_REASONS, type RemovalReason } from '#lib/shared/media-types';
 
-const NOT_HERE = { message: "This isn't here. It may have been removed, or it's still getting ready." };
+const NOT_HERE = "This isn't here. It may have been removed, or it's still getting ready.";
 
 /**
  * The item if this viewer may see it: ready and in a live album; trashed items and items of a
@@ -32,7 +29,7 @@ function viewable(id: string, locals: App.Locals) {
 
 /** The person acting (the gate guarantees a name, and with it a device id). */
 function author(locals: App.Locals): { name: string; device: string } {
-	if (!locals.name || !locals.deviceId) error(403, { message: 'Please tell us your name first.' });
+	if (!locals.name || !locals.deviceId) error(403, 'Please tell us your name first.');
 	return { name: locals.name, device: locals.deviceId };
 }
 
@@ -43,33 +40,16 @@ async function memoryOf(event: RequestEvent, mediaId: string) {
 	const form = await event.request.formData();
 	const id = Number(form.get('id'));
 	const memory = Number.isInteger(id) ? memories.get(id) : undefined;
-	if (!memory || memory.media_id !== mediaId) error(404, { message: "We couldn't find that memory." });
+	if (!memory || memory.media_id !== mediaId) error(404, "We couldn't find that memory.");
 	return { memory, form };
 }
 
-export const load: PageServerLoad = async ({ params, locals, url }) => {
+export const load: PageServerLoad = ({ params, locals, url }) => {
 	const { row, album, isAdmin } = viewable(params.id, locals);
-	const kind = row.kind!;
-	const ext = row.canonical_ext!;
-	const v = row.pipeline_version;
-	// display.webp is a still: animated GIFs and APNGs are shown as the canonical file.
-	const animated = ext === 'gif' || (ext === 'png' && (await isAnimatedPng(libraryPath(row.id, ext))));
-	const item: ViewItemDTO = {
-		id: row.id,
-		kind,
-		src: mediaUrl(row.id, kind === 'video' || animated ? 'file' : 'display', { v }),
-		placeholderUrl: mediaUrl(row.id, kind === 'video' ? 'poster' : 'thumb', { v }),
-		width: row.width,
-		height: row.height,
-		durationMs: row.duration_ms,
-		takenAt: row.taken_at,
-		takenMs: row.taken_ms,
-		by: row.uploaded_by_name
-	};
 	const { prev, next } = media.prevNext(row.id);
 	const edit = Number(url.searchParams.get('edit'));
 	return {
-		item,
+		item: viewItem(row),
 		save: saveTarget(row),
 		album: { id: album.id, title: album.title },
 		prevHref: prev ? `/view/${prev}` : null,
@@ -77,7 +57,9 @@ export const load: PageServerLoad = async ({ params, locals, url }) => {
 		memories: memoryList(row.id, { device: locals.deviceId, isAdmin }),
 		editingId: Number.isInteger(edit) && edit > 0 ? edit : null,
 		alreadyAsked: locals.deviceId ? requests.hasPendingFor(row.id, locals.deviceId) : false,
-		trashed: row.deleted_at !== null
+		trashed: row.deleted_at !== null,
+		// The admin's archive copy of what was uploaded (/admin/original checks the role again).
+		originalHref: isAdmin && row.source_kept && row.source_ext ? `/admin/original/${row.id}` : null
 	};
 };
 
@@ -103,7 +85,7 @@ export const actions: Actions = {
 		const body = text(form.get('body'));
 		try {
 			if (!memories.update(memory.id, body, { device: who.device })) {
-				error(403, { message: 'You can only change memories you wrote.' });
+				error(403, 'You can only change memories you wrote.');
 			}
 		} catch (e) {
 			if (e instanceof ValidationError) return fail(400, { memory: { error: e.message, errorFor: memory.id, body } });
@@ -117,7 +99,7 @@ export const actions: Actions = {
 		const { row, isAdmin } = viewable(event.params.id, event.locals);
 		const { memory } = await memoryOf(event, row.id);
 		if (!memories.remove(memory.id, { device: event.locals.deviceId, isAdmin })) {
-			error(403, { message: 'You can only delete memories you wrote.' });
+			error(403, 'You can only delete memories you wrote.');
 		}
 		return { memory: { deleted: true } };
 	},

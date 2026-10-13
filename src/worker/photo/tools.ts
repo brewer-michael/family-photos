@@ -3,8 +3,8 @@
  * same code runs on libheif 1.17 (Ubuntu 24.04: heif-convert, no --disable-limits) and 1.19
  * (Debian trixie: heif-dec) and on ffmpeg 6.1 or 7.1.
  *
- * - HEIF: HEIF_DEC_BIN, else heif-dec, else heif-convert; heif-info next to it. Decoder ids come
- *   from `--list-decoders`; --disable-limits support from `--help`.
+ * - HEIF: HEIF_DEC_BIN, else heif-dec, else heif-convert; heif-info next to it (both must exist).
+ *   Decoder ids come from `--list-decoders`; --disable-limits support from `--help`.
  * - ffmpeg: which still-image decoders exist (JPEG XL, JPEG 2000, BMP, PSD).
  *
  * No sharp or exiftool imports: the web process's startup self-check may use photoToolsReport().
@@ -18,6 +18,8 @@ export interface HeifTools {
 	/** heif-dec (libheif ≥ 1.18), heif-convert (1.17) or HEIF_DEC_BIN. */
 	decBin: string;
 	infoBin: string;
+	/** heif-info could be started (every HEIF decode reads the file's layout with it first). */
+	infoFound: boolean;
 	/** libheif version from the help banner, e.g. '1.19.8'; null if the tool is missing. */
 	version: string | null;
 	/** Decoder ids from `--list-decoders`, in listed order. */
@@ -109,6 +111,7 @@ async function detectHeif(): Promise<HeifTools> {
 	return {
 		decBin,
 		infoBin,
+		infoFound: infoHelp.started,
 		version: help.started ? (/libheif version: (\S+)/.exec(help.out)?.[1] ?? null) : null,
 		decoders: list.started ? parseDecoderList(list.out) : { hevc: [], av1: [] },
 		decDisableLimits: help.out.includes('--disable-limits'),
@@ -150,6 +153,7 @@ export function photoToolProblems(h: HeifTools, f: FfmpegImageTools): string[] {
 	const problems: string[] = [];
 	if (!h.version) problems.push(`The HEIF decoder (${h.decBin}) is not installed, so iPhone photos can't be added.`);
 	else {
+		if (!h.infoFound) problems.push(`heif-info (${h.infoBin}) is not installed, so iPhone photos can't be added.`);
 		if (!h.decoders.hevc.includes('libde265')) problems.push('libheif has no libde265 decoder (libheif-plugin-libde265), so iPhone photos may fail.');
 		if (!h.decoders.av1.includes('dav1d')) problems.push('libheif has no dav1d decoder (libheif-plugin-dav1d), so AVIF photos may fail.');
 	}
