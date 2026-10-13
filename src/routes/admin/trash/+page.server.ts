@@ -38,6 +38,9 @@ export const actions: Actions = {
 		if (r.reason === 'duplicate') {
 			return problem(409, 'trash', `Its album has the same ${row!.kind ?? 'photo'} again, so this copy stays in the trash.`, r.conflictId);
 		}
+		if (r.reason === 'file_missing') {
+			return problem(410, 'trash', `The file of ${row!.source_name} is gone from the photos folder, so it can't come back.`);
+		}
 		return problem(404, 'trash', 'It is no longer in the trash.');
 	},
 

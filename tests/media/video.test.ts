@@ -319,10 +319,12 @@ describe('video lane: fixtures', () => {
 		const { out } = await expectCommitted(q, { conversion: 'remux', width: 640, height: 360, durationS: 1, audio: true, kept: true });
 		expect(streamHash(out, 'v:0')).toBe(streamHash(file, 'v:0'));
 
-		// Admin "Reprocess": runs again from the archived original, which stays archived.
+		// Admin "Redo them": runs again from the archived original, which stays archived, while the
+		// item stays ready (media.claimRedo).
 		expect(media.markForReprocess(q.id)).toBe(true);
-		expect(media.claimForProcessing(q.id)?.status).toBe('processing');
+		expect(media.claimRedo(q.id)).toMatchObject({ status: 'ready', redo_state: 'running' });
 		await processVideo(q.id, context().ctx);
+		expect(media.getById(q.id)).toMatchObject({ status: 'ready', redo_state: null });
 		await expectCommitted({ ...q, src: path.join(fixtureDir, 'gone') }, { conversion: 'remux', width: 640, height: 360, durationS: 1, audio: true, kept: true });
 	});
 

@@ -12,6 +12,10 @@
 //   abortable       never answers until `shutdown`, then reports failed/retryable (like the real
 //                   lane, whose running job is aborted) and exits
 //
+// A `job` with task 'previews' is logged as {type:'previews'}: it writes the item's cache files
+// (thumb + display, or thumb + poster) and answers done ready, or done failed/corrupt when the
+// source_name starts with previews-fail. The row is never touched.
+//
 // With FAKE_WORKER_HELLO=never the lane starts but never says hello (a hung startup).
 // Every event is appended as a JSON line to FAKE_WORKER_LOG.
 import fs from 'node:fs';
@@ -109,6 +113,22 @@ async function runJob(id) {
 	}
 }
 
+/** A previews job: the cache files the real lane would rebuild from library/. @param {string} id */
+function runPreviews(id) {
+	const row = /** @type {{ source_name: string, kind: string, status: string } | undefined} */ (
+		db.prepare('SELECT source_name, kind, status FROM media WHERE id = ?').get(id)
+	);
+	log({ type: 'previews', id, status: row?.status });
+	if (row?.source_name.startsWith('previews-fail')) {
+		send({ type: 'done', id, outcome: 'failed', errorCode: 'corrupt', detail: 'its file in library/ is missing' });
+		return;
+	}
+	const dir = path.join(/** @type {string} */ (configDir), 'cache', id.slice(-2), id);
+	fs.mkdirSync(dir, { recursive: true });
+	for (const variant of ['thumb', row?.kind === 'video' ? 'poster' : 'display']) fs.writeFileSync(path.join(dir, `${variant}.webp`), 'webp');
+	send({ type: 'done', id, outcome: 'ready' });
+}
+
 process.on('message', (/** @type {any} */ msg) => {
 	if (msg?.type === 'shutdown') {
 		log({ type: stubborn ? 'ignored-shutdown' : 'shutdown' });
@@ -118,7 +138,7 @@ process.on('message', (/** @type {any} */ msg) => {
 			);
 		} else if (!stubborn) process.exit(0);
 	}
-	if (msg?.type === 'job') void runJob(String(msg.id));
+	if (msg?.type === 'job') void (msg.task === 'previews' ? runPreviews(String(msg.id)) : runJob(String(msg.id)));
 });
 process.on('disconnect', () => process.exit(0));
 
@@ -127,6 +147,7 @@ log({
 	execArgv: process.execArgv,
 	argv: process.argv.slice(2),
 	uvThreadpoolSize: process.env.UV_THREADPOOL_SIZE,
-	niceness: os.getPriority()
+	niceness: os.getPriority(),
+	secrets: ['FAMILY_PASSWORD', 'ADMIN_PASSWORD', 'SMTP_PASS'].filter((k) => k in process.env)
 });
 if (process.env.FAKE_WORKER_HELLO !== 'never') send({ type: 'hello', lane, pid: process.pid });

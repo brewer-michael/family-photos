@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { decodePathname, gate, normalizeRouteId, type GateInput } from '#lib/server/gate';
+import { SMALL_BODY_LIMIT, allowsLargeBody, bodyTooLarge, decodePathname, gate, normalizeRouteId, type GateInput } from '#lib/server/gate';
 
 const req = (over: Partial<GateInput>): GateInput => ({
 	routeId: '/',
@@ -113,5 +113,46 @@ describe('helpers', () => {
 		expect(normalizeRouteId('/(app)')).toBe('/');
 		expect(normalizeRouteId('/join/[token]')).toBe('/join/[token]');
 		expect(normalizeRouteId(null)).toBeNull();
+	});
+});
+
+describe('request body size (only tus uploads may send big bodies)', () => {
+	const post = (body: BodyInit | null, headers: Record<string, string> = {}) =>
+		new Request('http://x/login', { method: 'POST', headers, body, duplex: 'half' } as RequestInit);
+	/** A chunked body (no Content-Length) of `n` bytes in 64 KiB chunks. */
+	const chunked = (n: number) => {
+		let left = n;
+		return new ReadableStream<Uint8Array>({
+			pull(c) {
+				if (left <= 0) return c.close();
+				const k = Math.min(left, 64 * 1024);
+				left -= k;
+				c.enqueue(new Uint8Array(k).fill(97));
+			}
+		});
+	};
+
+	it('allowsLargeBody: the upload route only, never a remote call', () => {
+		expect(allowsLargeBody('/api/upload/[...path]', false)).toBe(true);
+		expect(allowsLargeBody('/(app)/api/upload/[...path]', false)).toBe(true);
+		expect(allowsLargeBody('/api/upload/[...path]', true)).toBe(false);
+		for (const id of ['/login', '/admin/login', '/view/[id]', '/api/retry', '/api/uploads', null]) expect(allowsLargeBody(id, false), String(id)).toBe(false);
+	});
+
+	it('bodyTooLarge decides by Content-Length when there is one', async () => {
+		expect(await bodyTooLarge(post('code=abc'))).toBe(false);
+		expect(await bodyTooLarge(post('x', { 'content-length': String(SMALL_BODY_LIMIT + 1) }))).toBe(true);
+		expect(await bodyTooLarge(post('x', { 'content-length': '60000000' }))).toBe(true);
+		expect(await bodyTooLarge(new Request('http://x/login'))).toBe(false); // GET: no body
+	});
+
+	it('bodyTooLarge reads a chunked body only up to the limit, and leaves a small one readable', async () => {
+		expect(await bodyTooLarge(post(chunked(60_000_000)))).toBe(true);
+		const small = post(chunked(1000));
+		expect(await bodyTooLarge(small)).toBe(false);
+		expect((await small.text()).length).toBe(1000); // the action still gets the whole body
+		const form = post(new TextEncoder().encode('code=abc&next=%2F').buffer as ArrayBuffer, { 'content-type': 'application/x-www-form-urlencoded' });
+		expect(await bodyTooLarge(form)).toBe(false);
+		expect((await form.formData()).get('code')).toBe('abc');
 	});
 });

@@ -56,6 +56,12 @@
 			Some photos or videos can't be added until the media tools are fixed. <a class="tap" href="#tools">See what's missing</a>
 		</p>
 	{/if}
+	{#if data.backup.error}
+		<p class="notice warn">
+			The copy of the database in .backups didn't work{data.backup.errorAt ? ` (${day(data.backup.errorAt)})` : ''}: {data.backup.error}
+			<a class="tap" href="#storage">Storage</a>
+		</p>
+	{/if}
 
 	<section class="section" id="requests" aria-labelledby="requests-title">
 		<h2 id="requests-title"><Icon name="flag" /> Removal requests</h2>
@@ -202,7 +208,18 @@
 			<dd>{data.storage.originals} ({plural(data.storage.originalsCount, 'item', 'items')})</dd>
 			<dt>In the trash</dt>
 			<dd><a class="tap" href="/admin/trash">{plural(data.storage.trash, 'item', 'items')}</a></dd>
+			<dt>Database copy</dt>
+			<dd>
+				{data.backup.lastOkAt ? `Last made ${day(data.backup.lastOkAt)}` : 'None made yet'}, in .backups on the photos share (a
+				minute after each start, then every day; the last 7 days are kept)
+			</dd>
 		</dl>
+		{#if data.storage.stuckFiles > 0}
+			<p class="notice warn">
+				The files of {plural(data.storage.stuckFiles, 'item', 'items')} deleted for good could not be deleted yet. They are tried again
+				every day.{data.storage.stuckFilesError ? ` The last problem: ${data.storage.stuckFilesError}` : ''}
+			</p>
+		{/if}
 		{#if !data.storage.keepOriginals}
 			<p class="muted">New originals are not kept (KEEP_ORIGINALS is off).</p>
 		{/if}
@@ -218,12 +235,43 @@
 				<p>Uploads that didn't work keep theirs, so they can be tried again.</p>
 			</ConfirmAction>
 		{/if}
+		{#if data.storage.redoing > 0}
+			<p>
+				{plural(data.storage.redoing, 'item is', 'items are')} being redone, after any new uploads. Everyone keeps seeing the current
+				version until the new one is ready.
+			</p>
+		{/if}
 		{#if data.storage.outdated > 0}
 			<p>{plural(data.storage.outdated, 'item was', 'items were')} made by an older version of this app and can be redone from the originals.</p>
 			<form method="POST" action="?/reprocessOutdated" use:enhance={submitting('reprocess')}>
 				<button type="submit" class="btn" disabled={busy.reprocess}><Icon name="retry" /> Redo them</button>
 			</form>
 		{/if}
+		{#if data.storage.redoProblems > 0}
+			<details>
+				<summary>
+					{plural(data.storage.redoProblems, "item couldn't", "items couldn't")} be redone. They still show as before.
+				</summary>
+				<ul class="small">
+					{#each data.storage.redoProblemList as p (p.id)}
+						<li>{p.name}{p.album ? ` (${p.album})` : ''}: <span class="muted">{p.error}</span></li>
+					{/each}
+				</ul>
+			</details>
+		{/if}
+		{#if data.storage.previewsWaiting > 0}
+			<p>
+				The previews of {plural(data.storage.previewsWaiting, 'item are', 'items are')} being made again from the photos share, after any
+				new uploads.
+			</p>
+		{/if}
+		<p class="muted previews-note">
+			Previews are kept in the app data folder. If it was lost or restored from an older backup, missing ones are made again from the
+			photos share at the next start, or now:
+		</p>
+		<form method="POST" action="?/rebuildPreviews" use:enhance={submitting('previews')}>
+			<button type="submit" class="btn" disabled={busy.previews}><Icon name="retry" /> Rebuild missing previews</button>
+		</form>
 	</section>
 
 	<section class="section" id="albums" aria-labelledby="albums-title">
@@ -376,12 +424,17 @@
 	}
 	.facts {
 		display: grid;
+		/* A link value is a tap-height box (.tap): line its text up with the label. */
+		align-items: baseline;
 		grid-template-columns: minmax(8rem, max-content) 1fr;
 		gap: 0.35rem 1rem;
 		margin: 0 0 1rem;
 	}
 	.facts dt {
 		font-weight: 700;
+	}
+	.previews-note {
+		margin-top: 1.5rem;
 	}
 	.facts dd {
 		margin: 0;

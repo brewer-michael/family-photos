@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { ADMIN_PASSWORD, joinPath, login, readSettings } from './helpers';
+import { deviceIdOf, seedAlbum, seedMedia } from './seed';
 
 test.describe('access over plain HTTP', () => {
 	test('family code (odd casing/spaces) → name → home shows Everyday Photos', async ({ page, context, baseURL }) => {
@@ -33,6 +34,45 @@ test.describe('access over plain HTTP', () => {
 		expect(cookies.find((c) => c.name === 'fp_device')).toMatchObject({ httpOnly: true });
 	});
 
+	test('"Not Jo?" on a shared tablet: the next person gets a device of their own', async ({ page, context }) => {
+		const album = seedAlbum('Shared iPad');
+		const photo = await seedMedia(album, { name: 'IMG_0001.HEIC', takenAt: '2024-07-04T12:00:00-07:00' });
+		await login(page, 'Grandma Jo');
+		const jo = await deviceIdOf(context);
+		await page.goto(`/view/${photo}`);
+		await page.getByLabel('Write a memory').fill('Jo wrote this');
+		await page.getByRole('button', { name: 'Save memory' }).click();
+		await expect(page.getByRole('status').filter({ hasText: 'your memory is saved' })).toBeVisible();
+		await page.getByRole('button', { name: 'Ask to remove' }).click();
+		const ask = page.getByRole('dialog', { name: 'Ask to remove this photo' });
+		await ask.getByRole('radio', { name: 'Blurry or duplicate' }).check();
+		await ask.getByRole('button', { name: 'Send request' }).click();
+		await page.getByRole('dialog', { name: 'Thank you' }).getByRole('button', { name: 'OK' }).click();
+
+		// Jo taps it by mistake and types her own name again (any case): still Jo's device.
+		await page.getByRole('link', { name: 'Not Grandma Jo?' }).click();
+		await expect(page.getByLabel('Your name')).toHaveValue('');
+		await expect(page.getByRole('link', { name: "Go back, I'm Grandma Jo" })).toHaveAttribute('href', `/view/${photo}`);
+		await page.getByLabel('Your name').fill('grandma  JO');
+		await page.getByRole('button', { name: 'Continue' }).click();
+		await expect(page).toHaveURL(new RegExp(`/view/${photo}$`));
+		expect(await deviceIdOf(context)).toBe(jo);
+		await expect(page.getByRole('listitem').filter({ hasText: 'Jo wrote this' }).getByRole('link', { name: 'Edit' })).toHaveCount(1);
+
+		// Uncle Bob takes the tablet: Jo's memory and request stay hers.
+		await page.getByRole('link', { name: 'Not grandma JO?' }).click();
+		await page.getByLabel('Your name').fill('Uncle Bob');
+		await page.getByRole('button', { name: 'Continue' }).click();
+		await expect(page).toHaveURL(new RegExp(`/view/${photo}$`));
+		await expect(page.getByRole('link', { name: 'Not Uncle Bob?' })).toBeVisible();
+		expect(await deviceIdOf(context)).not.toBe(jo);
+		const memory = page.getByRole('listitem').filter({ hasText: 'Jo wrote this' });
+		await expect(memory).toContainText('— Grandma Jo,');
+		await expect(memory.getByRole('link', { name: 'Edit' })).toHaveCount(0);
+		await expect(memory.getByRole('button', { name: /Delete/ })).toHaveCount(0);
+		await expect(page.getByRole('button', { name: 'Ask to remove' })).toBeVisible();
+	});
+
 	test('a QR join URL lands on the album after choosing a name', async ({ page }) => {
 		const { defaultAlbumId } = readSettings();
 		await page.goto(joinPath(defaultAlbumId));
@@ -48,10 +88,37 @@ test.describe('access over plain HTTP', () => {
 		await expect(page).toHaveURL(new RegExp(`/album/${defaultAlbumId}$`));
 	});
 
-	test('an invalid join link goes to the family code page', async ({ page }) => {
-		await page.goto('/join/not-a-real-token-at-all?album=1');
+	test('a wrong code stays in the field, focused, so a typo can be fixed', async ({ page }, testInfo) => {
+		// One wrong code, from an address of its own (the limit counts failures per address).
+		await page.setExtraHTTPHeaders({ 'x-real-ip': testInfo.project.name === 'mobile' ? '198.51.100.81' : '198.51.100.82' });
+		await page.goto('/login');
+		const code = page.getByLabel('Family code');
+		await code.fill('blue lakes cabin');
+		await page.getByRole('button', { name: 'Come in' }).click();
+		await expect(page.getByRole('alert')).toHaveText("That code didn't work. Check the spelling and try again.");
+		await expect(code).toHaveValue('blue lakes cabin');
+		await expect(code).toBeFocused();
+		await code.press('End');
+		for (let i = 0; i < 'cabin'.length + 2; i++) await code.press('Backspace');
+		await code.pressSequentially(' cabin');
+		await expect(code).toHaveValue('blue lake cabin');
+		await page.getByRole('button', { name: 'Come in' }).click();
+		await expect(page).toHaveURL(/\/name\?next=%2F$/);
+	});
+
+	test('an invalid join link goes to the family code page, then on to its album', async ({ page }) => {
+		await page.goto('/join/not-a-real-token-at-all');
 		await expect(page).toHaveURL(/\/login\?error=join$/);
+		const { defaultAlbumId } = readSettings();
+		await page.goto(`/join/not-a-real-token-at-all?album=${defaultAlbumId}`);
+		await expect(page).toHaveURL(new RegExp(`/login\\?error=join&next=%2Falbum%2F${defaultAlbumId}$`));
 		await expect(page.getByRole('alert')).toContainText("doesn't work any more");
+		await page.getByLabel('Family code').fill('blue lake cabin');
+		await page.getByRole('button', { name: 'Come in' }).click();
+		await page.getByLabel('Your name').fill('Aunt Linda');
+		await page.getByRole('button', { name: 'Continue' }).click();
+		await expect(page).toHaveURL(new RegExp(`/album/${defaultAlbumId}$`));
+		await expect(page.getByRole('heading', { level: 1, name: 'Everyday Photos' })).toBeVisible();
 	});
 
 	test('the 11th wrong code gets the rate-limit message (429), even from a new address', async ({ page, context }, testInfo) => {

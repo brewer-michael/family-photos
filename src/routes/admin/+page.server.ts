@@ -7,13 +7,14 @@ import { mailHealth, sendMail } from '#lib/server/mail';
 import { resendRemovalEmail } from '#lib/server/removal';
 import { getSelfCheck, runSelfCheck } from '#lib/server/selfcheck';
 import { formatBytes } from '#lib/server/disk';
+import { previewsWaiting, queueMissingPreviews } from '#lib/server/queue';
 import {
 	ERROR_CODE_LABELS,
 	deleteAlbum,
 	deleteArchivedOriginals,
 	done,
 	field,
-	listOutdated,
+	countOutdated,
 	problem,
 	reprocessOutdated,
 	requireAdmin,
@@ -22,7 +23,8 @@ import {
 import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
 import * as requests from '#lib/server/repo/requests';
-import { albumTitles, listAlbums } from '#lib/server/repo/admin';
+import { albumTitles, deletableOriginals, fileDeletionProblems, listAlbums } from '#lib/server/repo/admin';
+import { backupStatus } from '#lib/server/maintenance';
 import { getDefaultAlbumId } from '#lib/server/repo/settings';
 import { tx } from '#lib/server/db';
 import { mediaUrl } from '#lib/client/dto';
@@ -55,7 +57,9 @@ export const load: PageServerLoad = ({ locals }) => {
 	const titles = albumTitles();
 	const defaultAlbumId = getDefaultAlbumId();
 	const totals = media.storageTotals();
-	const keptForReady = media.listKeptOriginals().filter((o) => o.status === 'ready');
+	const deletable = deletableOriginals();
+	const stuckFiles = fileDeletionProblems();
+	const redo = media.redoSummary();
 
 	const pending = requests.listPending().map((r) => {
 		const row = media.getById(r.media_id);
@@ -111,12 +115,29 @@ export const load: PageServerLoad = ({ locals }) => {
 			videos: totals.videoCount,
 			originals: formatBytes(totals.originalsBytes),
 			originalsCount: totals.originalsCount,
-			deletableOriginals: keptForReady.length,
-			deletableBytes: formatBytes(keptForReady.reduce((n, o) => n + o.source_size, 0)),
+			deletableOriginals: deletable.count,
+			deletableBytes: formatBytes(deletable.bytes),
 			keepOriginals: c.keepOriginals,
-			outdated: listOutdated().length,
-			trash: totals.trashCount
+			outdated: countOutdated(),
+			/** Redos still waiting or running (the items show their current version meanwhile). */
+			redoing: redo.pending,
+			/** Redos that didn't work: the items still show as before. */
+			redoProblems: redo.problemCount,
+			redoProblemList: redo.problems.map((p) => ({
+				id: p.id,
+				name: p.source_name,
+				album: titles.get(p.album_id) ?? '',
+				error: p.redo_error
+			})),
+			trash: totals.trashCount,
+			/** Previews still to rebuild from library/ (a lost or restored cache; queue.ts). */
+			previewsWaiting: previewsWaiting(),
+			/** Items deleted for good whose files could not be deleted yet (tried again every day). */
+			stuckFiles: stuckFiles.count,
+			stuckFilesError: stuckFiles.lastError
 		},
+		/** The nightly copy of the database in .backups. */
+		backup: backupStatus(),
 		albums: listAlbums().map((a) => ({ ...a, isDefault: a.id === defaultAlbumId })),
 		defaultAlbumTitle: (defaultAlbumId !== null && albums.get(defaultAlbumId)?.title) || 'Everyday Photos'
 	};
@@ -216,7 +237,27 @@ export const actions: Actions = {
 	reprocessOutdated: async ({ locals }) => {
 		requireAdmin(locals);
 		const n = await reprocessOutdated();
-		return done('storage', n === 0 ? 'Nothing needs redoing.' : `${n} ${n === 1 ? 'item is' : 'items are'} being redone. They come back by themselves when ready.`);
+		return done(
+			'storage',
+			n === 0
+				? 'Nothing needs redoing.'
+				: `${n} ${n === 1 ? 'item is' : 'items are'} being redone, after any new uploads. Everyone keeps seeing the current version until the new one is ready.`
+		);
+	},
+
+	/**
+	 * "Rebuild missing previews": looks again for items whose previews are missing from the app data
+	 * folder (cache/), e.g. after restoring it, and rebuilds them from library/ (also done at every start).
+	 */
+	rebuildPreviews: ({ locals }) => {
+		requireAdmin(locals);
+		const n = queueMissingPreviews();
+		return done(
+			'storage',
+			n === 0
+				? 'Every photo and video has its previews.'
+				: `Making the previews of ${n} ${n === 1 ? 'item' : 'items'} again from the photos share, after any new uploads.`
+		);
 	},
 
 	/** access_gen++: every cookie and printed QR code stops working; the admin gets a fresh cookie. */

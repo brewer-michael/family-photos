@@ -18,7 +18,7 @@ import * as paths from '#lib/server/paths';
 import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
 import { MediaError } from '#lib/shared/errors';
-import type { ErrorCode } from '#lib/shared/media-types';
+import { PIPELINE_VERSION, type ErrorCode } from '#lib/shared/media-types';
 import { freshDb, testEnv } from '../helpers/env';
 import { deltaE2000, meanRgb, pixels, quadrantMeans, type Pixels } from '../helpers/photo-color';
 import {
@@ -145,7 +145,7 @@ async function expectCommitted(c: Converted, e: { ext: 'jpg' | 'png' | 'gif'; co
 	const meta = await sharp(c.canonical).metadata();
 	expect(meta.format).toBe({ jpg: 'jpeg', png: 'png', gif: 'gif' }[e.ext]);
 
-	// The source: passthrough → it *is* the canonical file; transcode → archived (KEEP_ORIGINALS).
+	// The source: passthrough → deleted (library/ holds its bytes); transcode → archived (KEEP_ORIGINALS).
 	expect(fs.existsSync(c.src)).toBe(false);
 	const archived = paths.originalsPath(c.id, row.source_ext!);
 	if (e.conversion === 'none') {
@@ -674,19 +674,53 @@ describe('sources and commits', () => {
 		expect(fs.existsSync(paths.originalsPath(c.id, 'heic'))).toBe(false);
 	});
 
-	it('reprocesses from the archived original, replacing the library and cache files', async () => {
+	it('redoes from the archived original while the item stays ready, replacing the library and cache files', async () => {
 		const c = await convert(photo('o6.heic'));
+		getDb().prepare('UPDATE media SET pipeline_version = 0 WHERE id = ?').run(c.id);
 		const before = fs.statSync(paths.cacheFile(c.id, 'thumb')).mtimeMs;
 		expect(media.markForReprocess(c.id)).toBe(true);
-		expect(media.claimForProcessing(c.id)?.status).toBe('processing');
+		expect(media.claimRedo(c.id)).toMatchObject({ status: 'ready', redo_state: 'running' });
+		expect(media.listByAlbum(albumId).items.map((r) => r.id)).toContain(c.id); // visible while redone
 		await processPhoto(c.id, context());
 		const row = media.getById(c.id)!;
-		expect(row).toMatchObject({ status: 'ready', source_kept: 1, width: H, height: W });
+		expect(row).toMatchObject({ status: 'ready', source_kept: 1, width: H, height: W, pipeline_version: PIPELINE_VERSION, redo_state: null });
 		expect(sha(paths.originalsPath(c.id, 'heic'))).toBe(sha(photo('o6.heic')));
 		expect(fs.statSync(paths.cacheFile(c.id, 'thumb')).mtimeMs).toBeGreaterThanOrEqual(before);
 	});
 
-	it('does not commit (and puts a passthrough source back) when the row left processing', async () => {
+	it('a redo that fails leaves the live file, the original and the row as they were', async () => {
+		const c = await convert(photo('o1.heic'));
+		const lib = paths.libraryPath(c.id, 'jpg');
+		fs.writeFileSync(lib, 'the live file'); // tell it apart from a fresh conversion
+		getDb().prepare('UPDATE media SET pipeline_version = 0 WHERE id = ?').run(c.id);
+		const redoOnce = async () => {
+			expect(media.markForReprocess(c.id)).toBe(true);
+			expect(media.claimRedo(c.id)).toBeTruthy();
+			return processPhoto(c.id, context()).then(
+				() => null,
+				(e: unknown) => e
+			);
+		};
+		// The commit itself fails (database error after the new file was renamed into library/).
+		getDb().exec(`CREATE TEMP TRIGGER redo_fails BEFORE UPDATE OF pipeline_version ON media BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END`);
+		try {
+			expect(String(await redoOnce())).toMatch(/disk I\/O error/);
+		} finally {
+			getDb().exec('DROP TRIGGER redo_fails');
+		}
+		expect(fs.readFileSync(lib, 'utf8')).toBe('the live file');
+		expect(sha(paths.originalsPath(c.id, 'heic'))).toBe(sha(photo('o1.heic')));
+		expect(media.getById(c.id)).toMatchObject({ status: 'ready', pipeline_version: 0, source_kept: 1 });
+		media.failRedo(c.id, 'test');
+		// The archived original no longer decodes.
+		fs.writeFileSync(paths.originalsPath(c.id, 'heic'), 'not a photo any more');
+		const err = await redoOnce();
+		expect(MediaError.is(err) && err.code).toBe('unsupported');
+		expect(fs.readFileSync(lib, 'utf8')).toBe('the live file');
+		expect(media.getById(c.id)).toMatchObject({ status: 'ready', pipeline_version: 0, canonical_ext: 'jpg' });
+	});
+
+	it('does not commit (and leaves a passthrough source untouched) when the row left processing', async () => {
 		const q = await enqueue(photo('o1.jpg'));
 		expect(media.requeue(q.id)).toBe(true);
 		const err = await processPhoto(q.id, context()).then(

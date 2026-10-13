@@ -1,10 +1,22 @@
-<!-- Family code page. Works without JavaScript (a plain form POST). -->
+<!--
+	Family code page. Works without JavaScript (a plain form POST). A wrong code comes back in the
+	field, with the field focused, so "Check the spelling" means fixing one letter, not retyping.
+-->
 <script lang="ts">
+	import { onMount } from 'svelte';
 	import type { PageProps } from './$types';
 	import Icon from '#lib/components/Icon.svelte';
 
 	let { data, form }: PageProps = $props();
 	const describedBy = $derived(form?.message ? 'code-hint code-error' : 'code-hint');
+	let codeInput = $state<HTMLInputElement>();
+
+	onMount(() => {
+		if (form?.message && codeInput) {
+			codeInput.focus();
+			codeInput.setSelectionRange(codeInput.value.length, codeInput.value.length);
+		}
+	});
 </script>
 
 <svelte:head>
@@ -38,6 +50,8 @@
 				spellcheck="false"
 				enterkeyhint="go"
 				required
+				defaultValue={form && 'code' in form ? form.code : ''}
+				bind:this={codeInput}
 				aria-invalid={!!form?.message}
 				aria-describedby={describedBy}
 			/>

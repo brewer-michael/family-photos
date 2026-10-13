@@ -1,7 +1,7 @@
 /**
- * Maintenance against the per-file temp CONFIG_DIR/PHOTOS_DIR: trash and duplicate purges (files,
- * then rows), backup rotation, the .incoming and cache sweeps, the hourly failure email and the
- * timers.
+ * Maintenance against the per-file temp CONFIG_DIR/PHOTOS_DIR: trash and duplicate purges (rows,
+ * then files), backups (rotation, never replacing copies of another database), the .incoming and
+ * cache sweeps, the hourly failure email and the timers.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -13,6 +13,7 @@ import {
 	DIGEST_MIN_GAP_MS,
 	FIRST_RUN_DELAY_MS,
 	backupDatabase,
+	backupStatus,
 	purgeDuplicates,
 	runDaily,
 	sendFailureDigest,
@@ -21,8 +22,8 @@ import {
 	sweepCache,
 	sweepIncoming
 } from '#lib/server/maintenance';
-import { getDb } from '#lib/server/db';
-import { backupsDir, cacheDir, cacheFile, incomingDir, incomingPath, libraryPath, originalsPath, outboxDir } from '#lib/server/paths';
+import { closeDb, getDb } from '#lib/server/db';
+import { backupsDir, cacheDir, cacheFile, dbPath, incomingDir, incomingPath, libraryPath, originalsPath, outboxDir } from '#lib/server/paths';
 import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
 import * as memories from '#lib/server/repo/memories';
@@ -184,9 +185,77 @@ describe('daily: backups', () => {
 		const copy = new Database(file, { readonly: true });
 		try {
 			expect(copy.prepare('SELECT title FROM albums WHERE id = ?').get(album)).toEqual({ title: 'Beach' });
+			expect(copy.pragma('journal_mode', { simple: true })).toBe('delete'); // one file, nothing next to it
 		} finally {
 			copy.close();
 		}
+		expect(fs.readdirSync(backupsDir()).filter((n) => /-(wal|shm|journal)$/.test(n))).toEqual([]);
+		expect(backupStatus()).toEqual({ lastOkAt: now, error: null, errorAt: null });
+	});
+
+	const titlesIn = (file: string): string[] => {
+		const db = new Database(file, { readonly: true });
+		try {
+			return db.prepare('SELECT title FROM albums ORDER BY id').pluck().all() as string[];
+		} finally {
+			db.close();
+		}
+	};
+	const day = (d: number) => Date.UTC(2026, 9, d, 3, 0);
+	const backupFiles = () => fs.readdirSync(backupsDir()).filter((n) => n.endsWith('.sqlite')).sort();
+
+	it('never replaces copies of another database: lost appdata stops the backups until a copy is restored', async () => {
+		for (let d = 7; d <= 13; d++) await backupDatabase(day(d));
+		const before = backupFiles();
+		expect(before).toHaveLength(BACKUPS_KEPT);
+
+		// /config is lost: the app starts on a new, empty database (new secret) next to the old copies.
+		freshDb();
+		const restart = Date.UTC(2026, 9, 13, 12, 1);
+		await expect(backupDatabase(restart)).rejects.toThrow(/different database/);
+		for (let d = 14; d <= 21; d++) await expect(backupDatabase(day(d))).rejects.toThrow(/different database/);
+		expect(backupFiles()).toEqual(before);
+		expect(titlesIn(path.join(backupsDir(), 'app-2026-10-13.sqlite'))).toEqual(['Everyday Photos', 'Beach']);
+		expect(fs.readdirSync(backupsDir()).filter((n) => /-(wal|shm|journal)$/.test(n))).toEqual([]);
+		const status = backupStatus();
+		expect(status).toMatchObject({ lastOkAt: null, errorAt: day(21) });
+		expect(status.error).toContain('app-2026-10-13.sqlite');
+		expect(status.error).toContain('move the old copies out of .backups');
+
+		// The admin restores the newest copy: backups carry on, and the error is gone.
+		closeDb();
+		for (const f of ['', '-wal', '-shm']) fs.rmSync(dbPath() + f, { force: true });
+		fs.copyFileSync(path.join(backupsDir(), 'app-2026-10-13.sqlite'), dbPath());
+		await backupDatabase(day(22));
+		expect(backupStatus()).toEqual({ lastOkAt: day(22), error: null, errorAt: null });
+		expect(backupFiles()).toHaveLength(BACKUPS_KEPT);
+		expect(titlesIn(path.join(backupsDir(), 'app-2026-10-22.sqlite'))).toEqual(['Everyday Photos', 'Beach']);
+	});
+
+	it('starting over on purpose: once the old copies are moved away, backups start again', async () => {
+		await backupDatabase(day(12));
+		freshDb();
+		await expect(backupDatabase(day(13))).rejects.toThrow(/different database/);
+		fs.renameSync(backupsDir(), `${backupsDir()}-old`);
+		await backupDatabase(day(13));
+		expect(backupFiles()).toEqual(['app-2026-10-13.sqlite']);
+		expect(backupStatus().error).toBeNull();
+		fs.rmSync(`${backupsDir()}-old`, { recursive: true, force: true });
+	});
+
+	it('reads older copies made in WAL mode without leaving -wal/-shm next to them', async () => {
+		fs.mkdirSync(backupsDir(), { recursive: true });
+		await getDb().backup(path.join(backupsDir(), 'app-2026-10-12.sqlite')); // as copies were made before
+		await backupDatabase(day(13));
+		expect(fs.readdirSync(backupsDir()).sort()).toEqual(['app-2026-10-12.sqlite', 'app-2026-10-13.sqlite']);
+	});
+
+	it('leaves the copies made before an upgrade alone', async () => {
+		fs.mkdirSync(backupsDir(), { recursive: true });
+		const pre = touchFile(path.join(backupsDir(), 'app-pre-v1-2026-01-01.sqlite'));
+		for (let d = 1; d <= 9; d++) await backupDatabase(day(d));
+		expect(exists(pre)).toBe(true);
+		expect(backupFiles()).toHaveLength(BACKUPS_KEPT + 1);
 	});
 });
 
@@ -206,6 +275,23 @@ describe('daily: sweeps', () => {
 
 		expect(await sweepIncoming()).toBe(2);
 		expect(fs.readdirSync(incomingDir()).sort()).toEqual(['README.txt', fresh, `${fresh}.json`, inUse].sort());
+	});
+
+	it('keeps the upload of a committed item until its lane has archived or deleted the source', async () => {
+		// A lane that died after markReady() but before archiving: the row is ready and still holds its token.
+		const id = received(album);
+		const tok = media.getById(id)!.upload_token!;
+		media.markQueued(id, { kind: 'photo', sourceMime: 'image/heic', sourceExt: 'heic', sourceSha256: `sha${++seq}`, estCostS: null });
+		media.claimForProcessing(id);
+		media.markReady(id, { conversion: 'transcode', canonicalExt: 'jpg', canonicalSize: 1, width: 1, height: 1, takenMs: 1, sourceKept: true });
+		touchFile(incomingPath(tok), 72 * HOUR);
+		expect(await sweepIncoming()).toBe(0);
+		expect(exists(incomingPath(tok))).toBe(true);
+		// Settled (here: the lane could not archive it and recorded that): the leftover goes.
+		media.markOriginalDeleted(id);
+		media.sourceSettled(id);
+		expect(await sweepIncoming()).toBe(1);
+		expect(exists(incomingPath(tok))).toBe(false);
 	});
 
 	it('deletes cache dirs of items that no longer exist once they are an hour old', async () => {

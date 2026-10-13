@@ -108,18 +108,61 @@ function exclusive<T>(fn: () => T | Promise<T>): Promise<T> {
 // ---------------------------------------------------------------------------
 
 /**
- * Deletes items trashed more than `olderThanMs` ago for good: files first, then rows (a crash in
- * between leaves rows whose files are gone, and the next purge finishes them). Items still being
- * taken in or converted wait for the next purge (see adminRepo.trashedBefore). Returns how many
- * items (not counting hidden Live Photo videos) were deleted.
+ * Deletes the files of items already deleted for good (adminRepo.deleteMediaQueueingFiles). An
+ * item's entry goes once every file of it is gone; one that fails (say a permission problem on
+ * /photos) stays, with its reason for the admin page, and the next purge tries again. Never throws
+ * for a file. Returns how many items' files were deleted and how many are still left.
+ */
+async function deleteQueuedFilesNow(): Promise<{ done: number; left: number }> {
+	let done = 0;
+	let left = 0;
+	let firstError: string | null = null;
+	for (const entry of adminRepo.queuedFileDeletions()) {
+		try {
+			await deleteItemFiles({
+				id: entry.media_id,
+				canonical_ext: entry.canonical_ext,
+				source_ext: entry.source_ext,
+				upload_token: entry.upload_token
+			});
+			adminRepo.fileDeletionDone(entry.media_id);
+			done++;
+		} catch (e) {
+			const message = e instanceof Error ? e.message : String(e);
+			adminRepo.fileDeletionFailed(entry.media_id, message);
+			firstError ??= message;
+			left++;
+		}
+	}
+	if (left > 0) {
+		console.error(`[admin] the files of ${left} item(s) deleted for good could not be deleted yet (tried again daily): ${firstError}`);
+	}
+	return { done, left };
+}
+
+/** deleteQueuedFilesNow(), after any trash purge or restore in progress. */
+export function deleteQueuedFiles(): Promise<{ done: number; left: number }> {
+	return exclusive(deleteQueuedFilesNow);
+}
+
+/**
+ * Deletes items trashed more than `olderThanMs` ago for good: rows first, recording their files in
+ * the same transaction, then the files (deleteQueuedFilesNow, which also retries files earlier
+ * runs could not delete). So a file that can't be deleted, or a crash part way, never leaves an
+ * item in the trash whose files are gone. Items still being taken in or converted wait for the next
+ * purge (see adminRepo.trashedBefore). Returns how many items (not counting hidden Live Photo
+ * videos) were deleted.
  */
 export function purgeTrash(olderThanMs: number, now: number = Date.now()): Promise<number> {
 	return exclusive(async () => {
-		const rows = adminRepo.trashedBefore(now - olderThanMs);
-		for (const row of rows) await deleteItemFiles(row);
-		adminRepo.deleteMedia(rows.map((r) => r.id));
+		const rows = tx(() => {
+			const gone = adminRepo.trashedBefore(now - olderThanMs);
+			adminRepo.deleteMediaQueueingFiles(gone);
+			return gone;
+		});
 		const items = rows.filter((r) => r.live_photo_of === null).length;
 		if (rows.length > 0) console.log(`[admin] deleted ${items} item(s) from the trash for good`);
+		await deleteQueuedFilesNow();
 		return items;
 	});
 }
@@ -129,9 +172,24 @@ export function emptyTrash(): Promise<number> {
 	return purgeTrash(0, Date.now() + 1);
 }
 
-/** Restore from the trash (after any purge in progress). */
-export function restoreItem(id: string): Promise<media.RestoreResult> {
-	return exclusive(() => media.restore(id));
+export type RestoreItemResult = media.RestoreResult | { ok: false; reason: 'file_missing' };
+
+/**
+ * Restore from the trash (after any purge in progress). Refused when a ready item's file is no
+ * longer in library/: it would come back as a broken tile that can't be saved.
+ */
+export function restoreItem(id: string): Promise<RestoreItemResult> {
+	return exclusive(async (): Promise<RestoreItemResult> => {
+		const row = media.getById(id);
+		if (row && row.deleted_at !== null && row.status === 'ready' && row.canonical_ext) {
+			const present = await fs.promises.access(libraryPath(row.id, row.canonical_ext)).then(
+				() => true,
+				() => false
+			);
+			if (!present) return { ok: false, reason: 'file_missing' };
+		}
+		return media.restore(id);
+	});
 }
 
 /** Days until a trashed item is deleted for good (at least 0). */
@@ -152,7 +210,8 @@ export function deleteArchivedOriginals(): Promise<{ count: number; bytes: numbe
 		let count = 0;
 		let bytes = 0;
 		for (const kept of media.listKeptOriginals()) {
-			if (media.getById(kept.id)?.status !== 'ready') continue;
+			const row = media.getById(kept.id);
+			if (!row || !media.originalDeletable(row)) continue;
 			if (kept.source_ext) await removeInside(originalsRoot(), originalsPath(kept.id, kept.source_ext));
 			media.markOriginalDeleted(kept.id);
 			count++;
@@ -164,19 +223,27 @@ export function deleteArchivedOriginals(): Promise<{ count: number; bytes: numbe
 }
 
 /**
- * Ready items, not in the trash, made by an older pipeline whose archived original lets them be
- * redone: exactly the rows media.markForReprocess() accepts, so "Redo them" never finds nothing.
+ * Ready items, not in the trash and not already being redone, made by an older pipeline whose
+ * archived original lets them be redone: exactly the rows reprocessOutdated() queues, so "Redo
+ * them" never finds nothing. Includes items whose last redo didn't work.
  */
 export function listOutdated(): media.MediaRow[] {
-	return media
-		.listBelowPipelineVersion(PIPELINE_VERSION)
-		.filter((r) => r.deleted_at === null && r.source_kept === 1 && r.source_ext !== null && r.kind !== null);
+	return media.listOutdated(PIPELINE_VERSION);
 }
 
-/** Queues every outdated item again from its archived original. Returns how many. */
+/** How many items listOutdated() would return (the admin page shows the number only). */
+export function countOutdated(): number {
+	return media.countOutdated(PIPELINE_VERSION);
+}
+
+/**
+ * Queues a redo of every outdated item from its archived original (one statement). The items stay
+ * visible as they are until their new version is ready; a redo that doesn't work leaves them as
+ * they were. The lanes take redos only while no upload waits. Returns how many.
+ */
 export function reprocessOutdated(): Promise<number> {
 	return exclusive(() => {
-		const n = listOutdated().filter((r) => media.markForReprocess(r.id)).length;
+		const n = media.queueRedos(PIPELINE_VERSION);
 		if (n > 0) wakeQueue();
 		return n;
 	});

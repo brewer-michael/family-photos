@@ -109,6 +109,23 @@ describe('createNameAllocator', () => {
 		expect(take('noext')).toBe('noext');
 		expect(take('noext')).toBe('noext (2)');
 	});
+
+	it('gives the same names as numbering from "(2)" each time, around names numbered by hand', () => {
+		const take = createNameAllocator(['Scan (3).jpg']);
+		const got = ['Scan.jpg', 'scan.JPG', 'Scan.jpg', 'Scan (5).jpg', 'Scan.jpg', 'Scan.jpg', 'Scan (2).jpg'].map(take);
+		expect(got).toEqual(['Scan.jpg', 'scan (2).JPG', 'Scan (4).jpg', 'Scan (5).jpg', 'Scan (6).jpg', 'Scan (7).jpg', 'Scan (2) (2).jpg']);
+	});
+
+	it('names thousands of files with the same name quickly (one step each)', () => {
+		const take = createNameAllocator();
+		const started = performance.now();
+		const names = Array.from({ length: 20_000 }, () => take('IMG_1.jpg'));
+		expect(performance.now() - started).toBeLessThan(500);
+		expect(names[0]).toBe('IMG_1.jpg');
+		expect(names[1]).toBe('IMG_1 (2).jpg');
+		expect(names[19_999]).toBe('IMG_1 (20000).jpg');
+		expect(new Set(names).size).toBe(20_000);
+	});
 });
 
 describe('contentDisposition', () => {

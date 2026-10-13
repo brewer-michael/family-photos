@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+	countOutdated,
 	daysLeftInTrash,
 	deleteAlbum,
 	deleteArchivedOriginals,
@@ -23,6 +24,7 @@ import { cacheDir, cacheFile, incomingPath, libraryPath, libraryRoot, originalsP
 import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
 import * as requests from '#lib/server/repo/requests';
+import * as adminRepo from '#lib/server/repo/admin';
 import { getDefaultAlbumId } from '#lib/server/repo/settings';
 import { wakeIntake } from '#lib/server/intake';
 import { wakeQueue } from '#lib/server/queue';
@@ -72,6 +74,7 @@ function ready(albumId: number, opts: { sha?: string; pipelineVersion?: number }
 		sourceKept: true,
 		pipelineVersion: opts.pipelineVersion
 	});
+	media.sourceSettled(id); // as the lane does once the source is archived
 	touchFile(libraryPath(id, 'jpg'));
 	touchFile(originalsPath(id, 'heic'), 'original bytes');
 	touchFile(cacheFile(id, 'thumb'));
@@ -172,6 +175,63 @@ describe('trash', () => {
 		expect(fs.existsSync(libraryPath(video, 'jpg'))).toBe(false);
 	});
 
+	it('deletes rows before files: a file that cannot be deleted leaves nothing to restore, and the next purge deletes it', async () => {
+		const [a, b, c] = [ready(album), ready(album), ready(album)];
+		for (const id of [a, b, c]) media.softDelete(id, 'x');
+		const stuck = libraryPath(b, 'jpg');
+		const realRm = fs.promises.rm;
+		const rm = vi.spyOn(fs.promises, 'rm').mockImplementation(async (p, opts) => {
+			if (p === stuck) throw Object.assign(new Error(`EACCES: permission denied, unlink '${stuck}'`), { code: 'EACCES' });
+			return realRm(p, opts);
+		});
+		try {
+			expect(await emptyTrash()).toBe(3);
+		} finally {
+			rm.mockRestore();
+		}
+		for (const id of [a, b, c]) expect(media.getById(id), id).toBeUndefined();
+		expect(media.listTrash()).toEqual([]);
+		expect(await restoreItem(b)).toEqual({ ok: false, reason: 'not_found' });
+		for (const id of [a, c]) expect(fs.existsSync(libraryPath(id, 'jpg')), id).toBe(false);
+		expect(fs.existsSync(stuck)).toBe(true);
+		expect(fs.existsSync(originalsPath(b, 'heic'))).toBe(false); // its other files went
+		expect(adminRepo.fileDeletionProblems()).toEqual({ count: 1, lastError: expect.stringContaining('EACCES') });
+
+		// Fixed: the next purge (the daily one, or "Empty trash") finishes the job.
+		expect(await emptyTrash()).toBe(0);
+		expect(fs.existsSync(stuck)).toBe(false);
+		expect(adminRepo.fileDeletionProblems()).toEqual({ count: 0, lastError: null });
+		expect(adminRepo.queuedFileDeletions()).toEqual([]);
+	});
+
+	it('files whose rows went just before a crash are deleted by the next purge', async () => {
+		const a = ready(album);
+		media.softDelete(a, 'x');
+		// What a purge has done when the process dies right after its transaction.
+		adminRepo.deleteMediaQueueingFiles(adminRepo.trashedBefore(Date.now() + 1));
+		expect(media.getById(a)).toBeUndefined();
+		expect(fs.existsSync(libraryPath(a, 'jpg'))).toBe(true);
+		expect(await emptyTrash()).toBe(0);
+		for (const f of [libraryPath(a, 'jpg'), originalsPath(a, 'heic'), cacheDir(a)]) expect(fs.existsSync(f), f).toBe(false);
+	});
+
+	it('refuses to restore a ready item whose file is gone from library/', async () => {
+		const a = ready(album);
+		media.softDelete(a, 'x');
+		fs.rmSync(libraryPath(a, 'jpg'));
+		expect(await restoreItem(a)).toEqual({ ok: false, reason: 'file_missing' });
+		expect(media.getById(a)?.deleted_at).not.toBeNull();
+		expect(await trashActions.restore(event(ADMIN, { form: { id: a } }))).toMatchObject({
+			status: 410,
+			data: { section: 'trash', ok: false, message: "The file of IMG_0001.HEIC is gone from the photos folder, so it can't come back." }
+		});
+		// A failed upload in the trash has no file in library/ and comes back as it was.
+		const f = received(album);
+		media.markFailed(f, 'corrupt', 'broken');
+		media.softDelete(f, 'x');
+		expect(await restoreItem(f)).toEqual({ ok: true });
+	});
+
 	it('a restore asked for during a purge waits for it (and finds the item gone)', async () => {
 		const a = ready(album);
 		media.softDelete(a, 'x');
@@ -213,8 +273,14 @@ describe('archived originals and redoing', () => {
 		expect(listOutdated().map((r) => r.id)).toEqual([old]);
 		expect(await reprocessOutdated()).toBe(1);
 		expect(listOutdated()).toEqual([]);
-		expect(media.getById(old)?.status).toBe('queued');
+		expect(countOutdated()).toBe(0);
+		// Still ready and visible while it waits for its redo.
+		expect(media.getById(old)).toMatchObject({ status: 'ready', redo_state: 'queued' });
+		expect(media.listByAlbum(album).items.map((r) => r.id)).toContain(old);
 		expect(wakeQueue).toHaveBeenCalledTimes(1);
+		// Its archived original is kept while it is being redone.
+		expect(await deleteArchivedOriginals()).toMatchObject({ count: 2 }); // the up-to-date one and the trashed one
+		expect(fs.existsSync(originalsPath(old, 'heic'))).toBe(true);
 	});
 
 	it('"Try again" wakes intake or the lanes, depending on where the item goes back to', () => {

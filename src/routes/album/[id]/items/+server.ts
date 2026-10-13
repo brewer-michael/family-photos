@@ -4,7 +4,10 @@ import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
 import { ALBUM_PAGE_SIZE, parseAlbumId, toTile } from '#lib/server/repo/ui';
 
-/** Most tiles one request returns (a refresh reloads every page fetched by "Show more" at once). */
+/**
+ * Most tiles one request returns. A refresh reloads every tile "Show more" had added, asking again
+ * from `next` while there are more than this (#lib/client/tiles fetchTilesUpTo).
+ */
 const MAX_LIMIT = 500;
 
 /** "Show more": the tiles after `?before=<cursor>` (`&limit=`, default one page) → { items, next }. */

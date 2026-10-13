@@ -1,7 +1,8 @@
 <!--
-	Uploads that aren't in the album grid yet (only their uploader and the admin see these).
-	Polls /api/status while anything is still on its way and calls `onsettled` once everything has
-	finished, so the page can reload the grid.
+	Uploads that aren't in the album grid yet (only their uploader and the admin see these), in two
+	sections: "Still on their way", and "These didn't work" for the ones that failed (they stay
+	until the admin deals with them, or for a week). Polls /api/status while anything is still on
+	its way and calls `onsettled` once everything has finished, so the page can reload the grid.
 -->
 <script lang="ts">
 	import Icon from './Icon.svelte';
@@ -36,6 +37,9 @@
 			};
 		})
 	);
+	type Row = (typeof rows)[number];
+	const onTheirWay = $derived(rows.filter((r) => r.status !== 'failed'));
+	const didntWork = $derived(rows.filter((r) => r.status === 'failed'));
 	const unfinished = $derived(rows.filter((r) => !isFinished(r.status)).map((r) => r.id));
 	const pollKey = $derived(unfinished.join(','));
 	let changed = false;
@@ -67,33 +71,53 @@
 	}
 </script>
 
-<ul class="pending" aria-label="Still on their way">
-	{#each rows as row (row.id)}
-		{@const line = statusLine(row, adminName)}
-		<li class="item card">
-			<span class="thumb">
-				{#if row.posterUrl}
-					<img src={row.posterUrl} alt="" width="96" height="96" />
-				{:else}
-					<Icon name={row.kind === 'video' ? 'video' : 'photo'} size="2em" />
-				{/if}
+{#snippet tile(row: Row)}
+	{@const line = statusLine(row, adminName)}
+	<li class="item card">
+		<span class="thumb">
+			{#if row.posterUrl}
+				<img src={row.posterUrl} alt="" width="96" height="96" />
+			{:else}
+				<Icon name={row.kind === 'video' ? 'video' : 'photo'} size="2em" />
+			{/if}
+		</span>
+		<span class="body">
+			{#if row.name}<span class="name">{row.name}</span>{/if}
+			<span class="line {line.tone}" role="status">
+				{#if line.tone === 'busy'}<span class="spinner" aria-hidden="true"></span>{/if}
+				{line.text}
 			</span>
-			<span class="body">
-				{#if row.name}<span class="name">{row.name}</span>{/if}
-				<span class="line {line.tone}" role="status">
-					{#if line.tone === 'busy'}<span class="spinner" aria-hidden="true"></span>{/if}
-					{line.text}
-				</span>
-				{#if line.detail}<span class="detail">{line.detail}</span>{/if}
-				{#if line.tone === 'retry'}
-					<button class="btn" type="button" disabled={retrying[row.id]} onclick={() => tryAgain(row.id)}>
-						<Icon name="retry" /> Try again
-					</button>
-				{/if}
-			</span>
-		</li>
-	{/each}
-</ul>
+			{#if line.detail}<span class="detail">{line.detail}</span>{/if}
+			{#if line.tone === 'retry'}
+				<button class="btn" type="button" disabled={retrying[row.id]} onclick={() => tryAgain(row.id)}>
+					<Icon name="retry" /> Try again
+				</button>
+			{/if}
+		</span>
+	</li>
+{/snippet}
+
+{#if onTheirWay.length > 0}
+	<section class="section" aria-labelledby="pending-title">
+		<h2 id="pending-title">Still on their way</h2>
+		<ul class="pending" aria-label="Still on their way">
+			{#each onTheirWay as row (row.id)}
+				{@render tile(row)}
+			{/each}
+		</ul>
+	</section>
+{/if}
+
+{#if didntWork.length > 0}
+	<section class="section" aria-labelledby="failed-title">
+		<h2 id="failed-title">These didn't work</h2>
+		<ul class="pending" aria-label="These didn't work">
+			{#each didntWork as row (row.id)}
+				{@render tile(row)}
+			{/each}
+		</ul>
+	</section>
+{/if}
 
 <style>
 	.pending {

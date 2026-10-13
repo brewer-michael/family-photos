@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { tick } from 'svelte';
+	import { flushSync, tick } from 'svelte';
 	import { invalidateAll } from '$app/navigation';
 	import type { PageProps } from './$types';
 	import AlbumForm from '#lib/components/AlbumForm.svelte';
@@ -10,17 +10,18 @@
 	import Uploader from '#lib/components/Uploader.svelte';
 	import type { TileDTO } from '#lib/client/dto';
 	import { countLabel } from '#lib/client/format';
+	import { fetchTilesUpTo, type TilePage } from '#lib/client/tiles';
 
 	let { data, form }: PageProps = $props();
 
-	/** Uploader shown? null = the page's default (open for an empty album or ?add). */
-	let uploaderChoice = $state<{ albumId: number; open: boolean } | null>(null);
-	const showUploader = $derived(
-		uploaderChoice?.albumId === data.album.id ? uploaderChoice.open : data.openUploader
-	);
-	/** Once shown, the uploader stays mounted (just hidden), so closing it never stops an upload. */
-	const uploaderMounted = $derived(showUploader || uploaderChoice?.albumId === data.album.id);
+	/**
+	 * The album whose uploader has been opened on this visit. Shown by default for an empty album or
+	 * ?add; once shown it stays (nothing closes it), so an upload in progress never disappears.
+	 */
+	let openedFor = $state<number | null>(null);
+	const showUploader = $derived(openedFor === data.album.id || data.openUploader);
 	let uploaderSection = $state<HTMLElement>();
+	let uploader = $state<ReturnType<typeof Uploader>>();
 
 	/**
 	 * Tiles fetched by "Show more", continuing the first page that ended at `from`. Once the first
@@ -37,14 +38,17 @@
 		return [...data.items, ...extra.filter((t) => !seen.has(t.id))];
 	});
 
-	async function toggleUploader() {
-		uploaderChoice = { albumId: data.album.id, open: !showUploader };
-		if (!showUploader) return;
-		await tick();
+	/**
+	 * "Add photos & videos": show the uploader and open the picker in the same tap. Synchronously
+	 * (flushSync, no await), so the click on the file input still counts as the tap (iOS insists).
+	 */
+	function addPhotos() {
+		flushSync(() => (openedFor = data.album.id));
 		uploaderSection?.focus();
+		uploader?.choose();
 	}
 
-	async function fetchTiles(before: string, limit?: number): Promise<{ items: TileDTO[]; next: string | null }> {
+	async function fetchTiles(before: string, limit?: number): Promise<TilePage> {
 		const q = `before=${encodeURIComponent(before)}${limit ? `&limit=${limit}` : ''}`;
 		const res = await fetch(`/album/${data.album.id}/items?${q}`);
 		if (!res.ok) throw new Error(String(res.status));
@@ -76,11 +80,13 @@
 	 */
 	async function refresh() {
 		const shown = extra.length;
+		// Keep the uploader (and its summary) open even when the album is no longer empty.
+		if (showUploader) openedFor = data.album.id;
 		await invalidateAll();
 		const from = data.next;
 		if (shown === 0 || !from) return;
 		try {
-			const page = await fetchTiles(from, shown);
+			const page = await fetchTilesUpTo(fetchTiles, from, shown);
 			more = { albumId: data.album.id, from, items: page.items, next: page.next };
 		} catch {
 			// The first page is fresh; "Show more" picks up from there.
@@ -123,39 +129,33 @@
 	</header>
 
 	<div class="toolbar">
-		<button
-			type="button"
-			class="btn btn-primary btn-big"
-			aria-expanded={showUploader}
-			aria-controls="add-section"
-			onclick={toggleUploader}
-		>
-			<Icon name="plus" /> Add photos &amp; videos
-		</button>
+		<!-- One big add button at a time: this one until the uploader shows, then the uploader's own. -->
+		{#if !showUploader}
+			<button type="button" class="btn btn-primary btn-big" onclick={addPhotos}>
+				<Icon name="plus" /> Add photos &amp; videos
+			</button>
+		{/if}
 		<SaveAll albumId={data.album.id} itemCount={data.album.itemCount} />
 	</div>
 
-	<section
-		id="add-section"
-		class="add card"
-		hidden={!showUploader}
-		aria-label="Add photos and videos to {data.album.title}"
-		tabindex="-1"
-		bind:this={uploaderSection}
-	>
-		{#if uploaderMounted}
+	{#if showUploader}
+		<section
+			id="add-section"
+			class="add card"
+			aria-label="Add photos and videos to {data.album.title}"
+			tabindex="-1"
+			bind:this={uploaderSection}
+		>
 			{#key data.album.id}
-				<!-- Finished uploads move to the grid, or to "Still on their way" when they failed. -->
-				<Uploader albumId={data.album.id} ondone={refresh} clearOnDone />
+				<!-- Finished uploads move to the grid, or to "These didn't work" when they failed. -->
+				<Uploader bind:this={uploader} albumId={data.album.id} ondone={refresh} clearOnDone />
 			{/key}
-		{/if}
-	</section>
+		</section>
+	{/if}
 
 	{#if data.pending.length > 0}
-		<section class="section" aria-labelledby="pending-title">
-			<h2 id="pending-title">Still on their way</h2>
-			<PendingTiles items={data.pending} adminName={data.adminName} onsettled={refresh} />
-		</section>
+		<!-- "Still on their way" and "These didn't work" (only their uploader and the admin see them). -->
+		<PendingTiles items={data.pending} adminName={data.adminName} onsettled={refresh} />
 	{/if}
 
 	<section class="section" aria-labelledby="grid-title">
@@ -168,7 +168,7 @@
 		{:else}
 			<div class="empty">
 				<p>No photos here yet.</p>
-				<p>Tap <strong>Add photos &amp; videos</strong> to put the first ones in.</p>
+				<p>Tap the big button above to put the first ones in.</p>
 			</div>
 		{/if}
 		{#if next}
@@ -222,9 +222,6 @@
 	.add {
 		margin-top: 1rem;
 		padding: 1rem;
-	}
-	.add[hidden] {
-		display: none;
 	}
 	.more {
 		margin-top: 1rem;

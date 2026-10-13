@@ -294,9 +294,9 @@ describe('client identity', () => {
 		expect(signInSubject(e)).toEqual({ keys: ['203.0.113.9'], knownDevice: false });
 		const d = 'devSAMAAAAAAAAAAAAAAAA';
 		cookies.set(DEVICE_COOKIE, deviceValue({ d, n: 'Sam' }));
-		expect(signInSubject(e)).toEqual({ keys: ['203.0.113.9', `device:${d}`], knownDevice: true });
+		expect(signInSubject(e)).toEqual({ keys: ['known:203.0.113.9', `device:${d}`], knownDevice: true });
 		expect(signInSubject({ ...e, getClientAddress: () => '198.51.100.23' })).toEqual({
-			keys: ['198.51.100.23', `device:${d}`],
+			keys: ['known:198.51.100.23', `device:${d}`],
 			knownDevice: true
 		});
 		// Forged, tampered or wrong-cookie values don't count.
@@ -316,6 +316,36 @@ describe('client identity', () => {
 		const known = signInSubject({ ...ev({}, '203.0.113.80'), cookies: cookies.asCookies() });
 		expect(loginLimiter.check(known).limited).toBe(false);
 		loginLimiter.reset();
+	});
+
+	it("a stranger's spoofed forwarding header can't lock a known device out (admin limiter)", () => {
+		adminLimiter.reset();
+		const victimIp = '198.51.100.50';
+		// Behind NPM (it sets X-Real-IP; CF-Connecting-IP passes through from the client) and behind
+		// cloudflared (the other way round): ten wrong guesses carrying the victim's IP.
+		for (const spoof of [
+			(i: number) => ev({ 'cf-connecting-ip': victimIp, 'x-real-ip': `203.0.113.${66 + i}` }, '172.17.0.5'),
+			(i: number) => ev({ 'cf-connecting-ip': `203.0.113.${66 + i}`, 'x-real-ip': victimIp }, '172.17.0.6')
+		]) {
+			for (let i = 0; i < 10; i++) adminLimiter.fail(signInSubject({ ...spoof(i), cookies: new FakeCookies().asCookies() }));
+			// A stranger at the victim's address is limited (the spoofed failures still count for strangers)…
+			expect(adminLimiter.check(signInSubject({ ...ev({ 'x-real-ip': victimIp }, '172.17.0.5'), cookies: new FakeCookies().asCookies() })).limited).toBe(true);
+			// …but the victim's signed-in phone at that address can still sign in.
+			const cookies = new FakeCookies();
+			cookies.set(DEVICE_COOKIE, deviceValue({ d: 'devVICAAAAAAAAAAAAAAAA', n: 'Vic' }));
+			expect(adminLimiter.check(signInSubject({ ...ev({ 'x-real-ip': victimIp }, '172.17.0.5'), cookies: cookies.asCookies() })).limited).toBe(false);
+			adminLimiter.reset();
+		}
+		// Known devices are still limited per IP: ten failures from new device ids at one address.
+		for (let i = 0; i < 10; i++) {
+			const c = new FakeCookies();
+			c.set(DEVICE_COOKIE, deviceValue({ d: `dev${String(i).padStart(19, 'N')}`, n: 'X' }));
+			adminLimiter.fail(signInSubject({ ...ev({ 'x-real-ip': '203.0.113.90' }), cookies: c.asCookies() }));
+		}
+		const fresh = new FakeCookies();
+		fresh.set(DEVICE_COOKIE, deviceValue({ d: 'devFRESHAAAAAAAAAAAAAA', n: 'Y' }));
+		expect(adminLimiter.check(signInSubject({ ...ev({ 'x-real-ip': '203.0.113.90' }), cookies: fresh.asCookies() })).limited).toBe(true);
+		adminLimiter.reset();
 	});
 
 	it('survives getClientAddress throwing', () => {

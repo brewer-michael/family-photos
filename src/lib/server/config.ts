@@ -122,14 +122,39 @@ export function autoVideoThreads(): number {
 	return Math.max(2, Math.floor(cores / 2));
 }
 
+/**
+ * The settings that are secrets. They never reach the worker lanes or any tool that reads uploaded
+ * bytes (ffmpeg, ffprobe, heif-dec, exiftool, sharp's decoders): a decoder bug there could read
+ * /proc/self/environ.
+ */
+export const SECRET_ENV = ['FAMILY_PASSWORD', 'ADMIN_PASSWORD', 'SMTP_PASS'] as const;
+
+/** A copy of `env` without SECRET_ENV, for child processes that parse untrusted media. */
+export function envWithoutSecrets(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+	const out = { ...env };
+	for (const key of SECRET_ENV) delete out[key];
+	return out;
+}
+
+export interface LoadConfigOptions {
+	/**
+	 * A worker lane: started without SECRET_ENV (queue.ts), it never signs anyone in or sends
+	 * mail, so the passwords are not required and come back as ''.
+	 */
+	lane?: boolean;
+}
+
 /** Pure: builds a Config from an env object. Throws ConfigError listing every problem. */
-export function loadConfig(env: Env = process.env): Config {
+export function loadConfig(env: Env = process.env, opts: LoadConfigOptions = {}): Config {
 	const problems: string[] = [];
 	const warnings: string[] = [];
+	if (opts.lane) env = { ...env, FAMILY_PASSWORD: undefined, ADMIN_PASSWORD: undefined, SMTP_PASS: undefined };
 
 	// --- required secrets -------------------------------------------------
 	const familyPassword = str(env, 'FAMILY_PASSWORD');
-	if (!familyPassword) {
+	if (opts.lane) {
+		// not needed (see LoadConfigOptions.lane)
+	} else if (!familyPassword) {
 		problems.push(
 			'FAMILY_PASSWORD is not set. This is the family code everyone types to get in (three short words work well, e.g. "blue lake cabin").'
 		);
@@ -138,7 +163,9 @@ export function loadConfig(env: Env = process.env): Config {
 	}
 
 	const adminPassword = str(env, 'ADMIN_PASSWORD');
-	if (!adminPassword) {
+	if (opts.lane) {
+		// not needed either
+	} else if (!adminPassword) {
 		problems.push('ADMIN_PASSWORD is not set. It protects the admin page (removal requests, trash, QR codes).');
 	} else if (adminPassword.length < 8) {
 		problems.push('ADMIN_PASSWORD must be at least 8 characters long.');
@@ -219,8 +246,8 @@ export function loadConfig(env: Env = process.env): Config {
 
 	return {
 		publicUrl,
-		familyPassword: familyPassword!,
-		adminPassword: adminPassword!,
+		familyPassword: familyPassword ?? '',
+		adminPassword: adminPassword ?? '',
 		adminEmail,
 		adminName,
 		siteTitle,
@@ -278,6 +305,17 @@ let cached: Config | null = null;
 /** Process-wide config, loaded from process.env on first use. Throws ConfigError. */
 export function getConfig(): Config {
 	cached ??= loadConfig(process.env);
+	return cached;
+}
+
+/**
+ * A worker lane's config (src/worker/main.ts, before anything else asks for it): loaded without
+ * the secrets, which are also dropped from this process's environment in case the lane was started
+ * with them, so the tools it runs never inherit them.
+ */
+export function useLaneConfig(): Config {
+	for (const key of SECRET_ENV) delete process.env[key];
+	cached = loadConfig(process.env, { lane: true });
 	return cached;
 }
 

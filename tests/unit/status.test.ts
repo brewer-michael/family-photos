@@ -170,7 +170,10 @@ describe('GET /api/status', () => {
 describe('POST /api/retry', () => {
 	function failedItem(code: 'retryable' | 'unsupported', opts: { device?: string; kind?: Kind | null } = {}): string {
 		const id = item({ device: opts.device });
-		if (opts.kind) queue(id, opts.kind);
+		if (opts.kind) {
+			queue(id, opts.kind);
+			media.claimForProcessing(id); // failed in its lane (an intake failure goes back through intake)
+		}
 		media.markFailed(id, code, 'test');
 		return id;
 	}

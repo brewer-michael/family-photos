@@ -3,10 +3,12 @@
  * canonical MP4 where phones read them (docs/media-pipeline.md §3 "Metadata").
  *
  * taken date fallback: Apple creationdate (local time + offset) → mvhd creation_time (UTC) →
- * the client's lastModified → upload time. Years before 2000 are skipped (unset camera clocks,
- * the 1904/1970 epochs). taken_at holds a local wall time only when the file has one (Apple
- * creationdate); a UTC instant alone leaves it null, like the photo lane, so readers fall back
- * to taken_ms in the server's time zone instead of showing UTC as the local time.
+ * the client's lastModified → upload time. An Apple creationdate without an offset takes its
+ * instant from creation_time, or without one is read in the server's time zone (TZ). Years
+ * before 2000 are skipped (unset camera clocks, the 1904/1970 epochs). taken_at holds a local
+ * wall time only when the file has one (Apple creationdate); a UTC instant alone leaves it null,
+ * like the photo lane, so readers fall back to taken_ms in the server's time zone instead of
+ * showing UTC as the local time.
  */
 import fs from 'node:fs/promises';
 import { MediaError } from '#lib/shared/errors';
@@ -86,6 +88,12 @@ export function parseLocalDate(s: string | null | undefined): { local: string; u
 	};
 }
 
+/** 'YYYY-MM-DDTHH:MM:SS' read as a wall time in the server's time zone (TZ). */
+function serverZoneMs(local: string): number {
+	const [y, mo, d, h, mi, se] = local.split(/[-T:]/).map(Number);
+	return new Date(y, mo - 1, d, h, mi, se).getTime();
+}
+
 const validMs = (ms: number | null | undefined): ms is number =>
 	typeof ms === 'number' && Number.isFinite(ms) && new Date(ms).getUTCFullYear() >= MIN_YEAR;
 
@@ -102,7 +110,8 @@ export function resolveTaken(input: {
 		const offset = formatOffset(apple.offsetMin);
 		return { takenAt: apple.local + offset, takenMs: apple.utcMs, offset };
 	}
-	if (apple) return { takenAt: apple.local, takenMs: utcMs ?? apple.utcMs, offset: null };
+	// No offset and no mvhd instant: the wall time in the server's zone, as the photo lane reads it.
+	if (apple) return { takenAt: apple.local, takenMs: utcMs ?? serverZoneMs(apple.local), offset: null };
 	if (utcMs !== null) return { takenAt: null, takenMs: utcMs, offset: null };
 	if (validMs(input.clientMtimeMs)) return { takenAt: null, takenMs: input.clientMtimeMs, offset: null };
 	return { takenAt: null, takenMs: input.uploadedMs, offset: null };

@@ -31,9 +31,10 @@
 	--scrim: rgb(20 12 6 / 0.55);
 	--tile-bg: #ead8c6;
 
-	/* Type: 18px at the default text size (see the iOS block below) */
+	/* Type: 18px at the default text size (see the iOS block below). Nothing is smaller (PLAN
+	   "18px+"): hints, file names and badges are told apart by colour and weight, not size. */
 	--fs-base: 1rem;
-	--fs-small: calc(var(--fs-base) * 0.9);
+	--fs-small: var(--fs-base);
 	--fs-large: calc(var(--fs-base) * 1.2);
 	--fs-h2: calc(var(--fs-base) * 1.4);
 	--fs-h1: calc(var(--fs-base) * 1.75);

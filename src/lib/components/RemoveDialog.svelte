@@ -1,6 +1,7 @@
 <!--
 	"Ask to remove": nobody can delete, but anyone can ask the admin (docs/PLAN.md "Removal
 	requests"). One pending request per device per item; posts to the page's ?/askRemove action.
+	On a small phone the sheet scrolls, so "Send request" and "Cancel" stay stuck to its bottom.
 -->
 <script lang="ts">
 	import { enhance } from '$app/forms';
@@ -98,7 +99,8 @@
 				</label>
 				<textarea
 					id="remove-details"
-					class="textarea"
+					class="textarea details"
+					class:roomy={reason === 'other'}
 					name="details"
 					maxlength="2000"
 					aria-required={reason === 'other'}
@@ -165,10 +167,23 @@
 		outline: none;
 		box-shadow: none;
 	}
+	/* Smaller until "Something else" asks for words. */
+	.details {
+		min-height: 5rem;
+	}
+	.details.roomy {
+		min-height: 7.5rem;
+	}
+	/* Always in view at the bottom of the sheet, over the sheet's own bottom padding. */
 	.actions {
+		position: sticky;
+		bottom: -1.5rem;
 		display: grid;
-		grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+		grid-template-columns: repeat(auto-fit, minmax(min(100%, 10rem), 1fr));
 		gap: 0.75rem;
-		margin-top: 1rem;
+		margin: 0 0 -1.5rem;
+		padding: 0.75rem 0 1.5rem;
+		background: var(--surface);
+		border-top: 1px solid var(--line);
 	}
 </style>

@@ -88,3 +88,47 @@ export function gate(input: GateInput): GateDecision {
 	}
 	return { action: 'allow' };
 }
+
+// ---------------------------------------------------------------------------
+// Request body size
+// ---------------------------------------------------------------------------
+
+/**
+ * Largest request body anything but a tus upload may send. BODY_SIZE_LIMIT (64M) is only there for
+ * 50 MiB upload chunks; every form here (a memory is at most 5000 characters) fits in far less.
+ * Without this, anyone could make the sign-in pages buffer and parse 64 MB form posts, a few dozen
+ * at once, before any check.
+ */
+export const SMALL_BODY_LIMIT = 256 * 1024;
+
+/** Whether this request may send a body over SMALL_BODY_LIMIT: tus uploads only (never a remote call). */
+export function allowsLargeBody(routeId: string | null, isRemote: boolean): boolean {
+	return !isRemote && isUnder(normalizeRouteId(routeId), '/api/upload');
+}
+
+/**
+ * Whether the request's body is over `limit` bytes, decided before anything reads it: by
+ * Content-Length when sent (Node's parser holds the client to it), otherwise (chunked) by reading
+ * a copy of the body up to the limit. The copy is a tee, so the original stays readable for the
+ * action and at most `limit` plus one chunk is buffered.
+ */
+export async function bodyTooLarge(request: Request, limit: number = SMALL_BODY_LIMIT): Promise<boolean> {
+	if (!request.body) return false;
+	const declared = request.headers.get('content-length');
+	if (declared !== null && declared.trim() !== '') {
+		const n = Number(declared);
+		return !Number.isSafeInteger(n) || n > limit;
+	}
+	const reader = request.clone().body!.getReader();
+	let seen = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) return false;
+			seen += value.byteLength;
+			if (seen > limit) return true;
+		}
+	} finally {
+		reader.cancel().catch(() => undefined);
+	}
+}

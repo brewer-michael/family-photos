@@ -84,7 +84,7 @@ The **media worker** is a separate entry point, `src/worker/main.ts`. A second `
   .backups/app-YYYY-MM-DD.sqlite        nightly db.backup(), keep 7
 /config/  (keep on the cache/SSD pool)
   app.sqlite (+wal/shm)
-  cache/<sh>/<id>/{thumb,display,poster}.webp   rebuildable from library/
+  cache/<sh>/<id>/{thumb,display,poster}.webp   rebuildable from library/ (missing ones are rebuilt at startup and from the admin page)
   tmp/<id>/                             decoded intermediates
   outbox/*.eml
 ```
@@ -120,7 +120,7 @@ On first boot the app seeds `secret`, sets `access_gen=1` and creates the **"Eve
 ## Code layout
 ```
 server.js  vite.config.ts  vite.worker.config.ts  Dockerfile  docker/entrypoint.sh  unraid/family-photos.xml
-.github/workflows/{ci.yml,docker.yml}  static/{robots.txt,manifest.webmanifest,icons/}  docs/media-pipeline.md
+.github/workflows/ci.yml  static/{robots.txt,manifest.webmanifest,icons/}  docs/media-pipeline.md
 src/app.css  src/hooks.server.ts
 src/lib/server/ config.ts  db/  repo/{settings,albums,media,memories,requests}.ts  auth.ts  ratelimit.ts
                 uploads/tus.ts  intake.ts  queue.ts (spawns/IPC to worker lanes)  serve.ts  zip.ts  mail.ts
@@ -318,12 +318,12 @@ The full spec is the workflow output at `/tmp/claude-0/-home-user-family-photos/
   - At startup, log the cgroup `cpu.weight` and `cpu.max`.
 - **`unraid/family-photos.xml`:**
   - `<Container version="2">` with Repository `ghcr.io/brewer-michael/family-photos:latest`, WebUI `http://[IP]:[PORT:3000]/`, Overview, Icon, TemplateURL and Category.
-  - **ExtraParams** `--cpu-shares=128 --memory=4g`.
+  - **ExtraParams** `--cpu-shares=128 --memory=4g --restart=unless-stopped`.
   - Paths: `/config` → `/mnt/user/appdata/family-photos` (cache), `/photos` → `/mnt/user/family-photos`.
   - The variables above, with Mask and Required set.
 - **CI:**
   - `ci.yml` runs in a `node:24-trixie-slim` container with the same apt packages as production: check, vitest (including the media suite), build, Playwright e2e.
-  - `docker.yml` (`main` and `v*` tags): buildx amd64, smoke-test `/healthz`, push to GHCR (`latest`, semver, sha).
+  - Its `image` job: buildx amd64, smoke-test `/healthz`. Its `publish` job (`main` and `v*` tags, never pull requests) runs only after every other job passed and pushes that smoke-tested image, not a rebuild, to GHCR (`latest`, semver, sha).
 - **`README.md`:**
   - Unraid install; first-run checklist; make the GHCR package public.
   - Cloudflare Tunnel vs Nginx Proxy Manager (`client_max_body_size ≥ 64m`).

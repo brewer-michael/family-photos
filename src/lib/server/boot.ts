@@ -5,6 +5,7 @@
 import { getConfig, ConfigError } from './config';
 import { ensureDirs } from './paths';
 import { closeDb, getDb } from './db';
+import { restoreAccessGen } from './repo/settings';
 import { startIntake, stopIntake } from './intake';
 import { startQueue, stopQueue } from './queue';
 import { startMaintenance, stopMaintenance } from './maintenance';
@@ -52,6 +53,7 @@ export function boot(): void {
 	for (const w of config.warnings) console.warn(`[config] ${w}`);
 	ensureDirs();
 	getDb(); // migrations + first-boot seed
+	restoreAccessGen(); // a database restored from an older copy keeps the last "Reset access"
 	g[BOOTED] = true;
 	g[SHUTDOWN] = shutdown;
 	process.once('sveltekit:shutdown' as never, () => void shutdown());

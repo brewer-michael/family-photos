@@ -5,6 +5,7 @@ import * as memories from '#lib/server/repo/memories';
 import * as requests from '#lib/server/repo/requests';
 import * as settings from '#lib/server/repo/settings';
 import { getDb } from '#lib/server/db';
+import { incomingPath, originalsPath } from '#lib/server/paths';
 import { ValidationError } from '#lib/shared/errors';
 import { PIPELINE_VERSION, type Kind } from '#lib/shared/media-types';
 import { freshDb } from '../helpers/env';
@@ -170,8 +171,19 @@ describe('media lifecycle', () => {
 		expect(media.claimForProcessing(id)!.attempts).toBe(2);
 	});
 
-	it('markReady fills the canonical fields, clears the token, sets pipeline_version', () => {
+	it('markReady fills the canonical fields, sets pipeline_version, and keeps the token until the source is settled', () => {
 		const id = ready(defaultAlbum, 'sha-ready', 1234, { gpsLat: 37.3, gpsLon: -122.0, contentId: 'CID' });
+		const token = media.getById(id)!.upload_token!;
+		expect(token).toMatch(/\w{16,}/);
+		// Committed, source not archived yet: the upload stays protected and the lane can find it.
+		expect(media.tokensInUse().has(token)).toBe(true);
+		expect(media.sourcePath(media.getById(id)!)).toBe(incomingPath(token));
+		expect(media.listUnsettled('photo').map((r) => r.id)).toEqual([id]);
+		expect(media.listUnsettled('video')).toEqual([]);
+		media.sourceSettled(id);
+		expect(media.tokensInUse().has(token)).toBe(false);
+		expect(media.sourcePath(media.getById(id)!)).toBe(originalsPath(id, 'heic'));
+		expect(media.listUnsettled('photo')).toEqual([]);
 		const row = media.getById(id)!;
 		expect(row).toMatchObject({
 			status: 'ready',
@@ -540,25 +552,26 @@ describe('removal requests', () => {
 });
 
 describe('admin helpers', () => {
-	it('markForReprocess re-queues ready items with an archived original only', () => {
+	it('markForReprocess queues a redo of ready items with an archived original only; they stay ready and visible', () => {
 		const kept = ready(defaultAlbum, 'rp-kept', 1, { sourceKept: true });
 		const notKept = ready(defaultAlbum, 'rp-gone', 1, { sourceKept: false });
 		expect(media.markForReprocess(kept)).toBe(true);
-		expect(media.getById(kept)).toMatchObject({ status: 'queued', attempts: 0 });
+		expect(media.getById(kept)).toMatchObject({ status: 'ready', redo_state: 'queued', redo_attempts: 0 });
+		expect(media.listByAlbum(defaultAlbum).items.map((r) => r.id).sort()).toEqual([kept, notKept].sort());
+		expect(media.markForReprocess(kept)).toBe(false); // already waiting
 		expect(media.markForReprocess(notKept)).toBe(false);
-		expect(media.listBelowPipelineVersion(PIPELINE_VERSION + 1).map((r) => r.id)).toEqual([notKept]);
+		expect(media.listBelowPipelineVersion(PIPELINE_VERSION + 1).map((r) => r.id).sort()).toEqual([kept, notKept].sort());
 	});
 
-	it('markForReprocess refuses a failed item whose bytes are live in the album again', () => {
+	it('markForReprocess refuses failed, trashed and unknown items (failed ones use "Try again")', () => {
 		const failed = queued(defaultAlbum, 'rp-dup');
 		media.claimForProcessing(failed);
 		media.markFailed(failed, 'corrupt', 'x', { sourceKept: true });
-		expect(media.getById(failed)).toMatchObject({ status: 'failed', source_kept: 1 });
-		const live = ready(defaultAlbum, 'rp-dup', 1);
-		expect(media.markForReprocess(failed)).toBe(false); // no SQLITE_CONSTRAINT_UNIQUE
-		expect(media.getById(failed)!.status).toBe('failed');
-		media.softDelete(live, 'gone');
-		expect(media.markForReprocess(failed)).toBe(true); // the live copy is in the trash now
+		expect(media.markForReprocess(failed)).toBe(false);
+		expect(media.getById(failed)).toMatchObject({ status: 'failed', redo_state: null });
+		const trashed = ready(defaultAlbum, 'rp-trash', 1);
+		media.softDelete(trashed, 'gone');
+		expect(media.markForReprocess(trashed)).toBe(false);
 		expect(media.markForReprocess('NOPE')).toBe(false);
 	});
 
@@ -569,5 +582,232 @@ describe('admin helpers', () => {
 		expect(media.listFailed({ sinceMs: Date.now() - 60_000 }).map((r) => r.id)).toEqual([id]);
 		expect(media.listFailed({ sinceMs: Date.now() + 60_000 })).toEqual([]);
 		expect(media.countByStatus().failed).toBe(1);
+	});
+});
+
+describe('redo (admin "Redo them"): the item stays ready and visible throughout', () => {
+	const outdated = (sha: string, extra: Partial<media.ReadyFields> & { kind?: Kind } = {}) =>
+		ready(defaultAlbum, sha, 1000, { sourceKept: true, pipelineVersion: PIPELINE_VERSION - 1, ...extra });
+	const visible = () => media.listByAlbum(defaultAlbum).items.map((r) => r.id).sort();
+	const fields: media.ReadyFields = {
+		conversion: 'transcode',
+		canonicalExt: 'jpg',
+		canonicalSize: 2000,
+		width: 1000,
+		height: 750,
+		takenMs: 1000,
+		sourceKept: true
+	};
+
+	it('queues every outdated item in one statement; uploads go first, then redos oldest first', () => {
+		const a = outdated('rd-a');
+		const b = outdated('rd-b', { kind: 'video', durationMs: 10_000 });
+		const current = ready(defaultAlbum, 'rd-c', 1000);
+		const trashed = outdated('rd-t');
+		media.softDelete(trashed, 'x');
+		expect(media.countOutdated()).toBe(2);
+		expect(media.listOutdated().map((r) => r.id)).toEqual([a, b]);
+		expect(media.queueRedos()).toBe(2);
+		expect(media.queueRedos()).toBe(0); // already waiting
+		expect(media.countOutdated()).toBe(0);
+		expect(media.getById(a)).toMatchObject({ status: 'ready', redo_state: 'queued' });
+		expect(visible()).toEqual([a, b, current].sort());
+		expect(media.redoSummary()).toMatchObject({ pending: 2, problemCount: 0 });
+
+		const upload = queued(defaultAlbum, 'rd-new');
+		expect(media.nextQueued('photo')?.id).toBe(upload); // a family upload never waits behind redos
+		expect(media.nextRedo('photo')?.id).toBe(a);
+		expect(media.nextRedo('video')?.id).toBe(b);
+		// The same bytes uploaded again while it waits are a duplicate of the visible item.
+		expect(media.findDuplicate(defaultAlbum, 'rd-a')?.id).toBe(a);
+	});
+
+	it('a successful redo replaces the fields and the pipeline version, and nothing else', () => {
+		const photo = outdated('rd-ok', { contentId: 'CID-OK' });
+		media.softDelete(photo, 'x');
+		media.restore(photo);
+		expect(media.markForReprocess(photo)).toBe(true);
+		expect(media.claimRedo(photo)).toMatchObject({ status: 'ready', redo_state: 'running', redo_attempts: 1 });
+		expect(media.isRedo(media.getById(photo)!)).toBe(true);
+		expect(media.claimRedo(photo)).toBeUndefined(); // only once
+		expect(media.claimForProcessing(photo)).toBeUndefined(); // never through the upload path
+		expect(visible()).toEqual([photo]);
+		expect(media.markReady(photo, fields)).toBe(false); // not a first conversion
+		expect(media.markRedone(photo, { ...fields, takenMs: 5000, contentId: 'CID-OK' })).toBe(true);
+		expect(media.getById(photo)).toMatchObject({
+			status: 'ready',
+			canonical_size: 2000,
+			width: 1000,
+			taken_ms: 5000,
+			pipeline_version: PIPELINE_VERSION,
+			redo_state: null,
+			redo_queued_ms: null,
+			redo_attempts: 0,
+			redo_error: null,
+			deleted_at: null
+		});
+		expect(media.markRedone(photo, fields)).toBe(false); // the redo is over
+		expect(media.countOutdated()).toBe(0);
+	});
+
+	it('a failed redo ends with its reason and leaves the item exactly as it was; "Redo them" can try again', () => {
+		const photo = outdated('rd-fail');
+		const before = media.getById(photo)!;
+		media.queueRedos();
+		media.claimRedo(photo);
+		expect(media.requeueRedo(photo)).toBe(true); // retryable: back in line, the attempt counts
+		expect(media.getById(photo)).toMatchObject({ redo_state: 'queued', redo_attempts: 1 });
+		media.claimRedo(photo);
+		expect(media.requeueRedo(photo, { refund: true })).toBe(true); // a shutdown: attempt given back
+		expect(media.getById(photo)).toMatchObject({ redo_state: 'queued', redo_attempts: 1 });
+		media.claimRedo(photo);
+		expect(media.failRedo(photo, 'too_large: Security limit exceeded')).toBe(true);
+		const after = media.getById(photo)!;
+		expect(after).toMatchObject({ status: 'ready', redo_state: null, redo_error: 'too_large: Security limit exceeded' });
+		for (const k of ['status', 'canonical_ext', 'canonical_size', 'pipeline_version', 'deleted_at', 'live_photo_of', 'source_kept'] as const) {
+			expect(after[k], k).toBe(before[k]);
+		}
+		expect(visible()).toEqual([photo]);
+		expect(media.listFailed()).toEqual([]); // not an "upload that didn't work"
+		expect(media.redoSummary()).toEqual({
+			pending: 0,
+			problemCount: 1,
+			problems: [{ id: photo, kind: 'photo', source_name: 'IMG_0001.HEIC', album_id: defaultAlbum, redo_error: 'too_large: Security limit exceeded' }]
+		});
+		expect(media.countOutdated()).toBe(1);
+		expect(media.queueRedos()).toBe(1);
+		expect(media.getById(photo)).toMatchObject({ redo_state: 'queued', redo_error: null, redo_attempts: 0 });
+	});
+
+	it('trashing drops a waiting redo; a running one finishes and holds back the trash purge', async () => {
+		const { trashedBefore } = await import('#lib/server/repo/admin');
+		const waiting = outdated('rd-w');
+		const running = outdated('rd-r');
+		media.queueRedos();
+		media.claimRedo(running);
+		media.softDelete(waiting, 'x');
+		media.softDelete(running, 'x');
+		expect(media.getById(waiting)).toMatchObject({ redo_state: null, redo_queued_ms: null });
+		expect(media.getById(running)!.redo_state).toBe('running');
+		expect(media.nextRedo('photo')).toBeUndefined();
+		expect(trashedBefore(Date.now() + 1).map((r) => r.id)).toEqual([waiting]);
+		expect(media.markRedone(running, fields)).toBe(true);
+		expect(trashedBefore(Date.now() + 1).map((r) => r.id).sort()).toEqual([waiting, running].sort());
+	});
+
+	it('the archived originals of items being redone are kept', () => {
+		const photo = outdated('rd-orig');
+		expect(media.originalDeletable(media.getById(photo)!)).toBe(true);
+		media.queueRedos();
+		expect(media.originalDeletable(media.getById(photo)!)).toBe(false);
+		expect(media.listKeptOriginals().find((o) => o.id === photo)).toMatchObject({ status: 'ready', redo_state: 'queued' });
+	});
+
+	it('startup recovery re-queues running redos, and ends them (item untouched) once out of attempts', () => {
+		const a = outdated('rd-int-a');
+		const b = outdated('rd-int-b');
+		media.queueRedos();
+		media.claimRedo(a);
+		for (let i = 0; i < 3; i++) {
+			media.claimRedo(b);
+			if (i < 2) media.requeueRedo(b);
+		}
+		expect(media.requeueInterrupted()).toEqual({ requeued: [a], failed: [b] });
+		expect(media.getById(a)).toMatchObject({ status: 'ready', redo_state: 'queued' });
+		expect(media.getById(b)).toMatchObject({ status: 'ready', redo_state: null, redo_error: 'Interrupted 3 times (worker crash or restart)' });
+	});
+});
+
+describe('graceful shutdown and "Try again"', () => {
+	it('a job a shutdown cut short gets its attempt back, so restarts never use up MAX_ATTEMPTS', () => {
+		const id = queued(defaultAlbum, 'sd-1');
+		for (let i = 0; i < 5; i++) {
+			expect(media.claimForProcessing(id)!.attempts).toBe(1);
+			expect(media.requeue(id, 'Interrupted by a shutdown; re-queued', { refund: true })).toBe(true);
+		}
+		expect(media.getById(id)).toMatchObject({ status: 'queued', attempts: 0 });
+		media.claimForProcessing(id);
+		expect(media.requeue(id, 'timeout')).toBe(true); // a real failure still counts
+		expect(media.getById(id)!.attempts).toBe(1);
+	});
+
+	it('"Try again" sends an item intake refused (never reached a lane) back through intake', () => {
+		// e.g. a 3-hour video: intake records kind=video, no est_cost_s or duration, attempts 0.
+		const id = received(defaultAlbum, { sourceName: 'long.mov' });
+		media.markFailed(id, 'too_large', '3 h is over the 120-minute limit', { kind: 'video', sourceMime: 'video/quicktime', sourceExt: 'mov', sourceSha256: 'sha-long' });
+		expect(media.getById(id)).toMatchObject({ kind: 'video', attempts: 0, est_cost_s: null });
+		expect(media.retry(id)).toBe('received'); // intake probes it again: caps, est_cost_s, duration_ms
+		expect(media.getById(id)).toMatchObject({ status: 'received', error_code: null });
+		// One that failed in its lane goes straight back to the lane.
+		const lane = queued(defaultAlbum, 'sha-lane', 'video', 30);
+		media.claimForProcessing(lane);
+		media.markFailed(lane, 'corrupt', 'ffmpeg: broken');
+		expect(media.retry(lane)).toBe('queued');
+	});
+});
+
+describe('Live Photo video that is ready after its photo was trashed or moved', () => {
+	const photoThenVideo = () => {
+		const photo = ready(defaultAlbum, 'lp3-photo', 1000, { contentId: 'LIVE-1' });
+		const video = queued(defaultAlbum, 'lp3-video', 'video');
+		return { photo, video };
+	};
+	const finishVideo = (video: string) => {
+		expect(media.claimForProcessing(video)).toBeTruthy();
+		expect(
+			media.markReady(video, { conversion: 'remux', canonicalExt: 'mp4', canonicalSize: 1, width: 1, height: 1, durationMs: 3000, takenMs: 1000, contentId: 'LIVE-1', sourceKept: false })
+		).toBe(true);
+	};
+
+	it('follows a photo trashed meanwhile (an approved removal request): never shown on its own', () => {
+		const { photo, video } = photoThenVideo();
+		media.softDelete(photo, 'Removed at Aunt Linda’s request');
+		finishVideo(video);
+		expect(media.getById(video)).toMatchObject({ live_photo_of: photo, deleted_reason: 'Removed at Aunt Linda’s request' });
+		expect(media.getById(video)!.deleted_at).not.toBeNull();
+		expect(media.listByAlbum(defaultAlbum).items).toEqual([]);
+		expect(media.listTrash().map((r) => r.id)).toEqual([photo]);
+		expect(media.restore(photo)).toEqual({ ok: true });
+		expect(media.listByAlbum(defaultAlbum).items.map((r) => r.id)).toEqual([photo]);
+		expect(media.livePhotoVideoFor(photo)?.id).toBe(video);
+	});
+
+	it('follows a photo moved meanwhile (same uploading device) to its new album', () => {
+		const other = albums.create({ title: 'Other', createdByName: null, createdByDevice: null });
+		const { photo, video } = photoThenVideo();
+		expect(media.move(photo, other.id)).toEqual({ ok: true });
+		finishVideo(video);
+		expect(media.getById(video)).toMatchObject({ live_photo_of: photo, album_id: other.id, deleted_at: null });
+		expect(media.listByAlbum(defaultAlbum).items).toEqual([]);
+		expect(media.listByAlbum(other.id).items.map((r) => r.id)).toEqual([photo]);
+	});
+
+	it("doesn't reach into another device's albums", () => {
+		const other = albums.create({ title: 'Other', createdByName: null, createdByDevice: null });
+		const stranger = received(other.id, { device: DEV_B });
+		media.markQueued(stranger, { kind: 'photo', sourceMime: 'image/heic', sourceExt: 'heic', sourceSha256: 'lp4-s', estCostS: null });
+		media.claimForProcessing(stranger);
+		media.markReady(stranger, { conversion: 'transcode', canonicalExt: 'jpg', canonicalSize: 1, width: 1, height: 1, takenMs: 1, contentId: 'LIVE-1', sourceKept: false });
+		const video = queued(defaultAlbum, 'lp4-video', 'video');
+		finishVideo(video);
+		expect(media.getById(video)).toMatchObject({ live_photo_of: null, deleted_at: null, album_id: defaultAlbum });
+	});
+
+	it('prefers a live photo to a trashed copy in the same album', () => {
+		const trashedCopy = ready(defaultAlbum, 'lp5-old', 1000, { contentId: 'LIVE-1' });
+		media.softDelete(trashedCopy, 'x');
+		const liveCopy = ready(defaultAlbum, 'lp5-new', 1000, { contentId: 'LIVE-1' });
+		const video = queued(defaultAlbum, 'lp5-video', 'video');
+		finishVideo(video);
+		expect(media.getById(video)).toMatchObject({ live_photo_of: liveCopy, deleted_at: null, album_id: defaultAlbum });
+	});
+
+	it('stays unpaired (and visible) when the moved photo’s album already has these video bytes live', () => {
+		const other = albums.create({ title: 'Other', createdByName: null, createdByDevice: null });
+		const { photo, video } = photoThenVideo();
+		ready(other.id, 'lp3-video', 1, { kind: 'video', durationMs: 60_000 }); // same bytes already live there
+		expect(media.move(photo, other.id)).toEqual({ ok: true });
+		finishVideo(video);
+		expect(media.getById(video)).toMatchObject({ live_photo_of: null, album_id: defaultAlbum, deleted_at: null });
 	});
 });

@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
-import { login } from './helpers';
+import { e2eDir, login } from './helpers';
 import { seedAlbum, seedMedia } from './seed';
 
 test.describe('downloads', () => {
@@ -80,6 +80,23 @@ test.describe('downloads', () => {
 		expect((await page.request.get(`/media/${trashed}/thumb`)).status()).toBe(404);
 		expect((await page.request.get(`/media/${id}/original`)).status()).toBe(404);
 		expect((await page.request.get('/media/..%2F..%2Fetc/file')).status()).toBe(404);
+	});
+
+	test('a photo whose previews went missing still opens: its file stands in for display, uncached', async ({ page }) => {
+		const album = seedAlbum('Lost previews');
+		const id = await seedMedia(album, { name: 'IMG_2001.HEIC', takenAt: '2024-07-04T11:22:31-07:00' });
+		const cached = (variant: string) => path.join(e2eDir(), 'config', 'cache', id.slice(-2), id, `${variant}.webp`);
+		fs.rmSync(cached('display'));
+		fs.rmSync(cached('thumb'));
+		await login(page, 'Grandma Jo');
+
+		const display = await page.request.get(`/media/${id}/display`);
+		expect(display.status()).toBe(200);
+		expect(display.headers()['content-type']).toBe('image/jpeg');
+		expect(display.headers()['cache-control']).toBe('private, no-cache');
+		expect((await display.body()).equals(await (await page.request.get(`/media/${id}/file`)).body())).toBe(true);
+		// A grid tile never gets the full file.
+		expect((await page.request.get(`/media/${id}/thumb`)).status()).toBe(404);
 	});
 
 	test('"Download all" is a ZIP with friendly names and memories.txt, without hidden Live Photo videos', async ({ page }, testInfo) => {

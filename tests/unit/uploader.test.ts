@@ -80,6 +80,7 @@ interface FakeUpload {
 		retryDelays: number[];
 		removeFingerprintOnSuccess: boolean;
 		metadata: Record<string, string>;
+		onShouldRetry: (e: Error, attempt: number, options: unknown) => boolean;
 		onProgress: (sent: number, total: number) => void;
 		onSuccess: (p: { lastResponse: { getHeader: (name: string) => string | undefined } }) => void;
 		onError: (e: Error) => void;
@@ -97,8 +98,20 @@ function succeed(u: FakeUpload, mediaId: string | null): void {
 	u.options.onSuccess({ lastResponse: { getHeader: (name) => (name === 'X-Media-Id' ? (mediaId ?? undefined) : undefined) } });
 }
 
+function httpError(status: number, body = ''): Error {
+	return Object.assign(new Error('tus: unexpected response'), { originalResponse: { getStatus: () => status, getBody: () => body } });
+}
+
 function fail(u: FakeUpload, status: number, body = ''): void {
-	u.options.onError(Object.assign(new Error('tus: unexpected response'), { originalResponse: { getStatus: () => status, getBody: () => body } }));
+	u.options.onError(httpError(status, body));
+}
+
+/** A request that never got an answer (tus-js-client's DetailedError without a response). */
+const networkError = () => Object.assign(new Error('tus: failed to upload chunk'), { originalRequest: {} });
+
+/** navigator.onLine as the browser reports it (the stand-in navigator is a plain object). */
+function setOnline(onLine: boolean): void {
+	(navigator as unknown as { onLine: boolean }).onLine = onLine;
 }
 
 /** What GET /api/status answers per id (missing ids are left out, as the server does). */
@@ -250,6 +263,142 @@ describe('sending', () => {
 		expect(tus.created).toHaveLength(3);
 		expect(tus.created[2].file).toBe(b.file);
 		expect(b).toMatchObject({ stage: 'sending', problem: null });
+	});
+});
+
+describe('a dropped connection', () => {
+	beforeEach(() => {
+		vi.stubGlobal('window', new EventTarget());
+	});
+
+	it('is retried on RETRY_DELAYS even while the browser says it is offline', async () => {
+		const { batch } = newBatch();
+		batch.add([photo()]);
+		await settle();
+		const [u] = tus.created;
+		const [item] = batch.items;
+		setOnline(false);
+		// tus-js-client's default gives up at once while offline; ours keeps to the retry schedule.
+		expect(u.options.onShouldRetry(networkError(), 0, u.options)).toBe(true);
+		expect(item.offline).toBe(true);
+		expect(batch.offline).toBe(true);
+		setOnline(true);
+		for (const status of [500, 502, 503, 409, 423, 429]) expect(u.options.onShouldRetry(httpError(status), 0, u.options), String(status)).toBe(true);
+		for (const status of [400, 401, 403, 404, 410, 413]) expect(u.options.onShouldRetry(httpError(status), 0, u.options), String(status)).toBe(false);
+		expect(item.offline).toBe(false);
+		// Bytes moving again clear the "Waiting for the internet…" line.
+		setOnline(false);
+		u.options.onShouldRetry(networkError(), 1, u.options);
+		expect(item.offline).toBe(true);
+		u.options.onProgress(400, 1000);
+		expect(item).toMatchObject({ offline: false, sent: 400, stage: 'sending' });
+	});
+
+	it('waits for the internet after the last retry instead of failing, then carries on', async () => {
+		tus.previous = [{ metadata: { albumId: '7' }, uploadUrl: '/api/upload/a' }];
+		const { batch, ondone } = newBatch();
+		batch.add([photo('a.jpg'), photo('b.jpg'), photo('c.jpg')]);
+		await settle();
+		const [a, b] = batch.items;
+		setOnline(false);
+		tus.created[0].options.onError(networkError());
+		await settle();
+		// Still "sending": the screen stays awake, leaving still asks, nothing says Done.
+		expect(a).toMatchObject({ stage: 'sending', offline: true, problem: null });
+		expect(a.canRetry).toBe(false);
+		expect(batch).toMatchObject({ sending: true, offline: true, unsent: 0, allSettled: false });
+		// It keeps its sending slot: the third file doesn't start while offline.
+		expect(tus.created).toHaveLength(2);
+		succeed(tus.created[1], ID.b);
+		await settle();
+		expect(b.stage).toBe('sent');
+		expect(tus.created).toHaveLength(3);
+		tus.created[2].options.onError(networkError());
+		await settle();
+		expect(batch.items[2]).toMatchObject({ stage: 'sending', offline: true });
+
+		setOnline(true);
+		window.dispatchEvent(new Event('online'));
+		await settle();
+		// Both go back in line and resume where they stopped, two at a time.
+		expect(tus.created).toHaveLength(5);
+		expect(tus.created[3]).toMatchObject({ file: a.file, started: true, resumedFrom: tus.previous[0] });
+		expect(tus.created[4].file).toBe(batch.items[2].file);
+		expect(batch.items.map((i) => [i.stage, i.offline])).toEqual([
+			['sending', false],
+			['sent', false],
+			['sending', false]
+		]);
+		succeed(tus.created[3], ID.a);
+		succeed(tus.created[4], ID.c);
+		statusOf = Object.fromEntries([ID.a, ID.b, ID.c].map((id) => [id, { id, status: 'ready', kind: 'photo' } as MediaStatusDTO]));
+		await vi.advanceTimersByTimeAsync(3000);
+		await settle();
+		expect(batch.allSettled).toBe(true);
+		expect(ondone).toHaveBeenCalledExactlyOnceWith({ unsent: 0 });
+		// Nothing is left listening.
+		window.dispatchEvent(new Event('online'));
+		await settle();
+		expect(tus.created).toHaveLength(5);
+	});
+
+	it('carries on when the page is shown again with the connection back (no online event seen)', async () => {
+		const { batch } = newBatch();
+		batch.add([photo()]);
+		await settle();
+		setOnline(false);
+		tus.created[0].options.onError(networkError());
+		await settle();
+		batch.visible();
+		await settle();
+		expect(tus.created).toHaveLength(1);
+		setOnline(true);
+		batch.visible();
+		await settle();
+		expect(tus.created).toHaveLength(2);
+		expect(batch.items[0]).toMatchObject({ stage: 'sending', offline: false });
+	});
+
+	it('stops waiting when the uploader goes away', async () => {
+		const { batch } = newBatch();
+		batch.add([photo()]);
+		await settle();
+		setOnline(false);
+		tus.created[0].options.onError(networkError());
+		await settle();
+		batch.destroy();
+		setOnline(true);
+		window.dispatchEvent(new Event('online'));
+		await settle();
+		expect(tus.created).toHaveLength(1);
+	});
+
+	it('tells ondone how many did not send, and again once "Try all again" sent them', async () => {
+		const { batch, ondone } = newBatch();
+		batch.add([photo('a.jpg'), photo('b.jpg'), photo('c.jpg')]);
+		await settle();
+		succeed(tus.created[0], ID.a);
+		await settle();
+		fail(tus.created[1], 502);
+		await settle();
+		fail(tus.created[2], 500);
+		statusOf = { [ID.a]: { id: ID.a, status: 'ready', kind: 'photo' } };
+		await vi.advanceTimersByTimeAsync(3000);
+		await settle();
+		expect(batch.unsent).toBe(2);
+		expect(ondone).toHaveBeenCalledExactlyOnceWith({ unsent: 2 });
+
+		batch.retryAll();
+		await settle();
+		expect(batch.unsent).toBe(0);
+		expect(tus.created).toHaveLength(5);
+		succeed(tus.created[3], ID.b);
+		succeed(tus.created[4], ID.c);
+		statusOf = Object.fromEntries([ID.a, ID.b, ID.c].map((id) => [id, { id, status: 'ready', kind: 'photo' } as MediaStatusDTO]));
+		await vi.advanceTimersByTimeAsync(3000);
+		await settle();
+		expect(ondone).toHaveBeenCalledTimes(2);
+		expect(ondone).toHaveBeenLastCalledWith({ unsent: 0 });
 	});
 });
 

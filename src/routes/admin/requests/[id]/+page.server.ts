@@ -5,7 +5,7 @@ import { tx } from '#lib/server/db';
 import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
 import * as requests from '#lib/server/repo/requests';
-import { listAlbums } from '#lib/server/repo/admin';
+import { listAlbumTitles } from '#lib/server/repo/admin';
 import { mediaUrl } from '#lib/client/dto';
 import { REMOVAL_REASON_LABELS } from '#lib/shared/media-types';
 
@@ -50,7 +50,7 @@ export const load: PageServerLoad = ({ params, locals }) => {
 			trashed: item.deleted_at !== null,
 			hasOriginal: media.sourcePath(item) !== null
 		},
-		otherAlbums: listAlbums()
+		otherAlbums: listAlbumTitles()
 			.filter((a) => a.id !== item.album_id)
 			.map((a) => ({ id: a.id, title: a.title }))
 	};

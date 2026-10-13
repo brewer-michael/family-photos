@@ -44,6 +44,52 @@ test.describe('viewer', () => {
 		await expect(page).toHaveURL(new RegExp(`/album/${album}$`));
 	});
 
+	test('Previous/Next and the actions stay on screen for a tall photo, on small phones and with large text', async ({ page }) => {
+		test.setTimeout(60_000);
+		const album = seedAlbum('Portrait photos');
+		const ids: string[] = [];
+		for (let day = 1; day <= 3; day++) {
+			ids.push(await seedMedia(album, { name: `IMG_000${day}.HEIC`, takenAt: `2024-07-0${day}T09:00:00-07:00`, size: [1536, 2048] }));
+		}
+		await login(page, 'Grandma Jo'); // at 360px wide, "Not Grandma Jo?" takes the header to two rows
+		/** Whether a tap in the middle of the element lands on it (not on something covering it). */
+		const onTop = (selector: string) =>
+			page.locator(selector).evaluate((el) => {
+				const r = el.getBoundingClientRect();
+				const x = r.left + r.width / 2;
+				const y = r.top + r.height / 2;
+				const hit = document.elementFromPoint(x, y);
+				return y > 0 && y < window.innerHeight && !!hit && el.contains(hit);
+			});
+		for (const [width, height] of [[360, 740], [390, 664]]) {
+			for (const textSize of ['112.5%', '168.75%']) {
+				const at = `${width}x${height}, text ${textSize}`;
+				await page.setViewportSize({ width, height });
+				await page.goto(`/view/${ids[1]}`);
+				await page.addStyleTag({ content: `html { font-size: ${textSize} !important }` });
+				await expect.poll(() => page.locator('img.media').evaluate((img: HTMLImageElement) => img.complete && img.naturalWidth)).toBe(1536);
+				expect(await onTop('.prevnext .next'), `Next, ${at}`).toBe(true);
+				expect(await onTop('.prevnext .prev'), `Previous, ${at}`).toBe(true);
+				expect(await onTop('.bar > .btn:first-child'), `Save to my phone, ${at}`).toBe(true);
+				// The actions' words are full size (18px+), and none runs out of its button.
+				for (const button of await page.locator('.bar > .btn').all()) {
+					const { font, overflows } = await button.evaluate((el) => ({
+						font: parseFloat(getComputedStyle(el).fontSize),
+						overflows: el.scrollWidth > el.clientWidth + 1
+					}));
+					expect(font, at).toBeGreaterThanOrEqual(18);
+					expect(overflows, at).toBe(false);
+				}
+				expect(await page.evaluate(() => document.documentElement.scrollWidth), at).toBeLessThanOrEqual(width);
+			}
+		}
+		// It really is the way to the next photo.
+		await page.setViewportSize({ width: 360, height: 740 });
+		await page.goto(`/view/${ids[1]}`);
+		await page.locator('.prevnext .next').click();
+		await expect(page).toHaveURL(new RegExp(`/view/${ids[0]}$`));
+	});
+
 	test('right-click on the photo opens the Save sheet instead of the browser menu', async ({ page }) => {
 		const { middle } = await threePhotos('Save sheet');
 		await login(page, 'Grandma Jo');
@@ -115,11 +161,23 @@ test.describe('viewer', () => {
 
 	test('"Ask to remove" stores one request per device and reassures', async ({ page }) => {
 		const { middle } = await threePhotos('Removal');
+		await page.setViewportSize({ width: 360, height: 740 });
 		await login(page, 'Aunt Linda');
 		await page.goto(`/view/${middle}`);
 		await page.getByRole('button', { name: 'Ask to remove' }).click();
 		const dialog = page.getByRole('dialog', { name: 'Ask to remove this photo' });
 		await expect(dialog).toContainText('Nothing is deleted yet — Michael will look at it.');
+		// On a small phone the sheet scrolls, but "Send request" and "Cancel" are in view (and look
+		// like the sheet's buttons, not the viewer bar's small stacked ones).
+		for (const name of ['Send request', 'Cancel']) {
+			const button = dialog.getByRole('button', { name });
+			const seen = await button.evaluate((el) => {
+				const r = el.getBoundingClientRect();
+				const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+				return { onTop: !!hit && el.contains(hit), direction: getComputedStyle(el).flexDirection };
+			});
+			expect(seen, name).toEqual({ onTop: true, direction: 'row' });
+		}
 		for (const label of ["I'm in it and don't want it shared", 'Blurry or duplicate', 'Wrong album', 'Something else']) {
 			await expect(dialog.getByRole('radio', { name: label })).toBeVisible();
 		}

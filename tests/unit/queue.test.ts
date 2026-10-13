@@ -7,14 +7,24 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { DEFAULT_TIMINGS, getProgress, queuePosition, startQueue, stopQueue, wakeQueue, type QueueTimings } from '#lib/server/queue';
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
+import {
+	DEFAULT_TIMINGS,
+	getProgress,
+	previewsWaiting,
+	queueMissingPreviews,
+	queuePosition,
+	startQueue,
+	stopQueue,
+	wakeQueue,
+	type QueueTimings
+} from '#lib/server/queue';
 import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
 import { setSourceDuration } from '#lib/server/repo/uploads';
 import { getDb } from '#lib/server/db';
-import { tmpRoot, workRoot } from '#lib/server/paths';
-import type { Kind } from '#lib/shared/media-types';
+import { cacheFile, tmpRoot, workRoot } from '#lib/server/paths';
+import type { CacheVariant, Kind } from '#lib/shared/media-types';
 import { freshDb, setEnv, testEnv } from '../helpers/env';
 
 vi.mock('#lib/server/selfcheck', () => ({ runSelfCheck: vi.fn(async () => null) }));
@@ -42,6 +52,7 @@ interface LogEvent {
 	argv?: string[];
 	uvThreadpoolSize?: string;
 	niceness?: number;
+	secrets?: string[];
 }
 
 let album: number;
@@ -118,7 +129,10 @@ describe('limits', () => {
 });
 
 describe('lanes', () => {
-	it('spawns one niced child per lane with the memory cap, its lane and UV_THREADPOOL_SIZE=4', async () => {
+	it('spawns one niced child per lane with the memory cap, its lane, UV_THREADPOOL_SIZE=4 and no secrets', async () => {
+		setEnv({ SMTP_HOST: 'smtp.example.com', SMTP_PASS: 'mail-secret' });
+		onTestFinished(() => setEnv({ SMTP_HOST: undefined, SMTP_PASS: undefined }));
+		expect(process.env.FAMILY_PASSWORD).toBeTruthy();
 		startQueue({ timings: FAST });
 		await vi.waitFor(() => expect(events().filter((e) => e.type === 'start')).toHaveLength(2));
 		const base = os.getPriority();
@@ -128,6 +142,8 @@ describe('lanes', () => {
 			expect(start.argv).toEqual([`--lane=${lane}`]);
 			expect(start.uvThreadpoolSize).toBe('4');
 			expect(start.niceness).toBe(Math.min(19, base + (lane === 'photo' ? 10 : 15)));
+			// The family code, admin password and SMTP password stay in the web process.
+			expect(start.secrets).toEqual([]);
 		}
 	});
 
@@ -313,8 +329,9 @@ describe('start and stop', () => {
 		fs.mkdirSync(path.dirname(entry));
 		fs.symlinkSync(FAKE_WORKER, entry);
 		await settled(id, 'ready');
+		// Each lane looks again on its own timer, so the video lane may start a recheck later.
+		await vi.waitFor(() => expect(lanesStarted('video')).toBe(1), { timeout: 2000, interval: 20 });
 		expect(lanesStarted('photo')).toBe(1);
-		expect(lanesStarted('video')).toBe(1);
 	});
 
 	it('waits while /config is short of space', async () => {
@@ -333,7 +350,7 @@ describe('start and stop', () => {
 		await stopQueue();
 		expect(events().filter((e) => e.type === 'shutdown')).toHaveLength(2);
 		expect(row(id).status).toBe('queued');
-		expect(row(id).attempts).toBe(1);
+		expect(row(id).attempts).toBe(0); // the claim's attempt is given back: restarts never use up MAX_ATTEMPTS
 	});
 
 	it('re-queues a job the shutdown aborted, even on its last attempt (the lane answers "failed" first)', async () => {
@@ -344,6 +361,7 @@ describe('start and stop', () => {
 		expect(row(id).attempts).toBe(3);
 		await stopQueue();
 		expect(row(id).status).toBe('queued');
+		expect(row(id).attempts).toBe(2);
 		expect(row(id).error_code).toBeNull();
 		expect(row(id).error_detail).toBe('Interrupted by a shutdown; re-queued');
 	});
@@ -358,5 +376,107 @@ describe('start and stop', () => {
 		expect(Date.now() - started).toBeLessThan(5000);
 		expect(events().filter((e) => e.type === 'ignored-shutdown')).toHaveLength(1);
 		expect(row(id).status).toBe('queued');
+	});
+});
+
+describe('admin redos', () => {
+	/** A ready item made by an older pipeline, with its redo queued; the fake worker acts on `behaviour`. */
+	function redoItem(behaviour: string): string {
+		const id = queued(behaviour);
+		media.claimForProcessing(id);
+		media.markReady(id, { conversion: 'transcode', canonicalExt: 'jpg', canonicalSize: 1, width: 1, height: 1, takenMs: 0, sourceKept: true, pipelineVersion: 0 });
+		expect(media.markForReprocess(id)).toBe(true);
+		return id;
+	}
+
+	it('run only while no upload waits; a redo that fails leaves the item ready and visible', async () => {
+		const redo = redoItem('fail-corrupt');
+		const upload = queued('ok');
+		startQueue({ timings: FAST });
+		await vi.waitFor(() => expect(row(redo).redo_state).toBeNull(), { timeout: 8000, interval: 20 });
+		expect(jobs('photo').map((j) => j.id)).toEqual([upload, redo]);
+		expect(row(upload).status).toBe('ready');
+		expect(row(redo)).toMatchObject({ status: 'ready', pipeline_version: 0, redo_error: 'corrupt: broken bytes', error_code: null });
+		expect(media.listByAlbum(album).items.map((r) => r.id).sort()).toEqual([redo, upload].sort());
+		expect(media.listFailed()).toEqual([]);
+	});
+
+	it('try a retryable failure again, then give up without touching the item', async () => {
+		const redo = redoItem('fail-retryable');
+		startQueue({ timings: FAST });
+		await vi.waitFor(() => expect(row(redo).redo_state).toBeNull(), { timeout: 8000, interval: 20 });
+		expect(jobs('photo').filter((j) => j.id === redo)).toHaveLength(3);
+		expect(row(redo)).toMatchObject({ status: 'ready', redo_error: 'Gave up after 3 attempts. Last error: flaky disk' });
+	});
+
+	it('a redo the shutdown cut short waits again with its attempt given back', async () => {
+		const redo = redoItem('hang');
+		startQueue({ timings: FAST });
+		await vi.waitFor(() => expect(jobs('photo')).toHaveLength(1));
+		expect(row(redo)).toMatchObject({ status: 'ready', redo_state: 'running', redo_attempts: 1 });
+		await stopQueue();
+		expect(row(redo)).toMatchObject({ status: 'ready', redo_state: 'queued', redo_attempts: 0 });
+	});
+
+	it('a waiting redo whose original is no longer recorded ends instead of holding up the ones behind it', async () => {
+		const orphan = redoItem('ok');
+		media.markOriginalDeleted(orphan);
+		const next = redoItem('ok');
+		startQueue({ timings: FAST });
+		// (the fake worker doesn't commit redos, so the lane's job list is what shows it was taken)
+		await vi.waitFor(() => expect(jobs('photo').map((j) => j.id)).toEqual([next]), { timeout: 8000, interval: 20 });
+		expect(row(orphan)).toMatchObject({ status: 'ready', redo_state: null, redo_error: "Its archived original is gone, so it can't be redone" });
+	});
+});
+
+describe('missing previews', () => {
+	/** A ready item as a lane leaves it, with only the cache files in `cached` (the rest went missing). */
+	function readyItem(behaviour: string, kind: Kind, cached: CacheVariant[] = []): string {
+		const id = queued(behaviour, kind);
+		media.claimForProcessing(id);
+		media.markReady(id, { conversion: 'none', canonicalExt: kind === 'photo' ? 'jpg' : 'mp4', canonicalSize: 1, width: 1, height: 1, takenMs: 0, sourceKept: false });
+		for (const variant of cached) {
+			fs.mkdirSync(path.dirname(cacheFile(id, variant)), { recursive: true });
+			fs.writeFileSync(cacheFile(id, variant), 'webp');
+		}
+		return id;
+	}
+	const rebuilt = (lane?: Kind) => events().filter((e) => e.type === 'previews' && (!lane || e.lane === lane)).map((e) => e.id);
+
+	it('are rebuilt from library/ at startup, newest first and after uploads, without touching the rows', async () => {
+		const older = readyItem('ok', 'photo');
+		const complete = readyItem('ok', 'photo', ['thumb', 'display']);
+		const noDisplay = readyItem('ok', 'photo', ['thumb']);
+		const noPoster = readyItem('ok', 'video', ['thumb']);
+		const completeVideo = readyItem('ok', 'video', ['thumb', 'poster']);
+		const upload = queued('ok');
+		const before = [older, complete, noDisplay, noPoster, completeVideo].map((id) => ({ ...row(id) }));
+		startQueue({ timings: FAST });
+		expect(previewsWaiting()).toBe(3);
+		await vi.waitFor(() => expect(previewsWaiting()).toBe(0), { timeout: 8000, interval: 20 });
+		// The upload first; then the previews, newest first. Items with all their previews are left alone.
+		expect(events().filter((e) => e.lane === 'photo' && (e.type === 'job' || e.type === 'previews')).map((e) => e.id)).toEqual([upload, noDisplay, older]);
+		expect(rebuilt('video')).toEqual([noPoster]);
+		for (const id of [older, noDisplay]) expect(fs.existsSync(cacheFile(id, 'display'))).toBe(true);
+		expect(fs.existsSync(cacheFile(noPoster, 'poster'))).toBe(true);
+		for (const r of before) expect(row(r.id)).toEqual(r);
+		expect(row(upload).status).toBe('ready');
+	});
+
+	it('are looked for again from the admin page; one that cannot be rebuilt is only logged', async () => {
+		startQueue({ timings: FAST });
+		const lost = readyItem('ok', 'photo');
+		const broken = readyItem('previews-fail', 'photo');
+		const warn = vi.spyOn(console, 'warn');
+		expect(queueMissingPreviews()).toBe(2);
+		await vi.waitFor(() => expect(previewsWaiting()).toBe(0), { timeout: 8000, interval: 20 });
+		expect(rebuilt()).toEqual([broken, lost]);
+		expect(fs.existsSync(cacheFile(lost, 'thumb'))).toBe(true);
+		expect(warn).toHaveBeenCalledWith(`[queue] could not rebuild the previews of ${broken}: corrupt: its file in library/ is missing`);
+		expect(row(broken)).toMatchObject({ status: 'ready', attempts: 1, error_code: null, error_detail: null, redo_state: null });
+		// Not retried by itself; asking again finds only that one.
+		expect(queueMissingPreviews()).toBe(1);
+		await vi.waitFor(() => expect(rebuilt()).toEqual([broken, lost, broken]), { timeout: 8000, interval: 20 });
+		expect(row(broken).status).toBe('ready');
 	});
 });

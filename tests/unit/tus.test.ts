@@ -6,12 +6,15 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import type { RequestEvent } from '@sveltejs/kit';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { tusHandler, parseCookies } from '#lib/server/uploads/tus';
+import { tusHandler, parseCookies, forgetOpenUploads } from '#lib/server/uploads/tus';
 import { ACCESS_COOKIE, DEVICE_COOKIE, accessValue, deviceValue } from '#lib/server/auth';
-import { GiB, freeBytes } from '#lib/server/disk';
+import { GiB, freeBytes, spaceNeededForUpload } from '#lib/server/disk';
 import { wakeIntake } from '#lib/server/intake';
 import * as albums from '#lib/server/repo/albums';
 import * as media from '#lib/server/repo/media';
+import * as adminRepo from '#lib/server/repo/admin';
+import { getDefaultAlbumId } from '#lib/server/repo/settings';
+import { deleteAlbum } from '#lib/server/admin';
 import { incomingDir, incomingPath } from '#lib/server/paths';
 import * as uploadRoute from '../../src/routes/api/upload/[...path]/+server';
 import { freshDb } from '../helpers/env';
@@ -82,6 +85,7 @@ const head = (token: string, c = cookie()) => call('HEAD', `/api/upload/${token}
 beforeEach(() => {
 	freshDb();
 	vi.clearAllMocks();
+	forgetOpenUploads();
 	vi.mocked(freeBytes).mockResolvedValue(10_000 * GiB);
 	album = albums.create({ title: 'Lake trip', createdByName: 'Linda', createdByDevice: LINDA.d }).id;
 });
@@ -162,6 +166,34 @@ describe('creating an upload', () => {
 		expect((await create(size)).status).toBe(201);
 	});
 
+	it('keeps room for the uploads still on their way, until they finish', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const need = spaceNeededForUpload(1000); // 2 × 1000 + 2 GiB
+		const free = (bytes: number) => vi.mocked(freeBytes).mockResolvedValue(bytes);
+		free(need + 2000);
+		const a = tokenOf(await create(1000));
+		expect((await create(1000)).status).toBe(201); // b
+		// Both were let in against the same free space: a third doesn't fit any more.
+		const c = await create(1000);
+		expect(c.status).toBe(413);
+		expect(await c.text()).toBe("There isn't enough room left for this one. Please tell Michael.");
+		expect(warn).toHaveBeenCalledWith(expect.stringContaining('kept for uploads on their way'));
+
+		// a has written 400 bytes (they show in the free space): it still keeps 2 × 1000 − 400.
+		const bytes = randomBytes(1000);
+		expect((await patch(a, 0, bytes.subarray(0, 400))).status).toBe(204);
+		free(need + 1600 + 2000 - 1);
+		expect((await create(1000)).status).toBe(413);
+		free(need + 1600 + 2000);
+		expect((await create(1000)).status).toBe(201); // d
+
+		// Finished: a keeps nothing more; b and d still do.
+		expect((await patch(a, 400, bytes.subarray(400))).status).toBe(204);
+		free(need + 2000 + 2000);
+		expect((await create(1000)).status).toBe(201);
+		warn.mockRestore();
+	});
+
 	it('refuses empty files', async () => {
 		expect((await create(10)).status).toBe(201); // the FileStore's folder exists from here on
 		const before = fs.readdirSync(incomingDir()).length;
@@ -236,17 +268,35 @@ describe('sending and finishing', () => {
 		expect(media.listReceived()).toHaveLength(1);
 	});
 
-	it('keeps an upload whose album was deleted on the way, in that album, and logs it', async () => {
+	it('puts an upload whose album was deleted on the way into Everyday Photos, and logs it', async () => {
 		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const everyday = getDefaultAlbumId()!;
 		const bytes = randomBytes(100);
 		const token = tokenOf(await create(bytes.length));
 		albums.softDelete(album);
 		const res = await patch(token, 0, bytes);
 		expect(res.status).toBe(204);
 		const id = res.headers.get('x-media-id')!;
-		expect(media.getById(id)).toMatchObject({ status: 'received', album_id: album, upload_token: token });
+		expect(media.getById(id)).toMatchObject({ status: 'received', album_id: everyday, upload_token: token });
+		expect(adminRepo.countAlbumRows(album)).toBe(0);
 		expect(wakeIntake).toHaveBeenCalledTimes(1);
-		expect(warn).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`^\\[upload\\] ${id} .*was deleted.*restoring the album brings it back`)));
+		expect(warn).toHaveBeenCalledWith(expect.stringMatching(new RegExp(`^\\[upload\\] ${id} .*album ${album} "Lake trip" was deleted; it went to album ${everyday}`)));
+		warn.mockRestore();
+	});
+
+	it('follows an admin "delete album, move items" that happens half-way through an upload', async () => {
+		const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+		const bytes = randomBytes(1000);
+		const token = tokenOf(await create(bytes.length));
+		expect((await patch(token, 0, bytes.subarray(0, 400))).status).toBe(204);
+		expect(deleteAlbum(album, { moveItems: true })).toEqual({ ok: true, moved: 0, trashed: 0 });
+		const last = await patch(token, 400, bytes.subarray(400));
+		expect(last.status).toBe(204);
+		const id = last.headers.get('x-media-id')!;
+		expect(media.getById(id)!.album_id).toBe(getDefaultAlbumId());
+		// Nothing is left behind in the deleted album, and a retry's HEAD finds the same item.
+		expect(adminRepo.countAlbumRows(album)).toBe(0);
+		expect((await head(token)).headers.get('x-media-id')).toBe(id);
 		warn.mockRestore();
 	});
 

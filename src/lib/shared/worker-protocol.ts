@@ -15,6 +15,8 @@
  *   return false for a `ready` one, and the main process then treats the job as done.
  *   Workers should not throw after markReady returned true (log cleanup errors).
  * - One job at a time per lane. The worker sends `hello` once it is ready.
+ * - A `job` with task 'previews' rebuilds a ready item's previews from library/: nothing was
+ *   claimed and the worker writes nothing to the row, so its `done` is only logged.
  */
 import type { ErrorCode, Kind } from './media-types';
 
@@ -26,6 +28,12 @@ export interface JobMessage {
 	type: 'job';
 	id: string;
 	kind: Kind;
+	/**
+	 * 'previews': rebuild a ready item's previews in cache/ from its file in library/
+	 * (src/worker/previews.ts). The row is not claimed and never changes; a failure is only logged.
+	 * Absent: convert the item (a first conversion, or an admin redo).
+	 */
+	task?: 'previews';
 }
 
 /** Ask the worker to abort the running job (ctx.signal fires). */

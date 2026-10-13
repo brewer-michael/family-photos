@@ -5,8 +5,11 @@
  *
  * taken date fallback: EXIF DateTimeOriginal (+ OffsetTimeOriginal, SubSecTimeOriginal) → EXIF
  * CreateDate (+ OffsetTimeDigitized) → XMP dates → the client's lastModified → upload time.
- * taken_at is the local wall time plus the offset when known; taken_ms is UTC (a wall time
- * without an offset is read as UTC, as the video lane does).
+ * taken_at is the local wall time plus the offset when known; taken_ms is UTC. A wall time
+ * without an offset (older cameras and Android phones, scans) is read in the server's time zone
+ * (TZ, which Unraid sets; the zone pages already show taken_ms-only items in), so it sorts among
+ * photos and videos that carry a real offset or UTC instant. taken_at stays offset-less: no
+ * guessed offset is written into previews or shown.
  */
 import { exiftool } from '../exiftool';
 
@@ -99,7 +102,9 @@ export function parseExifDate(value: unknown, offset?: unknown, subsec?: unknown
 	const offMin = m[8] ? parseOffset(m[8]) : parseOffset(str(offset));
 	const local = `${pad(y, 4)}-${pad(mo)}-${pad(d)}T${pad(h)}:${pad(mi)}:${pad(se)}`;
 	const off = offMin === null ? null : formatOffset(offMin);
-	return { takenAt: local + (off ?? ''), takenMs: wall + ms - (offMin ?? 0) * 60_000, offset: off };
+	// `wall` (UTC parts) only validates the date above; y ≥ MIN_YEAR, so new Date(y, …) has no two-digit-year quirk.
+	const takenMs = offMin === null ? new Date(y, mo - 1, d, h, mi, se).getTime() + ms : wall + ms - offMin * 60_000;
+	return { takenAt: local + (off ?? ''), takenMs, offset: off };
 }
 
 /** A file's lastModified before 2000 is an unset clock (the 1970 epoch), not a capture date. */

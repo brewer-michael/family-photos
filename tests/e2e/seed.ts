@@ -27,6 +27,8 @@ export interface SeedItem {
 	livePhotoOf?: string;
 	/** Fill colour of the generated picture. */
 	color?: string;
+	/** Pixel size of the generated picture (default 640×480; e.g. [1536, 2048] for a portrait photo). */
+	size?: [width: number, height: number];
 	/** Default 'ready'. Unfinished items get no canonical file (videos get a poster). */
 	status?: 'ready' | 'queued' | 'processing' | 'failed';
 	errorCode?: 'retryable' | 'unsupported';
@@ -87,8 +89,12 @@ const takenMsOf = (takenAt: string) => {
 	return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
 };
 
-const pictureOf = (item: Pick<SeedItem, 'color'>) =>
-	sharp({ create: { width: 640, height: 480, channels: 3, background: item.color ?? '#c96f3b' } });
+const sizeOf = (item: Pick<SeedItem, 'size'>) => item.size ?? [640, 480];
+
+const pictureOf = (item: Pick<SeedItem, 'color' | 'size'>) => {
+	const [width, height] = sizeOf(item);
+	return sharp({ create: { width, height, channels: 3, background: item.color ?? '#c96f3b' } });
+};
 
 type FileKind = Pick<SeedItem, 'kind' | 'moving'>;
 
@@ -106,7 +112,7 @@ const sourceType = (item: FileKind): [mime: string, ext: string] =>
 				: ['image/heic', 'heic'];
 
 /** Writes a ready item's canonical file and thumbnails; returns the canonical file's size. */
-async function writeReadyFiles(id: string, item: Pick<SeedItem, 'kind' | 'moving' | 'color'>): Promise<number> {
+async function writeReadyFiles(id: string, item: Pick<SeedItem, 'kind' | 'moving' | 'color' | 'size'>): Promise<number> {
 	const kind = item.kind ?? 'photo';
 	const picture = pictureOf(item);
 	const ext = canonicalExt(item);
@@ -120,7 +126,7 @@ async function writeReadyFiles(id: string, item: Pick<SeedItem, 'kind' | 'moving
 					? await picture.clone().png().toBuffer()
 					: await picture.clone().jpeg({ quality: 80 }).toBuffer();
 	write(libraryFile(id, ext), canonical);
-	write(cacheFile(id, 'thumb'), await picture.clone().resize(480, 360).webp().toBuffer());
+	write(cacheFile(id, 'thumb'), await picture.clone().resize(480, 480, { fit: 'inside' }).webp().toBuffer());
 	if (kind === 'photo') write(cacheFile(id, 'display'), await picture.clone().webp().toBuffer());
 	return canonical.length;
 }
@@ -166,8 +172,8 @@ export async function seedMedia(albumId: number, item: SeedItem): Promise<string
 			ready ? (item.moving ? 'none' : 'transcode') : null,
 			ready ? ext : null,
 			ready ? size : null,
-			ready ? 640 : null,
-			ready ? 480 : null,
+			ready ? sizeOf(item)[0] : null,
+			ready ? sizeOf(item)[1] : null,
 			ready && kind === 'video' ? 1000 : null,
 			ready ? item.takenAt : null,
 			ready ? takenMsOf(item.takenAt) : null,

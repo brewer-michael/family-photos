@@ -6,7 +6,7 @@
 import QRCode from 'qrcode';
 import { joinUrl } from './auth';
 import { publicOrigin } from './config';
-import { listAlbums } from './repo/admin';
+import { listAlbumTitles } from './repo/admin';
 
 export interface QrCard {
 	/** null = the whole site. */
@@ -29,7 +29,7 @@ export async function qrCards(siteTitle: string): Promise<QrCard[]> {
 	const origin = publicOrigin();
 	const targets = [
 		{ albumId: null, title: siteTitle, whenText: null },
-		...listAlbums().map((a) => ({ albumId: a.id, title: a.title, whenText: a.when_text }))
+		...listAlbumTitles().map((a) => ({ albumId: a.id, title: a.title, whenText: a.when_text }))
 	];
 	return Promise.all(
 		targets.map(async (t) => {

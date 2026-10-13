@@ -9,6 +9,8 @@
 
 	/** The album whose batch has finished (shows "Done! See them"). */
 	let doneFor = $state<number | null>(null);
+	/** Some files of that batch didn't send: no "Done!", just the way to the album. */
+	let unsent = $state(0);
 </script>
 
 <svelte:head>
@@ -26,13 +28,21 @@
 		<p class="to">to <strong>{data.album.title}</strong></p>
 		{#key data.album.id}
 			<div class="uploader card">
-				<Uploader albumId={data.album.id} ondone={() => (doneFor = data.album?.id ?? null)} />
+				<Uploader
+					albumId={data.album.id}
+					ondone={(r) => {
+						doneFor = data.album?.id ?? null;
+						unsent = r.unsent;
+					}}
+				/>
 			</div>
 		{/key}
-		{#if doneFor === data.album.id}
+		{#if doneFor === data.album.id && unsent === 0}
 			<a class="btn btn-primary btn-big btn-block done" href="/album/{data.album.id}">
 				<Icon name="check" /> Done! See them
 			</a>
+		{:else if doneFor === data.album.id}
+			<a class="btn btn-big btn-block done" href="/album/{data.album.id}">See the ones that were sent</a>
 		{/if}
 	{:else}
 		<h1>Which album?</h1>
@@ -105,6 +115,8 @@
 		margin: 0;
 		padding: 0;
 		display: grid;
+		/* Never wider than the screen: a long unbroken album name wraps instead of widening every row. */
+		grid-template-columns: minmax(0, 1fr);
 		gap: 0.75rem;
 	}
 	.choice {
@@ -141,6 +153,7 @@
 	.title {
 		font-size: var(--fs-large);
 		font-weight: 700;
+		overflow-wrap: anywhere;
 	}
 	.new {
 		padding: 1rem 1.1rem 1.25rem;

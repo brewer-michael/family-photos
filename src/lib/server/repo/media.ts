@@ -8,15 +8,17 @@
  *                      ─ markFailed(id, 'unsupported', …, extra)   status=failed
  *   queue (main)       ─ nextQueued(kind) → claimForProcessing()   status=processing, attempts++
  *   lane (worker)      ─ markReady()   (commit step; pairs Live Photos, touches album)
+ *                      ─ sourceSettled() (after archiving or deleting the source)
  *   queue (main)       ─ on failure: requeue() or markFailed()
  *                        Both only act on unfinished rows and return false otherwise: a job that
  *                        committed markReady() and then failed (cleanup error, timeout, crash) is
  *                        a success, and the main process must leave the ready row alone.
- *   startup            ─ requeueInterrupted()
+ *   startup            ─ requeueInterrupted(); each lane: listUnsettled() → sourceSettled()
  *
- * upload_token: kept while the source still lives in .incoming/<token> (received, queued,
- * processing, failed) and cleared by markReady()/markDuplicate(), i.e. once the pipeline has
- * consumed the upload. Use sourcePath() to locate an item's source file.
+ * upload_token: kept while the source may still be in .incoming/<token> (received, queued,
+ * processing, failed, and a `ready` row until the lane has archived or deleted the source),
+ * so the .incoming sweep never deletes a source a row still needs. Cleared by sourceSettled()
+ * and markDuplicate(). Use sourcePath() to locate an item's source file.
  *
  * Boolean columns are 0/1 numbers in rows.
  */
@@ -76,7 +78,15 @@ export interface MediaRow {
 	updated_at: number;
 	deleted_at: number | null;
 	deleted_reason: string | null;
+	/** Admin redo of a ready item: NULL, waiting ('queued') or in a lane ('running'). */
+	redo_state: RedoState | null;
+	redo_queued_ms: number | null;
+	redo_attempts: number;
+	/** Why the last redo didn't work (admin only); the item kept its old file. */
+	redo_error: string | null;
 }
+
+export type RedoState = 'queued' | 'running';
 
 /** Visible in grids, ZIPs and prev/next: ready, not trashed, not a hidden Live Photo video. */
 const VISIBLE = `status = 'ready' AND deleted_at IS NULL AND live_photo_of IS NULL`;
@@ -157,13 +167,15 @@ export function clearUploadToken(id: string): void {
 }
 
 /**
- * Where the item's source bytes are right now: the archived original if kept,
- * else the tus upload in .incoming/<token>; null when the source is gone
- * (e.g. conversion 'none': the source became the canonical file).
+ * Where the item's source bytes are: the tus upload in .incoming/<token> while the row holds its
+ * token (not yet settled), else the archived original if kept; null when the source is gone
+ * (deleted after a passthrough or with KEEP_ORIGINALS off). The lanes also look in the other
+ * place (src/worker/settle.ts locateSource), for a lane that died between archiving and
+ * sourceSettled().
  */
 export function sourcePath(row: Pick<MediaRow, 'id' | 'upload_token' | 'source_kept' | 'source_ext'>): string | null {
-	if (row.source_kept && row.source_ext) return originalsPath(row.id, row.source_ext);
 	if (row.upload_token) return incomingPath(row.upload_token);
+	if (row.source_kept && row.source_ext) return originalsPath(row.id, row.source_ext);
 	return null;
 }
 
@@ -313,10 +325,17 @@ export function listFailed(opts: { limit?: number; sinceMs?: number } = {}): Med
 	).all(opts.sinceMs ?? 0, Math.max(1, Math.floor(opts.limit ?? 200))) as MediaRow[];
 }
 
+/**
+ * Repeats the media_queue index's own predicate: SQLite only uses a partial index when the query's
+ * WHERE contains its terms literally (`status = 'queued'` alone doesn't imply it), and without it
+ * every intake step, dispatch and status poll would scan the whole table.
+ */
+const IN_QUEUE = `status IN ('received','queued','processing')`;
+
 /** Received rows waiting for intake, oldest first. */
 export function listReceived(opts: { limit?: number } = {}): MediaRow[] {
 	return stmt(
-		`SELECT * FROM media WHERE status = 'received' ORDER BY created_at ASC, id ASC LIMIT ?`
+		`SELECT * FROM media WHERE ${IN_QUEUE} AND status = 'received' ORDER BY created_at ASC, id ASC LIMIT ?`
 	).all(Math.max(1, Math.floor(opts.limit ?? 50))) as MediaRow[];
 }
 
@@ -442,12 +461,12 @@ const VIDEO_ORDER = `(COALESCE(est_cost_s, 0) - 0.5 * ((? - COALESCE(queued_ms, 
 export function nextQueued(kind: Kind, now: number = Date.now()): MediaRow | undefined {
 	if (kind === 'photo') {
 		return stmt(
-			`SELECT * FROM media WHERE status = 'queued' AND kind = 'photo' AND deleted_at IS NULL
+			`SELECT * FROM media WHERE ${IN_QUEUE} AND status = 'queued' AND kind = 'photo' AND deleted_at IS NULL
 			 ORDER BY ${PHOTO_ORDER} LIMIT 1`
 		).get() as MediaRow | undefined;
 	}
 	return stmt(
-		`SELECT * FROM media WHERE status = 'queued' AND kind = 'video' AND deleted_at IS NULL
+		`SELECT * FROM media WHERE ${IN_QUEUE} AND status = 'queued' AND kind = 'video' AND deleted_at IS NULL
 		 ORDER BY ${VIDEO_ORDER} LIMIT 1`
 	).get(now, now) as MediaRow | undefined;
 }
@@ -457,15 +476,44 @@ export function queueOrder(kind: Kind, now: number = Date.now()): string[] {
 	const rows = (
 		kind === 'photo'
 			? stmt(
-					`SELECT id FROM media WHERE status = 'queued' AND kind = 'photo' AND deleted_at IS NULL
+					`SELECT id FROM media WHERE ${IN_QUEUE} AND status = 'queued' AND kind = 'photo' AND deleted_at IS NULL
 					 ORDER BY ${PHOTO_ORDER}`
 				).all()
 			: stmt(
-					`SELECT id FROM media WHERE status = 'queued' AND kind = 'video' AND deleted_at IS NULL
+					`SELECT id FROM media WHERE ${IN_QUEUE} AND status = 'queued' AND kind = 'video' AND deleted_at IS NULL
 					 ORDER BY ${VIDEO_ORDER}`
 				).all(now, now)
 	) as { id: string }[];
 	return rows.map((r) => r.id);
+}
+
+/**
+ * Next item of a lane waiting for a redo, oldest first. The queue asks only when nextQueued()
+ * found nothing, so family uploads never wait behind a redo backlog.
+ */
+export function nextRedo(kind: Kind): MediaRow | undefined {
+	return stmt(
+		`SELECT * FROM media WHERE redo_state = 'queued' AND kind = ? AND status = 'ready' AND deleted_at IS NULL
+		 ORDER BY redo_queued_ms ASC, id ASC LIMIT 1`
+	).get(kind) as MediaRow | undefined;
+}
+
+/**
+ * redo queued → running with redo_attempts++ (status stays 'ready'). Returns the updated row, or
+ * undefined when it is no longer waiting (trashed, taken, or its original is gone).
+ */
+export function claimRedo(id: string): MediaRow | undefined {
+	return stmt(
+		`UPDATE media SET redo_state = 'running', redo_attempts = redo_attempts + 1
+		 WHERE id = ? AND redo_state = 'queued' AND status = 'ready' AND deleted_at IS NULL
+		   AND source_kept = 1 AND source_ext IS NOT NULL
+		 RETURNING *`
+	).get(id) as MediaRow | undefined;
+}
+
+/** The lane job for this row is a redo (claimRedo), not a first conversion. */
+export function isRedo(row: Pick<MediaRow, 'status' | 'redo_state'>): boolean {
+	return row.status === 'ready' && row.redo_state === 'running';
 }
 
 /**
@@ -516,9 +564,10 @@ const epochMs = (v: number): number | null => (Number.isFinite(v) && Math.abs(v)
 
 /**
  * processing → ready (the worker's commit step, after the canonical file was renamed
- * into library/). Clears the upload token and error, touches the album, and pairs
- * Live Photos. A takenMs that isn't a valid epoch time (NaN, ±Infinity, beyond what a Date
- * can hold) falls back to the row's created_at, so a ready row always has its sort key.
+ * into library/). Clears the error, touches the album, and pairs Live Photos. The upload
+ * token stays until the lane has archived or deleted the source (sourceSettled()). A takenMs
+ * that isn't a valid epoch time (NaN, ±Infinity, beyond what a Date can hold) falls back to the
+ * row's created_at, so a ready row always has its sort key.
  * Returns false if the row wasn't processing.
  */
 export function markReady(id: string, f: ReadyFields): boolean {
@@ -529,7 +578,7 @@ export function markReady(id: string, f: ReadyFields): boolean {
 				width = ?, height = ?, duration_ms = ?, hdr_tonemapped = ?, audio_dropped = ?, slowmo_retimed = ?,
 				taken_at = ?, taken_ms = COALESCE(?, created_at), gps_lat = ?, gps_lon = ?, gps_alt = ?, content_id = ?,
 				source_kept = ?, source_ext = COALESCE(?, source_ext), pipeline_version = ?,
-				upload_token = NULL, error_code = NULL, error_detail = NULL, updated_at = ?
+				error_code = NULL, error_detail = NULL, updated_at = ?
 			 WHERE id = ? AND status = 'processing'`
 		).run(
 			f.conversion,
@@ -562,21 +611,94 @@ export function markReady(id: string, f: ReadyFields): boolean {
 }
 
 /**
- * Live Photo pairing for a ready item: a video ≤ 4.5 s whose content_id matches a
- * ready photo's in the same album gets live_photo_of = photo.id (order-independent).
+ * After markReady(): the lane has archived the source in originals/ (and fsynced it) or deleted
+ * it, so the row lets go of its .incoming upload. Until then the .incoming sweep keeps the file.
+ */
+export function sourceSettled(id: string): void {
+	stmt('UPDATE media SET upload_token = NULL, updated_at = ? WHERE id = ? AND upload_token IS NOT NULL').run(Date.now(), id);
+}
+
+/**
+ * Ready rows of a lane whose source was never settled (the lane died between markReady() and
+ * sourceSettled()); the lane finishes them when it starts.
+ */
+export function listUnsettled(kind: Kind): MediaRow[] {
+	return stmt(
+		`SELECT * FROM media WHERE status = 'ready' AND upload_token IS NOT NULL AND kind = ? ORDER BY created_at ASC`
+	).all(kind) as MediaRow[];
+}
+
+/**
+ * A redo's commit step (the lane renamed the new canonical file into library/): the same fields
+ * as markReady() plus the current pipeline_version, and the redo is over. The row stays 'ready'
+ * the whole time and its album, trash state and Live Photo link are left as they are. Returns
+ * false when the row isn't being redone any more (it was trashed while waiting, or purged); the
+ * lane then puts the previous file back.
+ */
+export function markRedone(id: string, f: ReadyFields): boolean {
+	return (
+		stmt(
+			`UPDATE media SET conversion = ?, canonical_ext = ?, canonical_size = ?,
+				width = ?, height = ?, duration_ms = ?, hdr_tonemapped = ?, audio_dropped = ?, slowmo_retimed = ?,
+				taken_at = ?, taken_ms = COALESCE(?, created_at), gps_lat = ?, gps_lon = ?, gps_alt = ?, content_id = ?,
+				source_kept = ?, source_ext = COALESCE(?, source_ext), pipeline_version = ?,
+				redo_state = NULL, redo_queued_ms = NULL, redo_attempts = 0, redo_error = NULL, updated_at = ?
+			 WHERE id = ? AND status = 'ready' AND redo_state = 'running'`
+		).run(
+			f.conversion,
+			f.canonicalExt,
+			int(f.canonicalSize),
+			int(f.width),
+			int(f.height),
+			int(f.durationMs),
+			f.hdrTonemapped ? 1 : 0,
+			f.audioDropped ? 1 : 0,
+			f.slowmoRetimed ? 1 : 0,
+			f.takenAt ?? null,
+			epochMs(f.takenMs),
+			real(f.gpsLat),
+			real(f.gpsLon),
+			real(f.gpsAlt),
+			f.contentId ?? null,
+			f.sourceKept ? 1 : 0,
+			f.sourceExt ?? null,
+			f.pipelineVersion ?? PIPELINE_VERSION,
+			Date.now(),
+			id
+		).changes > 0
+	);
+}
+
+/**
+ * Live Photo pairing for a ready item: a video ≤ 4.5 s whose content_id matches a ready photo's
+ * gets live_photo_of = photo.id (order-independent).
+ *
+ * A video that becomes ready after its photo also follows wherever the photo went meanwhile: a
+ * photo trashed (an approved removal request) or moved before the video was ready still takes it
+ * along, so the clip never shows up on its own. It looks in the video's album first, then in
+ * other albums only for photos uploaded from the same device; a live photo wins over a trashed
+ * one. A moved photo whose album already has these video bytes live is left unpaired (the
+ * media_album_sha index would refuse the move).
  * Returns the photo id it linked to/from, or null.
  */
 export function pairLivePhoto(id: string): string | null {
 	const row = getById(id);
 	if (!row || row.status !== 'ready' || !row.content_id || row.deleted_at !== null) return null;
 	if (row.kind === 'video') {
-		if (row.duration_ms === null || row.duration_ms > LIVE_PHOTO_MAX_MS) return null;
+		if (row.duration_ms === null || row.duration_ms > LIVE_PHOTO_MAX_MS || row.live_photo_of !== null) return null;
 		const photo = stmt(
-			`SELECT id FROM media WHERE album_id = ? AND content_id = ? AND kind = 'photo'
-			   AND status = 'ready' AND deleted_at IS NULL ORDER BY created_at LIMIT 1`
-		).get(row.album_id, row.content_id) as { id: string } | undefined;
+			`SELECT id, album_id, deleted_at, deleted_reason FROM media
+			 WHERE content_id = ? AND kind = 'photo' AND status = 'ready'
+			   AND (album_id = ? OR uploaded_by_device = ?)
+			 ORDER BY album_id = ? DESC, deleted_at IS NOT NULL, created_at, id LIMIT 1`
+		).get(row.content_id, row.album_id, row.uploaded_by_device, row.album_id) as
+			| Pick<MediaRow, 'id' | 'album_id' | 'deleted_at' | 'deleted_reason'>
+			| undefined;
 		if (!photo) return null;
-		stmt('UPDATE media SET live_photo_of = ?, updated_at = ? WHERE id = ?').run(photo.id, Date.now(), id);
+		if (photo.album_id !== row.album_id && photo.deleted_at === null && conflictIn(photo.album_id, [row])) return null;
+		stmt(
+			`UPDATE media SET live_photo_of = ?, album_id = ?, deleted_at = ?, deleted_reason = ?, updated_at = ? WHERE id = ?`
+		).run(photo.id, photo.album_id, photo.deleted_at, photo.deleted_reason, Date.now(), id);
 		return photo.id;
 	}
 	if (row.kind === 'photo') {
@@ -624,24 +746,31 @@ export function markFailed(id: string, code: ErrorCode, detail: string, extra: F
 	);
 }
 
-/** processing → queued after a retryable failure (keeps attempts and its queue position). */
-export function requeue(id: string, detail?: string): boolean {
+/**
+ * processing → queued, keeping its queue position. After a retryable failure the attempt counts
+ * (keeps attempts). `refund` is for a job a graceful shutdown cut short: that isn't the item's
+ * fault, so the claim's attempt is given back and restarts never use up MAX_ATTEMPTS.
+ */
+export function requeue(id: string, detail?: string, opts: { refund?: boolean } = {}): boolean {
 	return (
 		stmt(
-			`UPDATE media SET status = 'queued', error_detail = COALESCE(?, error_detail), updated_at = ?
+			`UPDATE media SET status = 'queued', error_detail = COALESCE(?, error_detail),
+				attempts = CASE WHEN ? THEN MAX(attempts - 1, 0) ELSE attempts END, updated_at = ?
 			 WHERE id = ? AND status = 'processing'`
-		).run(detail ?? null, Date.now(), id).changes > 0
+		).run(detail ?? null, opts.refund ? 1 : 0, Date.now(), id).changes > 0
 	);
 }
 
 /**
- * failed → queued (or → received when it failed before detection) with attempts reset:
- * "Try again" / admin retry. Only while the source still exists (upload_token or archived
- * original). If the same bytes became live in the album meanwhile, the row becomes a
- * duplicate instead: its upload token is cleared (the .incoming sweep deletes that file) and an
- * archived original stays recorded (source_kept/source_ext) until purgeDuplicatesOlderThan()
- * hands the row to maintenance, which deletes it. Returns the new status, or null if it can't
- * be retried (including a trashed row).
+ * failed → queued with attempts reset: "Try again" / admin retry. An item that failed before it
+ * ever reached a lane (attempts = 0: intake refused it, e.g. too long, damaged or unrecognised)
+ * goes back to `received` instead, so intake detects and probes it again: the video caps apply
+ * again, and est_cost_s and duration_ms are set for the lane's order and time limit. Only while the
+ * source still exists (upload_token or archived original). If the same bytes became live in the
+ * album meanwhile, the row becomes a duplicate instead: its upload token is cleared (the
+ * .incoming sweep deletes that file) and an archived original stays recorded
+ * (source_kept/source_ext) until purgeDuplicatesOlderThan() hands the row to maintenance, which
+ * deletes it. Returns the new status, or null if it can't be retried (including a trashed row).
  */
 export function retry(id: string): Status | null {
 	return tx((): Status | null => {
@@ -658,7 +787,8 @@ export function retry(id: string): Status | null {
 				return 'duplicate';
 			}
 		}
-		const status: Status = row.kind ? 'queued' : 'received';
+		const backToIntake = !row.kind || (row.attempts === 0 && row.upload_token !== null);
+		const status: Status = backToIntake ? 'received' : 'queued';
 		const now = Date.now();
 		stmt(
 			`UPDATE media SET status = ?, attempts = 0, error_code = NULL, error_detail = NULL,
@@ -669,40 +799,115 @@ export function retry(id: string): Status | null {
 	});
 }
 
+// ---------------------------------------------------------------------------
+// Redo (admin "Redo them"): tracked in redo_* columns, never in `status`
+// ---------------------------------------------------------------------------
+
 /**
- * Admin "Reprocess": ready|failed → queued (attempts reset) for an item whose source was archived
- * (source_kept = 1), so the lane re-runs from originals/. The item is hidden from grids until it
- * is ready again; the lane overwrites library/ and cache/ files by atomic rename. Items without
- * an archived original can only have their derivatives rebuilt (not via this function).
- * Returns false when not eligible, including a failed item whose bytes are live in the album
- * again (re-queuing it would create a second live copy).
+ * Items a redo can start for: ready, not in the trash, with an archived original to redo from,
+ * and not already being redone. Shared by queueRedos(), countOutdated() and listOutdated(), so
+ * "Redo them" never finds nothing.
  */
-export function markForReprocess(id: string): boolean {
-	return tx(() => {
-		const row = getById(id);
-		if (!row || (row.status !== 'ready' && row.status !== 'failed')) return false;
-		if (row.status === 'failed' && row.source_sha256 && findDuplicate(row.album_id, row.source_sha256, id)) {
-			return false;
+const REDOABLE = `status = 'ready' AND source_kept = 1 AND source_ext IS NOT NULL AND kind IS NOT NULL
+	AND deleted_at IS NULL AND redo_state IS NULL`;
+
+/**
+ * Admin "Redo": queues a redo of a ready item from its archived original (originals/). The item
+ * stays ready and visible with its current file until the lane commits the new one
+ * (markRedone()); if the redo doesn't work, it stays exactly as it was (failRedo()). Returns false
+ * when not eligible (not ready, trashed, no archived original, or already being redone).
+ */
+export function markForReprocess(id: string, now: number = Date.now()): boolean {
+	return (
+		stmt(
+			`UPDATE media SET redo_state = 'queued', redo_queued_ms = ?, redo_attempts = 0, redo_error = NULL
+			 WHERE id = ? AND ${REDOABLE}`
+		).run(now, id).changes > 0
+	);
+}
+
+/** "Redo them": queues a redo of every item made by a pipeline older than `version`, in one statement. */
+export function queueRedos(version: number = PIPELINE_VERSION, now: number = Date.now()): number {
+	return stmt(
+		`UPDATE media SET redo_state = 'queued', redo_queued_ms = ?, redo_attempts = 0, redo_error = NULL
+		 WHERE ${REDOABLE} AND pipeline_version < ?`
+	).run(now, version).changes;
+}
+
+/** How many items queueRedos(version) would queue. */
+export function countOutdated(version: number = PIPELINE_VERSION): number {
+	return (stmt(`SELECT COUNT(*) AS n FROM media WHERE ${REDOABLE} AND pipeline_version < ?`).get(version) as { n: number }).n;
+}
+
+/** The items queueRedos(version) would queue, oldest first. */
+export function listOutdated(version: number = PIPELINE_VERSION): MediaRow[] {
+	return stmt(`SELECT * FROM media WHERE ${REDOABLE} AND pipeline_version < ? ORDER BY created_at ASC, id ASC`).all(
+		version
+	) as MediaRow[];
+}
+
+/**
+ * redo running → queued. A retryable failure (`refund` false) counts the attempt and goes to the
+ * back of the redo queue; a job a graceful shutdown cut short (`refund`) gets its attempt back and
+ * keeps its place.
+ */
+export function requeueRedo(id: string, opts: { refund?: boolean } = {}): boolean {
+	return (
+		stmt(
+			`UPDATE media SET redo_state = 'queued',
+				redo_attempts = CASE WHEN ? THEN MAX(redo_attempts - 1, 0) ELSE redo_attempts END,
+				redo_queued_ms = CASE WHEN ? THEN redo_queued_ms ELSE ? END
+			 WHERE id = ? AND redo_state = 'running'`
+		).run(opts.refund ? 1 : 0, opts.refund ? 1 : 0, Date.now(), id).changes > 0
+	);
+}
+
+/**
+ * A redo that didn't work: the redo ends with its reason (admin only). Nothing else changes: the
+ * item keeps its status, canonical file, pipeline_version and visibility, so it is still listed
+ * as outdated and "Redo them" can try again.
+ */
+export function failRedo(id: string, detail: string): boolean {
+	return (
+		stmt(
+			`UPDATE media SET redo_state = NULL, redo_queued_ms = NULL, redo_error = ?
+			 WHERE id = ? AND redo_state IS NOT NULL`
+		).run(detail.slice(0, 8000), id).changes > 0
+	);
+}
+
+export interface RedoSummary {
+	/** Waiting or in a lane. */
+	pending: number;
+	/** Not trashed items whose last redo didn't work (they still show their old version). */
+	problems: Pick<MediaRow, 'id' | 'kind' | 'source_name' | 'album_id' | 'redo_error'>[];
+	problemCount: number;
+}
+
+/** For the admin page: redos still to do, and the ones that didn't work (at most `limit`). */
+export function redoSummary(opts: { limit?: number } = {}): RedoSummary {
+	const pending = (stmt(`SELECT COUNT(*) AS n FROM media WHERE redo_state IS NOT NULL`).get() as { n: number }).n;
+	const problemCount = (
+		stmt(`SELECT COUNT(*) AS n FROM media WHERE redo_error IS NOT NULL AND redo_state IS NULL AND deleted_at IS NULL`).get() as {
+			n: number;
 		}
-		const now = Date.now();
-		return (
-			stmt(
-				`UPDATE media SET status = 'queued', attempts = 0, error_code = NULL, error_detail = NULL,
-					queued_ms = ?, updated_at = ?
-				 WHERE id = ? AND status IN ('ready','failed') AND source_kept = 1 AND source_ext IS NOT NULL
-				   AND kind IS NOT NULL AND deleted_at IS NULL`
-			).run(now, now, id).changes > 0
-		);
-	});
+	).n;
+	const problems = stmt(
+		`SELECT id, kind, source_name, album_id, redo_error FROM media
+		 WHERE redo_error IS NOT NULL AND redo_state IS NULL AND deleted_at IS NULL
+		 ORDER BY id DESC LIMIT ?`
+	).all(Math.max(1, Math.floor(opts.limit ?? 20))) as RedoSummary['problems'];
+	return { pending, problems, problemCount };
 }
 
 /**
  * Startup recovery: rows left in `processing` by a crash go back to `queued`, or to
- * failed/retryable once they've used MAX_ATTEMPTS.
+ * failed/retryable once they've used MAX_ATTEMPTS. Redos a lane was running go back to waiting,
+ * or end (failRedo, the item untouched) once they've used MAX_ATTEMPTS.
  */
 export function requeueInterrupted(maxAttempts: number = MAX_ATTEMPTS): { requeued: string[]; failed: string[] } {
 	return tx(() => {
-		const rows = stmt(`SELECT id, attempts FROM media WHERE status = 'processing'`).all() as {
+		const rows = stmt(`SELECT id, attempts FROM media WHERE ${IN_QUEUE} AND status = 'processing'`).all() as {
 			id: string;
 			attempts: number;
 		}[];
@@ -714,6 +919,19 @@ export function requeueInterrupted(maxAttempts: number = MAX_ATTEMPTS): { requeu
 				failed.push(r.id);
 			} else {
 				requeue(r.id, 'Interrupted by a restart; re-queued');
+				requeued.push(r.id);
+			}
+		}
+		const redos = stmt(`SELECT id, redo_attempts FROM media WHERE redo_state = 'running'`).all() as {
+			id: string;
+			redo_attempts: number;
+		}[];
+		for (const r of redos) {
+			if (r.redo_attempts >= maxAttempts) {
+				failRedo(r.id, `Interrupted ${r.redo_attempts} times (worker crash or restart)`);
+				failed.push(r.id);
+			} else {
+				requeueRedo(r.id);
 				requeued.push(r.id);
 			}
 		}
@@ -776,9 +994,13 @@ export function move(id: string, albumId: number): MoveResult {
 /** Moves an item (and its Live Photo video) to the trash. */
 export function softDelete(id: string, reason: string | null): boolean {
 	const now = Date.now();
+	// A redo still waiting is dropped (restoring the item leaves it outdated, to be redone again).
+	// One a lane is running finishes; the trash purge waits for it (repo/admin trashedBefore).
 	return (
 		stmt(
-			`UPDATE media SET deleted_at = ?, deleted_reason = ?, updated_at = ?
+			`UPDATE media SET deleted_at = ?, deleted_reason = ?, updated_at = ?,
+				redo_queued_ms = CASE WHEN redo_state = 'queued' THEN NULL ELSE redo_queued_ms END,
+				redo_state = CASE WHEN redo_state = 'queued' THEN NULL ELSE redo_state END
 			 WHERE (id = ? OR live_photo_of = ?) AND deleted_at IS NULL`
 		).run(now, reason, now, id, id).changes > 0
 	);
@@ -805,6 +1027,17 @@ export function restore(id: string): RestoreResult {
 		).run(Date.now(), id, id);
 		return { ok: true };
 	});
+}
+
+/**
+ * Every ready item (trashed ones too: the admin's trash shows their tiles), newest first. The queue
+ * looks for the ones whose previews are missing from cache/ and rebuilds them from library/
+ * (queue.queueMissingPreviews).
+ */
+export function listReadyForPreviews(): { id: string; kind: Kind }[] {
+	return stmt(
+		`SELECT id, kind FROM media WHERE status = 'ready' AND kind IS NOT NULL AND canonical_ext IS NOT NULL ORDER BY id DESC`
+	).all() as { id: string; kind: Kind }[];
 }
 
 /** Trashed items (not their hidden Live Photo videos), most recently trashed first. */
@@ -861,10 +1094,15 @@ export function storageTotals(): StorageTotals {
 }
 
 /** Items whose archived original exists (admin "Delete all archived originals"). */
-export function listKeptOriginals(): Pick<MediaRow, 'id' | 'source_ext' | 'source_size' | 'status'>[] {
+export function listKeptOriginals(): Pick<MediaRow, 'id' | 'source_ext' | 'source_size' | 'status' | 'redo_state'>[] {
 	return stmt(
-		`SELECT id, source_ext, source_size, status FROM media WHERE source_kept = 1`
-	).all() as Pick<MediaRow, 'id' | 'source_ext' | 'source_size' | 'status'>[];
+		`SELECT id, source_ext, source_size, status, redo_state FROM media WHERE source_kept = 1`
+	).all() as Pick<MediaRow, 'id' | 'source_ext' | 'source_size' | 'status' | 'redo_state'>[];
+}
+
+/** An archived original "Delete all archived originals" may delete: its item is ready and not being redone from it. */
+export function originalDeletable(row: Pick<MediaRow, 'status' | 'redo_state'>): boolean {
+	return row.status === 'ready' && row.redo_state === null;
 }
 
 /** After the archived original was deleted from disk. */

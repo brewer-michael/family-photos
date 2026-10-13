@@ -2,8 +2,10 @@
  * exiftool failing to copy metadata into a canonical file (docs/media-pipeline.md §2 "Other
  * decoders"): a failure a retry won't fix keeps the photo without the copied tags (the row already
  * has the date and place), except a RAW preview that needs the RAW's Orientation, which fails as
- * corrupt; only a transient failure (timeout, exiftool gone, disk) is retryable. The copy steps
- * are mocked to fail; everything else is the real lane.
+ * corrupt; only a transient failure (timeout, exiftool gone, disk) is retryable. The same holds
+ * for reading the source's metadata and extracting a RAW's preview: a transient failure is
+ * retryable instead of committing the photo without its date, place and Live Photo id. The
+ * exiftool steps are mocked to fail; everything else is the real lane.
  */
 import { execFileSync } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
@@ -20,13 +22,13 @@ import { MediaError } from '#lib/shared/errors';
 import { freshDb, testEnv } from '../helpers/env';
 import { OTHER_EXIF, PHOTO_FIXTURES } from '../helpers/photo-fixtures';
 import type { WorkerContext } from '../../src/worker/context';
-import { endExiftool } from '../../src/worker/exiftool';
+import { endExiftool, exiftool } from '../../src/worker/exiftool';
 import { processPhoto } from '../../src/worker/photo';
-import { copyExif, copyRawTags } from '../../src/worker/photo/metadata';
+import { copyExif, copyRawTags, readSourceTags } from '../../src/worker/photo/metadata';
 
 vi.mock('../../src/worker/photo/metadata', async (importOriginal) => {
 	const real = await importOriginal<typeof import('../../src/worker/photo/metadata')>();
-	return { ...real, copyExif: vi.fn(real.copyExif), copyRawTags: vi.fn(real.copyRawTags) };
+	return { ...real, copyExif: vi.fn(real.copyExif), copyRawTags: vi.fn(real.copyRawTags), readSourceTags: vi.fn(real.readSourceTags) };
 });
 
 /** What exiftool-vendored rejects with when exiftool refuses a file's tags. */
@@ -45,6 +47,8 @@ beforeAll(() => {
 afterEach(() => {
 	vi.mocked(copyExif).mockClear();
 	vi.mocked(copyRawTags).mockClear();
+	vi.mocked(readSourceTags).mockClear();
+	vi.restoreAllMocks();
 });
 
 afterAll(async () => {
@@ -146,5 +150,41 @@ describe('RAW (tags copied into the preview)', () => {
 		vi.mocked(copyRawTags).mockRejectedValueOnce(Object.assign(new Error('spawn /usr/bin/exiftool ENOENT'), { code: 'ENOENT' }));
 		const e = await failure(await enqueue(path.join(PHOTO_FIXTURES, 'preview.dng')));
 		expect(e.code).toBe('retryable');
+	});
+});
+
+describe('reading the source (before anything is converted)', () => {
+	it('is retryable when exiftool times out, so the photo keeps its date, place and Live Photo id', async () => {
+		vi.mocked(readSourceTags).mockRejectedValueOnce(TIMEOUT);
+		const id = await enqueue(path.join(PHOTO_FIXTURES, 'o6.heic'));
+		const e = await failure(id);
+		expect(e.code).toBe('retryable');
+		expect(e.detail).toMatch(/metadata.*timeout/);
+		// The next attempt reads the tags.
+		await processPhoto(id, context());
+		expect(media.getById(id)).toMatchObject({ status: 'ready', taken_at: '2024-07-04T11:22:31-07:00', gps_lat: 37.3349 });
+	});
+
+	it('is retryable when exiftool is gone', async () => {
+		vi.mocked(readSourceTags).mockRejectedValueOnce(new Error('BatchCluster has ended, cannot enqueue -G1 -n'));
+		const e = await failure(await enqueue(path.join(PHOTO_FIXTURES, 'o1.jpg')));
+		expect(e.code).toBe('retryable');
+	});
+
+	it('goes on without the tags when exiftool refuses this file', async () => {
+		vi.mocked(readSourceTags).mockRejectedValueOnce(REFUSED);
+		const id = await enqueue(path.join(PHOTO_FIXTURES, 'o1.jpg'));
+		await processPhoto(id, context());
+		const row = media.getById(id)!;
+		expect(row).toMatchObject({ status: 'ready', taken_at: null, gps_lat: null });
+		expect(row.taken_ms).toBe(row.created_at);
+		expect(warnings()).toEqual([expect.stringMatching(/^WARN exiftool could not read .*Bad format/)]);
+	});
+
+	it("is retryable when exiftool times out extracting a RAW's preview (not 'no preview')", async () => {
+		vi.spyOn(exiftool(), 'extractJpgFromRaw').mockRejectedValueOnce(TIMEOUT);
+		const e = await failure(await enqueue(path.join(PHOTO_FIXTURES, 'preview.dng')));
+		expect(e.code).toBe('retryable');
+		expect(e.detail).toMatch(/JpgFromRaw.*timeout/);
 	});
 });

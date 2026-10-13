@@ -4,6 +4,8 @@
 	screen is kept awake); then each tile follows the server ("Getting it ready…", "✓ Added", …).
 	With `clearOnDone` (a page that lists unfinished uploads itself), a finished batch collapses to
 	one line ("Done! 3 added.") and only tiles the page can't show stay (not sent, not a photo).
+	A dropped connection shows "Waiting for the internet…" and carries on by itself; "Done!" is only
+	said when nothing is left unsent ("2 didn't send yet." + "Try all again" otherwise).
 	Copy never mentions file formats. State lives in #lib/client/uploader.svelte.
 -->
 <script lang="ts">
@@ -13,12 +15,15 @@
 	import Icon from './Icon.svelte';
 	import { BASE_ACCEPT, acceptFor, isIOS } from '#lib/media/allowlist';
 	import { statusLine, type StatusLine } from '#lib/client/status';
-	import { NOT_MEDIA_TEXT, UploadBatch, summaryText, type UploadItem } from '#lib/client/uploader.svelte';
+	import { NOT_MEDIA_TEXT, SEND_FAILED_TEXT, UploadBatch, summaryText, type UploadItem } from '#lib/client/uploader.svelte';
 
 	interface Props {
 		albumId: number;
-		/** Called when every file in the current batch has finished (ready, duplicate or failed). */
-		ondone?: () => void;
+		/**
+		 * Called when every file in the current batch has finished (ready, duplicate or failed), with
+		 * how many didn't send (0 when everything went).
+		 */
+		ondone?: (result: { unsent: number }) => void;
 		/**
 		 * After `ondone`, collapse the sent files to a one-line summary, because the page shows them
 		 * itself (e.g. failed ones in its own list). Default false: the tiles stay.
@@ -28,7 +33,7 @@
 
 	let { albumId, ondone, clearOnDone = false }: Props = $props();
 
-	const batch = new UploadBatch({ albumId: () => albumId, ondone: () => ondone?.(), clearOnDone: () => clearOnDone });
+	const batch = new UploadBatch({ albumId: () => albumId, ondone: (r) => ondone?.(r), clearOnDone: () => clearOnDone });
 	const adminName = $derived(typeof page.data.adminName === 'string' ? page.data.adminName : 'the site admin');
 
 	let input = $state<HTMLInputElement>();
@@ -51,7 +56,8 @@
 		}
 	});
 
-	function choose() {
+	/** Opens the picker. Exported so a page's own "Add photos & videos" button can open it in one tap. */
+	export function choose() {
 		batch.picking();
 		input?.click();
 	}
@@ -71,6 +77,7 @@
 			case 'waiting':
 				return { text: 'Waiting to send…', tone: 'waiting' };
 			case 'sending':
+				if (item.offline) return { text: 'Waiting for the internet…', tone: 'waiting' };
 				return { text: `Sending… ${item.file.size > 0 ? Math.floor((100 * item.sent) / item.file.size) : 0}%`, tone: 'busy' };
 			case 'skipped':
 				return { text: item.problem ?? NOT_MEDIA_TEXT, tone: 'error' };
@@ -112,14 +119,25 @@
 		return parts.length > 0 ? `${parts.join(' · ')}.` : 'All sent.';
 	});
 
+	/** Files that didn't send: never "Done!" while there are any. */
+	const unsentText = $derived(batch.unsent === 1 && batch.toSend.length === 1 ? "It didn't send yet." : `${batch.unsent} didn't send yet.`);
+	/** A dropped connection, or the server's own reason on each tile (no room, album gone, …). */
+	const unsentHint = $derived(
+		batch.items.every((i) => i.stage !== 'error' || i.problem === SEND_FAILED_TEXT)
+			? 'Check your connection, then press Try again.'
+			: 'See why below.'
+	);
+
 	const announcement = $derived(
 		batch.sending
-			? `Sending ${batch.current} of ${batch.toSend.length}.`
-			: batch.summary
-				? summaryText(batch.summary)
-				: batch.toSend.length > 0
-					? `Done! ${finishedText}`
-					: ''
+			? `Sending ${batch.current} of ${batch.toSend.length}.${batch.offline ? ' Waiting for the internet.' : ''}`
+			: batch.unsent > 0
+				? `${unsentText} ${unsentHint}`
+				: batch.summary
+					? summaryText(batch.summary)
+					: batch.toSend.length > 0
+						? `Done! ${finishedText}`
+						: ''
 	);
 </script>
 
@@ -156,7 +174,19 @@
 		<div>
 			<p class="headline">Sending {batch.current} of {batch.toSend.length}…</p>
 			<progress class="bar" max={batch.bytesTotal || 1} value={batch.bytesSent} aria-label="Sent so far"></progress>
+			{#if batch.offline}
+				<p class="offline">Waiting for the internet… It carries on by itself when it's back.</p>
+			{/if}
 			<p class="keep"><Icon name="phone" /> Keep this screen open until it says Done.</p>
+		</div>
+	{:else if batch.unsent > 0}
+		<div>
+			<p class="headline unsent"><Icon name="retry" /> {unsentText}</p>
+			<p class="keep">{unsentHint}</p>
+			{#if batch.summary}<p class="keep">{summaryText(batch.summary)}</p>{/if}
+			{#if batch.unsent > 1}
+				<button type="button" class="btn retry-all" onclick={() => batch.retryAll()}><Icon name="retry" /> Try all again</button>
+			{/if}
 		</div>
 	{:else if batch.summary}
 		<p class="headline summary" class:ok={batch.summary.failed === 0}>
@@ -227,6 +257,19 @@
 	}
 	.headline.summary {
 		margin: 0;
+	}
+	.headline.unsent {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		color: var(--danger);
+	}
+	.offline {
+		margin: 0.5rem 0 0;
+		font-weight: 700;
+	}
+	.retry-all {
+		margin-top: 0.75rem;
 	}
 	.keep {
 		display: flex;

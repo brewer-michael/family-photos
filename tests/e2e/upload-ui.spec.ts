@@ -1,9 +1,10 @@
 /**
  * The Uploader in a real browser: the picker's accept attribute per platform, instant tiles,
- * "Sending 1 of 1…", skipping non-media, and a small JPEG going all the way to a finished tile.
+ * "Sending 1 of 1…", skipping non-media, a small JPEG going all the way to a finished tile, and a
+ * connection that drops mid-upload (no "Done!" until everything is sent; it carries on by itself).
  */
 import AxeBuilder from '@axe-core/playwright';
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type Route } from '@playwright/test';
 import sharp from 'sharp';
 import { login } from './helpers';
 import { readRows, seedAlbum } from './seed';
@@ -13,8 +14,8 @@ type AxePage = ConstructorParameters<typeof AxeBuilder>[0]['page'];
 /** What a tile may end on: added; or, while the photo lane is unavailable, a failure the admin hears about. */
 const FINISHED = /✓ Added|We couldn't add this one\. Michael has been told\.|This one didn't work\./;
 
-async function jpeg(): Promise<Buffer> {
-	return sharp({ create: { width: 320, height: 240, channels: 3, background: '#3b7dc9' } })
+async function jpeg(background = '#3b7dc9'): Promise<Buffer> {
+	return sharp({ create: { width: 320, height: 240, channels: 3, background } })
 		.jpeg({ quality: 85 })
 		.toBuffer();
 }
@@ -96,7 +97,7 @@ test('picking the same photo again says it is already in the album', async ({ pa
 	const bytes = await jpeg();
 	await pick(page, [{ name: 'IMG_0001.JPG', mimeType: 'image/jpeg', buffer: bytes }]);
 	// The album page uses clearOnDone: a finished batch collapses to one summary line, and the photo
-	// moves to the grid (or, if it failed, to the page's own "Still on their way" list).
+	// moves to the grid (or, if it failed, to the page's own "These didn't work" list).
 	const uploader = page.locator('.uploader');
 	const tiles = uploader.getByRole('list', { name: 'Your photos and videos' }).getByRole('listitem');
 	await expect(uploader.locator('.summary')).toContainText(/Done! 1 added\.|1 couldn't be added/, { timeout: 45_000 });
@@ -111,4 +112,52 @@ test('picking the same photo again says it is already in the album', async ({ pa
 	await expect(uploader.locator('.summary')).toHaveText('Done! 1 already in this album.', { timeout: 30_000 });
 	await expect(tiles).toHaveCount(0);
 	await expect(page.locator('a[href^="/view/"]')).toHaveCount(1);
+});
+
+test('a dropped connection waits for the internet and carries on, with no "Done!" until all are sent', async ({ page, context }, testInfo) => {
+	test.skip(testInfo.project.name !== 'mobile', 'one browser is enough');
+	test.setTimeout(120_000);
+	await page.setExtraHTTPHeaders({ 'x-real-ip': '198.51.100.74' });
+	await login(page, 'Aunt Linda');
+	const album = seedAlbum('Offline for a bit');
+	await page.goto(`/add?album=${album}`);
+
+	// The first two files' bytes are held back, then cut off when the phone loses its connection.
+	const held: Route[] = [];
+	let cutOff = false;
+	await page.route('**/api/upload/**', async (route) => {
+		if (route.request().method() !== 'PATCH' || cutOff) return route.continue();
+		held.push(route); // answered below
+	});
+
+	await pick(page, [
+		{ name: 'IMG_0201.JPG', mimeType: 'image/jpeg', buffer: await jpeg('#c93b3b') },
+		{ name: 'IMG_0202.JPG', mimeType: 'image/jpeg', buffer: await jpeg('#3bc96a') },
+		{ name: 'IMG_0203.JPG', mimeType: 'image/jpeg', buffer: await jpeg('#c9b23b') }
+	]);
+	await expect.poll(() => held.length).toBe(2);
+	await context.setOffline(true);
+	cutOff = true;
+	for (const route of held) await route.abort('internetdisconnected');
+
+	const tiles = page.getByRole('list', { name: 'Your photos and videos' }).getByRole('listitem');
+	await expect(tiles.filter({ hasText: 'Waiting for the internet…' })).toHaveCount(2);
+	await expect(page.getByText(/Waiting for the internet… It carries on by itself/)).toBeVisible();
+	// Offline for a while: still sending, never "Done!" or "didn't send".
+	for (let i = 0; i < 4; i++) {
+		await expect(page.getByText(/Sending \d of 3…/)).toBeVisible();
+		await expect(page.getByText('Done!', { exact: true })).toHaveCount(0);
+		await expect(page.getByText(/Everything is sent|didn't send/)).toHaveCount(0);
+		await expect(page.getByRole('link', { name: /Done! See them/ })).toHaveCount(0);
+		await page.waitForTimeout(2500);
+	}
+
+	await context.setOffline(false);
+	for (const name of ['IMG_0201', 'IMG_0202', 'IMG_0203']) {
+		await expect(tiles.filter({ hasText: name })).toContainText(FINISHED, { timeout: 90_000 });
+	}
+	await expect(page.getByText('Done!', { exact: true })).toBeVisible();
+	await expect(page.getByRole('link', { name: 'Done! See them' })).toBeVisible();
+	const rows = readRows<{ source_name: string }>('SELECT source_name FROM media WHERE album_id = ? ORDER BY source_name', album);
+	expect(rows.map((r) => r.source_name)).toEqual(['IMG_0201.JPG', 'IMG_0202.JPG', 'IMG_0203.JPG']);
 });

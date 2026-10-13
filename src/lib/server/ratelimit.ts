@@ -343,6 +343,12 @@ export function clientIp(event: ClientEvent, trustedProxies?: readonly string[])
  * someone got in (on /name), so strangers flooding wrong guesses can't lock out the family's
  * phones. Known devices still share a global ceiling of their own: anyone with the family code
  * can mint new device ids, and that must not open an unlimited guess at the admin password.
+ *
+ * A known device's IP keys are counted apart from strangers' (`known:` prefix). Which forwarding
+ * header a proxy overwrites depends on the setup, so a stranger can put any IP in the other one
+ * and have their failures recorded against it; with shared keys, ten wrong guesses carrying a
+ * family member's IP would lock that person's signed-in phone out even with the right password.
+ * Strangers still can't escape their own limit, and known devices are still limited per IP.
  */
 export function signInSubject(
 	event: ClientEvent & { cookies: Cookies },
@@ -350,5 +356,7 @@ export function signInSubject(
 ): RateLimitSubject {
 	const keys = clientKeys(event, trustedProxies);
 	const device = readDevice(event.cookies);
-	return device ? { keys: [...keys, `device:${device.d}`], knownDevice: true } : { keys, knownDevice: false };
+	return device
+		? { keys: [...keys.map((k) => `known:${k}`), `device:${device.d}`], knownDevice: true }
+		: { keys, knownDevice: false };
 }

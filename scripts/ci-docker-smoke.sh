@@ -1,7 +1,7 @@
 #!/bin/sh
-# Smoke test for a built image (.github/workflows/docker.yml): starts it the way the Unraid template
-# does (required settings, empty /config and /photos, PUID 99 / PGID 100, cpu-shares and memory
-# limits, TZ) and checks that it
+# Smoke test for a built image (the image job in .github/workflows/ci.yml): starts it the way the
+# Unraid template does (required settings, empty /config and /photos, PUID 99 / PGID 100, cpu-shares
+# and memory limits, TZ) and checks that it
 #   - becomes healthy (the image's HEALTHCHECK) and answers /healthz and the sign-in page,
 #   - writes its data as 99:100 and gives /photos' top-level folders to 99:100,
 #   - can start both media worker lanes as 99:100 (scripts/smoke-worker.mjs),

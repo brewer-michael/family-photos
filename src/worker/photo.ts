@@ -1,7 +1,9 @@
 /**
  * Photo lane job (docs/media-pipeline.md §1 photo rows and §2): detect from bytes → read the
- * source's metadata → build the one canonical JPEG/PNG/GIF, or keep the source bytes → verify →
- * derivatives → fsync → rename into library/ → media.markReady → archive or delete the source.
+ * source's metadata → build the one canonical JPEG/PNG/GIF, or keep the source bytes (a hard link
+ * or copy of the source in .work/) → verify → derivatives → fsync → rename into library/ →
+ * media.markReady → archive or delete the source → release the upload token (./settle.ts). The
+ * source is never moved before the commit is on disk.
  *
  * Routes by detected subtype:
  *   jpeg       RGB/grey → the source bytes ('none'); CMYK/YCCK → sRGB JPEG
@@ -50,6 +52,8 @@ import {
 } from './photo/metadata';
 import { RAW_FILE_TYPES, rawPreview } from './photo/raw';
 import { ffmpegImageTools, heifTools, photoToolProblems } from './photo/tools';
+import { fsyncPath, linkSource, locateSource, settleSource } from './settle';
+import { keepLive, undoInstall } from './redo';
 
 /** sharp's default limitInputPixels (0x3FFF²): larger photos fail as too_large. */
 const MAX_PIXELS = 268_402_689;
@@ -88,7 +92,9 @@ async function logTools(ctx: WorkerContext): Promise<void> {
 export async function processPhoto(id: string, ctx: WorkerContext): Promise<void> {
 	const row = media.getById(id);
 	if (!row) throw new MediaError('unsupported', `media ${id} not found`);
-	const src = media.sourcePath(row);
+	/** Admin "Redo them": the item stays ready and keeps its live file until markRedone() commits. */
+	const redo = media.isRedo(row);
+	const src = await locateSource(row);
 	if (!src) throw new MediaError('corrupt', 'the uploaded file is gone');
 	let sizeBytes: number;
 	try {
@@ -115,8 +121,9 @@ export async function processPhoto(id: string, ctx: WorkerContext): Promise<void
 		await derivatives(job, canon, derivs);
 		if (ctx.signal.aborted) throw new MediaError('retryable', 'cancelled');
 
-		// Commit: derivatives into the cache, then the canonical file into library/ and the row, so
-		// nothing but the database stands between a moved passthrough source and its commit.
+		// Commit: derivatives into the cache, then the canonical file (for a passthrough, a second
+		// name for the source's bytes) into library/ and the row. The source stays where the row
+		// says until the commit is on disk.
 		await fs.mkdir(ctx.paths.cacheDir(id), { recursive: true });
 		await fs.rename(derivs.display, ctx.paths.cacheFile(id, 'display'));
 		await fs.rename(derivs.thumb, ctx.paths.cacheFile(id, 'thumb'));
@@ -124,13 +131,15 @@ export async function processPhoto(id: string, ctx: WorkerContext): Promise<void
 		await fsyncPath(canon.file);
 		const canonicalSize = (await fs.stat(canon.file)).size;
 		await fs.mkdir(path.dirname(dest), { recursive: true });
+		// A redo replaces the live file: keep it until the row says otherwise (./redo.ts).
+		const live = redo ? await keepLive(dest, work) : null;
 		await fs.rename(canon.file, dest);
 		const keep = canon.conversion === 'transcode' && ctx.config.keepOriginals;
 		const sourceExt = row.source_ext ?? det.ext;
 		let committed = false;
 		try {
 			await fsyncPath(path.dirname(dest));
-			committed = media.markReady(id, {
+			committed = (redo ? media.markRedone : media.markReady)(id, {
 				conversion: canon.conversion,
 				canonicalExt: canon.ext,
 				canonicalSize,
@@ -146,25 +155,31 @@ export async function processPhoto(id: string, ctx: WorkerContext): Promise<void
 				sourceExt
 			});
 		} finally {
-			// Not committed: put a passthrough source back where the row expects it, or drop our output.
-			if (!committed) await fs.rename(dest, canon.conversion === 'none' ? src : canon.file).catch(() => undefined);
+			// Not committed: no row describes the file just installed (the source is untouched); a
+			// redo's live file goes back.
+			if (!committed) await undoInstall(dest, live).catch(() => undefined);
 		}
-		if (!committed) throw new MediaError('retryable', `media ${id} is no longer processing; not committed`);
+		if (!committed) throw new MediaError('retryable', `media ${id} is no longer ${redo ? 'being redone' : 'processing'}; not committed`);
 		ctx.log.info(`photo ${id}: ${det.subtype} → ${canon.ext} (${canon.conversion}) ${shown.width}×${shown.height} in ${Date.now() - started} ms`);
-		// Committed: nothing below may fail the item (src/worker/README.md).
-		await settleSource(job, canon, keep, sourceExt, row.canonical_ext).catch((e: unknown) => {
-			ctx.log.error(`photo ${id}: could not settle the source`, { error: errorDetail(e, 500) });
-		});
+		// Committed: nothing below may fail the item (src/worker/README.md). A passthrough source is
+		// deleted (library/ holds its bytes); a transcode's is archived (KEEP_ORIGINALS) or deleted.
+		await settleSource(id, src, keep, sourceExt, ctx.log, `photo ${id}`);
+		await dropPreviousLibraryFile(id, canon.ext, row.canonical_ext, ctx);
 	} finally {
 		await Promise.all([tmp, work].map((d) => fs.rm(d, { recursive: true, force: true }).catch(() => undefined)));
 	}
 }
 
-/** exiftool on the source; unreadable metadata is not fatal (the date falls back). */
+/**
+ * exiftool on the source. Metadata exiftool can't read in this file is not fatal (the date falls
+ * back); a transient failure (timeout, exiftool gone, disk) is retryable, because committing
+ * without the tags would lose the date, place and Live Photo id of a ready item for good.
+ */
 async function sourceTags(src: string, ctx: WorkerContext): Promise<SourceTags> {
 	try {
 		return await readSourceTags(src);
 	} catch (e) {
+		if (exiftoolTransient(e)) throw new MediaError('retryable', `exiftool could not read the source's metadata: ${errorDetail(e, 500)}`);
 		ctx.log.warn(`exiftool could not read ${src}`, { error: errorDetail(e, 300) });
 		return {};
 	}
@@ -187,7 +202,7 @@ const transcode = (e: Encoded): Canonical => ({ ...e, conversion: 'transcode' })
 
 async function buildCanonical(job: Job): Promise<Canonical> {
 	const { src, det, outBase } = job;
-	const passthrough = (ext: Canonical['ext']): Canonical => ({ file: src, ext, conversion: 'none' });
+	const passthrough = async (ext: Canonical['ext']): Promise<Canonical> => ({ file: await linkSource(src, `${outBase}.${ext}`), ext, conversion: 'none' });
 	switch (det.subtype) {
 		case 'jpeg':
 			if ((await probe(src)).space !== 'cmyk') return passthrough('jpg');
@@ -310,46 +325,12 @@ async function derivatives(job: Job, canon: Canonical, out: { display: string; t
 	}
 }
 
-async function fsyncPath(p: string): Promise<void> {
-	const fh = await fs.open(p, 'r');
+/** A reprocessed item whose canonical extension changed loses its old library file (never throws). */
+async function dropPreviousLibraryFile(id: string, ext: string, previousExt: string | null, ctx: WorkerContext): Promise<void> {
+	if (!previousExt || previousExt === ext) return;
 	try {
-		await fh.sync();
-	} finally {
-		await fh.close();
-	}
-}
-
-/**
- * After the commit (never throws; every failure is logged): a transcode's source is archived in
- * originals/ (KEEP_ORIGINALS) or deleted; a passthrough source already became the canonical file.
- * A reprocessed item whose canonical extension changed loses its old library file.
- */
-async function settleSource(job: Job, canon: Canonical, keep: boolean, sourceExt: string, previousExt: string | null): Promise<void> {
-	const { id, src, ctx } = job;
-	if (canon.conversion === 'transcode') {
-		try {
-			if (!keep) await fs.rm(src, { force: true });
-			else {
-				const archived = ctx.paths.originalsPath(id, sourceExt);
-				if (src !== archived) {
-					await fs.mkdir(path.dirname(archived), { recursive: true });
-					await fs.rename(src, archived);
-				}
-			}
-		} catch (e) {
-			ctx.log.error(`photo ${id}: could not ${keep ? 'archive' : 'delete'} the source`, { error: errorDetail(e, 500) });
-			try {
-				if (keep) media.markOriginalDeleted(id);
-			} catch (e2) {
-				ctx.log.error(`photo ${id}: could not record the missing original`, { error: errorDetail(e2, 500) });
-			}
-		}
-	}
-	if (previousExt && previousExt !== canon.ext) {
-		try {
-			await fs.rm(ctx.paths.libraryPath(id, previousExt), { force: true });
-		} catch (e) {
-			ctx.log.warn(`photo ${id}: could not remove the old .${previousExt} library file`, { error: errorDetail(e, 500) });
-		}
+		await fs.rm(ctx.paths.libraryPath(id, previousExt), { force: true });
+	} catch (e) {
+		ctx.log.warn(`photo ${id}: could not remove the old .${previousExt} library file`, { error: errorDetail(e, 500) });
 	}
 }

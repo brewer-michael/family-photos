@@ -16,10 +16,7 @@ export const load: PageServerLoad = ({ locals, url }) => {
 export const actions: Actions = {
 	default: async (event) => {
 		const { request, cookies, url, locals } = event;
-		const form = await request.formData();
-		const next = safeNext(String(form.get('next') ?? ''));
-		const code = String(form.get('code') ?? '');
-
+		// The limit first: a limited client's body isn't even read.
 		const keys = signInSubject(event);
 		const limit = loginLimiter.check(keys);
 		if (limit.limited) {
@@ -29,6 +26,9 @@ export const actions: Actions = {
 				message: `Too many tries. Please wait ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} and try again.`
 			});
 		}
+		const form = await request.formData();
+		const next = safeNext(String(form.get('next') ?? ''));
+		const code = String(form.get('code') ?? '');
 		if (code.trim() === '') {
 			return fail(400, { limited: false, message: 'Please type the family code.' });
 		}
@@ -36,7 +36,10 @@ export const actions: Actions = {
 			loginLimiter.fail(keys);
 			return fail(400, {
 				limited: false,
-				message: "That code didn't work. Check the spelling and try again."
+				message: "That code didn't work. Check the spelling and try again.",
+				// Shown again so a typo can be fixed, not retyped (it's the shared family code, in a
+				// plain text field anyway; long input is cut so the page stays small).
+				code: code.slice(0, 200)
 			});
 		}
 		loginLimiter.clear(keys);

@@ -4,14 +4,24 @@
  *
  * One child process per lane, at a lower CPU priority than the web process:
  *   nice -n 10|15 node --max-old-space-size=512 <WORKER_ENTRY> --lane=photo|video
- *   stdio ['ignore','inherit','inherit','ipc'], UV_THREADPOOL_SIZE=4
+ *   stdio ['ignore','inherit','inherit','ipc'], UV_THREADPOOL_SIZE=4, and the environment without
+ *   FAMILY_PASSWORD/ADMIN_PASSWORD/SMTP_PASS (config.ts SECRET_ENV): lanes parse untrusted bytes
  * Each lane runs one job at a time: media.nextQueued(lane) → media.claimForProcessing() (processing,
  * attempts++) → {type:'job'}. Photos go first in, first out; videos cheapest-first with ageing.
+ * Only when no upload waits does a lane take an admin redo: media.nextRedo(lane) →
+ * media.claimRedo() (the row stays `ready`; redo_attempts++). Only when no redo waits either does
+ * it rebuild missing previews (queueMissingPreviews(): at every start and from the admin page): a
+ * `job` with task 'previews' that rebuilds cache/ from library/ and never changes the row, so its
+ * outcome is only logged.
  *
- * Outcomes. The worker commits success itself (markReady); `done` ready/duplicate needs nothing
- * here. `done` failed, a crash, or a kill (timeout/stall) is a failure: retryable with attempts left
- * → media.requeue(), otherwise media.markFailed(). Both leave a `ready` row alone, so a job that
- * committed and then failed is still a success.
+ * Outcomes. The worker commits success itself (markReady, or markRedone for a redo); `done`
+ * ready/duplicate needs nothing here. `done` failed, a crash, or a kill (timeout/stall) is a
+ * failure: retryable with attempts left → media.requeue(), otherwise media.markFailed(). Both leave
+ * a `ready` row alone, so a job that committed and then failed is still a success. A failed redo
+ * only ever touches the redo (media.requeueRedo / media.failRedo), never the item.
+ *
+ * Shutdown. A job a graceful shutdown cuts short is re-queued with its attempt given back
+ * (requeue/requeueRedo `refund`), so container restarts never use up MAX_ATTEMPTS.
  *
  * Limits. Photo jobs get 300 s (600 s when the source is over 40 MB); video jobs 120 s + 30 s per
  * second of video, and are also stopped when no progress message arrived for 180 s. An overrun
@@ -24,12 +34,12 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { getConfig } from './config';
-import { configRoot, tmpRoot, workRoot } from './paths';
+import { envWithoutSecrets, getConfig } from './config';
+import { cacheFile, cacheRoot, configRoot, tmpRoot, workRoot } from './paths';
 import * as media from './repo/media';
 import { runSelfCheck } from './selfcheck';
 import { JOB_MIN_FREE_BYTES, formatBytes, freeBytesSync } from './disk';
-import { MAX_ATTEMPTS, type ErrorCode } from '#lib/shared/media-types';
+import { MAX_ATTEMPTS, type ErrorCode, type Kind } from '#lib/shared/media-types';
 import { LANES, isWorkerToMain, type Lane, type MainToWorker, type WorkerToMain } from '#lib/shared/worker-protocol';
 import { errorDetail } from '#lib/shared/errors';
 
@@ -81,6 +91,10 @@ const NICE_BIN = ['/usr/bin/nice', '/bin/nice'].find((p) => fs.existsSync(p)) ??
 
 interface RunningJob {
 	id: string;
+	/** An admin redo of a ready item (media.claimRedo), not a first conversion. */
+	redo: boolean;
+	/** Rebuilding a ready item's previews from library/ (startPreviews): the row is never changed. */
+	previews?: boolean;
 	startedAt: number;
 	hardTimer: NodeJS.Timeout;
 	stallTimer: NodeJS.Timeout | null;
@@ -146,7 +160,8 @@ function spawnLane(l: LaneState): void {
 	const niceness = NICENESS[l.lane];
 	const child = spawn(NICE_BIN ?? process.execPath, NICE_BIN ? ['-n', String(niceness), process.execPath, ...nodeArgs] : nodeArgs, {
 		stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
-		env: { ...process.env, UV_THREADPOOL_SIZE: '4' }
+		// No secrets: the lane and every decoder it runs parse untrusted bytes (config.ts SECRET_ENV).
+		env: { ...envWithoutSecrets(), UV_THREADPOOL_SIZE: '4' }
 	});
 	if (!NICE_BIN && child.pid !== undefined) {
 		try {
@@ -223,10 +238,12 @@ function handleMessage(l: LaneState, m: WorkerToMain): void {
 			try {
 				const code = m.outcome === 'failed' ? (m.errorCode ?? 'retryable') : null;
 				// A lane being shut down aborts its job and answers `failed`/retryable: like a job cut
-				// short by the exit itself (onExit), it goes back in the queue and doesn't count as a failure.
-				if (stopping && code === 'retryable') media.requeue(m.id, 'Interrupted by a shutdown; re-queued');
-				else if (code) recordFailure(m.id, code, m.detail || 'failed without details');
-				else console.log(`[queue] ${m.id} ${m.outcome} (${l.lane}, ${secs(Date.now() - job.startedAt)})`);
+				// short by the exit itself (onExit), it goes back in the queue and the claim's attempt is
+				// given back, so restarts never use up MAX_ATTEMPTS.
+				if (stopping && code === 'retryable') requeueAfterShutdown(job);
+				else if (code) recordFailure(job, code, m.detail || 'failed without details');
+				else if (job.previews) previewsFinished(null);
+				else console.log(`[queue] ${m.id} ${job.redo ? 'redone' : m.outcome} (${l.lane}, ${secs(Date.now() - job.startedAt)})`);
 			} finally {
 				dispatch(l);
 			}
@@ -247,8 +264,8 @@ function onExit(l: LaneState, child: ChildProcess, how: string): void {
 	if (job) {
 		endJob(l);
 		try {
-			if (stopping) media.requeue(job.id, 'Interrupted by a shutdown; re-queued');
-			else recordFailure(job.id, 'retryable', reason ?? `the ${l.lane} worker stopped (${how}) while working on it`);
+			if (stopping) requeueAfterShutdown(job);
+			else recordFailure(job, 'retryable', reason ?? `the ${l.lane} worker stopped (${how}) while working on it`);
 		} catch (e) {
 			console.error(`[queue] could not record the outcome of ${job.id}:`, errorDetail(e, 500));
 		}
@@ -265,11 +282,34 @@ function onExit(l: LaneState, child: ChildProcess, how: string): void {
 // Jobs
 // ---------------------------------------------------------------------------
 
-/** retryable with attempts left → back in the queue; otherwise failed. A `ready` row is left alone. */
-function recordFailure(id: string, code: ErrorCode, detail: string): void {
+/** A job a graceful shutdown cut short: back in the queue with its attempt given back. */
+function requeueAfterShutdown(job: RunningJob): void {
+	if (job.previews) return; // the next start looks for missing previews again
+	aheadCache = null;
+	if (job.redo) media.requeueRedo(job.id, { refund: true });
+	else media.requeue(job.id, 'Interrupted by a shutdown; re-queued', { refund: true });
+}
+
+/**
+ * retryable with attempts left → back in the queue; otherwise failed. A `ready` row is left alone.
+ * A redo that fails never touches the item: it waits for another try, or ends with its reason
+ * (media.failRedo) while the item keeps its old file and stays visible.
+ */
+function recordFailure(job: RunningJob, code: ErrorCode, detail: string): void {
+	const { id } = job;
+	if (job.previews) return previewsFinished(`${id}: ${code}: ${detail}`);
 	const row = media.getById(id);
 	if (!row) return;
 	aheadCache = null;
+	if (job.redo) {
+		if (code === 'retryable' && row.redo_attempts < MAX_ATTEMPTS) {
+			if (media.requeueRedo(id)) console.warn(`[queue] redo of ${id} will be tried again (attempt ${row.redo_attempts} of ${MAX_ATTEMPTS} failed): ${detail}`);
+			return;
+		}
+		const final = code === 'retryable' ? `Gave up after ${row.redo_attempts} attempts. Last error: ${detail}` : `${code}: ${detail}`;
+		if (media.failRedo(id, final)) console.error(`[queue] redo of ${id} (${row.source_name}) didn't work; it keeps its current version: ${final}`);
+		return;
+	}
 	if (code === 'retryable' && row.attempts < MAX_ATTEMPTS) {
 		if (media.requeue(id, detail)) console.warn(`[queue] ${id} will be tried again (attempt ${row.attempts} of ${MAX_ATTEMPTS} failed): ${detail}`);
 		return;
@@ -291,10 +331,11 @@ function armStall(l: LaneState): void {
 	job.stallTimer = later(() => kill(l, `no progress for ${secs(timings.stallMs)}`), timings.stallMs);
 }
 
-function startJob(l: LaneState, row: media.MediaRow): void {
+function startJob(l: LaneState, row: media.MediaRow, redo: boolean): void {
 	const limit = hardLimitMs(l, row);
 	l.job = {
 		id: row.id,
+		redo,
 		startedAt: Date.now(),
 		hardTimer: later(() => kill(l, `it took longer than ${secs(limit)}`), limit),
 		stallTimer: null
@@ -344,16 +385,24 @@ function dispatch(l: LaneState): void {
 			}, timings.diskRecheckMs);
 			return;
 		}
-		// claimForProcessing only refuses rows that stopped being queued since nextQueued (a race).
+		// claimForProcessing/claimRedo only refuse rows that stopped waiting since nextQueued/nextRedo
+		// (a race). Uploads go first; admin redos only run while no upload waits in this lane.
 		for (let i = 0; i < 10; i++) {
 			const next = media.nextQueued(l.lane);
-			if (!next) return;
-			const row = media.claimForProcessing(next.id);
-			aheadCache = null;
-			if (row) {
-				startJob(l, row);
-				return;
+			if (next) {
+				const row = media.claimForProcessing(next.id);
+				aheadCache = null;
+				if (row) return startJob(l, row, false);
+				continue;
 			}
+			const redo = media.nextRedo(l.lane);
+			if (!redo) return startPreviews(l);
+			const row = media.claimRedo(redo.id);
+			if (row) return startJob(l, row, true);
+			// nextRedo only returns waiting, ready, untrashed rows, so a refused claim means its
+			// archived original is no longer recorded: end that redo rather than meeting it again on
+			// every dispatch (it would hold up the redos and previews behind it).
+			media.failRedo(redo.id, "Its archived original is gone, so it can't be redone");
 		}
 	} catch (e) {
 		console.error(`[queue] ${l.lane} lane: could not pick the next job; trying again soon:`, errorDetail(e, 500));
@@ -362,6 +411,57 @@ function dispatch(l: LaneState): void {
 			dispatch(l);
 		}, timings.dispatchRetryMs);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Previews (cache/ rebuilt from library/)
+// ---------------------------------------------------------------------------
+
+/**
+ * Ready items whose previews are missing from cache/, per lane, newest first (a lost cache pool, or
+ * /config restored from an older backup). In memory only: every start looks again.
+ */
+const previewsPending = new Map<Lane, Set<string>>(LANES.map((lane) => [lane, new Set<string>()]));
+/** Previews jobs since the backlog was last empty (one summary line when it empties). */
+let previewsRun = { rebuilt: 0, failed: 0 };
+
+/** A photo needs thumb + display, a video thumb + poster (what the grid and viewer ask for). */
+function previewsMissing(id: string, kind: Kind): boolean {
+	return !fs.existsSync(cacheFile(id, 'thumb')) || !fs.existsSync(cacheFile(id, kind === 'photo' ? 'display' : 'poster'));
+}
+
+/** Starts the lane's next previews job, if any is still needed. */
+function startPreviews(l: LaneState): void {
+	const pending = previewsPending.get(l.lane)!;
+	for (const id of pending) {
+		pending.delete(id);
+		const row = media.getById(id);
+		// Gone, no longer ready, or rebuilt meanwhile (a redo): nothing to do.
+		if (!row || row.status !== 'ready' || row.kind !== l.lane || !previewsMissing(id, l.lane)) continue;
+		const limit = timings.photoTimeoutMs;
+		l.job = {
+			id,
+			redo: false,
+			previews: true,
+			startedAt: Date.now(),
+			hardTimer: later(() => kill(l, `rebuilding its previews took longer than ${secs(limit)}`), limit),
+			stallTimer: null
+		};
+		send(l, { type: 'job', id, kind: l.lane, task: 'previews' });
+		return;
+	}
+}
+
+/** A previews job ended (`failure`: what went wrong). One summary line once none is left. */
+function previewsFinished(failure: string | null): void {
+	if (failure) {
+		previewsRun.failed++;
+		console.warn(`[queue] could not rebuild the previews of ${failure}`);
+	} else previewsRun.rebuilt++;
+	if (previewsWaiting() > 0) return;
+	const { rebuilt, failed } = previewsRun;
+	console.log(`[queue] rebuilt the previews of ${rebuilt} item(s)${failed > 0 ? `; ${failed} could not be rebuilt (see above)` : ''}`);
+	previewsRun = { rebuilt: 0, failed: 0 };
 }
 
 /** Empties /config/tmp and /photos/.work (leftovers of jobs a restart interrupted). */
@@ -403,6 +503,11 @@ export function startQueue(opts: QueueOptions = {}): void {
 	} catch (e) {
 		console.error('[queue] could not re-queue interrupted jobs:', errorDetail(e, 500));
 	}
+	try {
+		queueMissingPreviews();
+	} catch (e) {
+		console.error('[queue] could not look for missing previews:', errorDetail(e, 500));
+	}
 	lanes = LANES.map((lane) => ({
 		lane,
 		child: null,
@@ -422,6 +527,33 @@ export function startQueue(opts: QueueOptions = {}): void {
 export function wakeQueue(): void {
 	aheadCache = null;
 	for (const l of lanes) dispatch(l);
+}
+
+/**
+ * Looks for ready items (trashed ones too) whose previews are missing from cache/ and has the lanes
+ * rebuild them from library/, newest first, while no upload or redo waits. Runs at every start; the
+ * admin page's "Rebuild missing previews" runs it again without a restart. One or two file checks
+ * per item. Returns how many items are missing previews.
+ */
+export function queueMissingPreviews(): number {
+	let found = 0;
+	for (const { id, kind } of media.listReadyForPreviews()) {
+		if (!previewsMissing(id, kind)) continue;
+		previewsPending.get(kind)?.add(id);
+		found++;
+	}
+	if (found > 0) {
+		console.warn(`[queue] ${found} item(s) have no previews in ${cacheRoot()}; rebuilding them from library/ after any new uploads`);
+		wakeQueue();
+	}
+	return found;
+}
+
+/** Previews still to rebuild, including the ones a lane is on now. */
+export function previewsWaiting(): number {
+	let n = lanes.filter((l) => l.job?.previews).length;
+	for (const pending of previewsPending.values()) n += pending.size;
+	return n;
 }
 
 /**
@@ -450,6 +582,8 @@ export async function stopQueue(): Promise<void> {
 	);
 	lanes = [];
 	progress.clear();
+	for (const pending of previewsPending.values()) pending.clear();
+	previewsRun = { rebuilt: 0, failed: 0 };
 	aheadCache = null;
 	started = false;
 	stopping = false;

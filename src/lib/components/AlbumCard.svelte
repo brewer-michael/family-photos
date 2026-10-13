@@ -59,6 +59,15 @@
 		font-size: var(--fs-large);
 		font-weight: 700;
 		line-height: 1.25;
+		/* A long word ("Thanksgiving") is hyphenated where the browser can, never cut anywhere. */
+		-webkit-hyphens: auto;
+		hyphens: auto;
+	}
+	/* Phones show two cards a row (home page): body-size titles, so a long word fits its card. */
+	@media (max-width: 30rem) {
+		.title {
+			font-size: var(--fs-base);
+		}
 	}
 	.when,
 	.count {

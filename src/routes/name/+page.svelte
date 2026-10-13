@@ -1,7 +1,10 @@
 <!--
 	"What should we call you?" — asked once per device. Works without JavaScript.
-	defaultValue, not value: on a slow phone someone may start typing before the page hydrates, and
-	hydrating a `value` would wipe what they typed.
+	"Not Jo?" leads here too, usually because someone else has the phone, so the field starts empty
+	(no one has to delete Jo's name first) and Jo has a way back. Typing a different name makes a new
+	device id (+page.server.ts); typing the same name again keeps Jo's.
+	No `value`: on a slow phone someone may start typing before the page hydrates, and hydrating a
+	`value` would wipe what they typed.
 -->
 <script lang="ts">
 	import type { PageProps } from './$types';
@@ -36,7 +39,6 @@
 				enterkeyhint="done"
 				maxlength="40"
 				required
-				defaultValue={data.currentName ?? ''}
 				aria-invalid={!!form?.message}
 				aria-describedby={describedBy}
 			/>
@@ -46,6 +48,12 @@
 		</div>
 		<button type="submit" class="btn btn-primary btn-big btn-block"><Icon name="check" /> Continue</button>
 	</form>
+
+	{#if data.currentName}
+		<p class="still">
+			<a class="btn btn-quiet" href={data.next}><Icon name="arrow-left" /> Go back, I'm {data.currentName}</a>
+		</p>
+	{/if}
 </div>
 
 <style>
@@ -62,5 +70,11 @@
 	.name {
 		font-size: var(--fs-large);
 		min-height: calc(var(--tap) * 1.15);
+	}
+	.still {
+		margin-top: 1rem;
+	}
+	.still .btn {
+		padding-inline: 0;
 	}
 </style>

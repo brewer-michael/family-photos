@@ -46,7 +46,8 @@ log_cgroup() {
 	fi
 	if [ "$share" -ge "$default" ] 2>/dev/null; then
 		log 'Hint: no --cpu-shares is set, so getting videos ready competes for the CPU as hard as Plex and'
-		log '      other containers. Add "--cpu-shares=128 --memory=4g" to Extra Parameters (the Unraid template does).'
+		log '      other containers. Add "--cpu-shares=128 --memory=4g --restart=unless-stopped" to Extra Parameters'
+		log '      (the Unraid template does).'
 	fi
 }
 

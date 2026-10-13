@@ -1,7 +1,8 @@
 /**
  * Video lane job (docs/media-pipeline.md §3, no 4K option): probe → plan → poster first →
  * remux/transcode into .work/<id>/<id>.mp4 with progress → exiftool date/place → verify →
- * fsync → rename into library/ → media.markReady → archive or delete the source.
+ * fsync → rename into library/ → media.markReady → archive or delete the source → release the
+ * upload token (./settle.ts).
  *
  * Called by main.ts for a row the main process already claimed ('processing'). Known failures
  * are thrown as MediaError(code, detail); the main process decides retry. Nothing throws after
@@ -22,6 +23,8 @@ import { planVideo } from './video/plan';
 import { makePoster } from './video/poster';
 import { runConversion, toMediaError } from './video/progress';
 import { verifyOutput } from './video/verify';
+import { fsyncPath, locateSource, settleSource } from './settle';
+import { keepLive, undoInstall } from './redo';
 
 let capsLogged = false;
 
@@ -54,19 +57,12 @@ function heartbeat(ctx: WorkerContext) {
 	};
 }
 
-async function fsyncPath(p: string): Promise<void> {
-	const fh = await fs.open(p, 'r');
-	try {
-		await fh.sync();
-	} finally {
-		await fh.close();
-	}
-}
-
 export async function processVideo(id: string, ctx: WorkerContext): Promise<void> {
 	const row = media.getById(id);
 	if (!row) throw new MediaError('unsupported', `media ${id} not found`);
-	const src = media.sourcePath(row);
+	/** Admin "Redo them": the item stays ready and keeps its live file until markRedone() commits. */
+	const redo = media.isRedo(row);
+	const src = await locateSource(row);
 	if (!src) throw new MediaError('corrupt', 'the uploaded file is gone');
 	try {
 		await fs.access(src);
@@ -145,34 +141,40 @@ export async function processVideo(id: string, ctx: WorkerContext): Promise<void
 		}
 
 		const dest = ctx.paths.libraryPath(id, 'mp4');
-		const size = await installCanonical(out, dest);
+		// A redo replaces the live file: keep it until the row says otherwise (./redo.ts).
+		const live = redo ? await keepLive(dest, work) : null;
 		const keep = ctx.config.keepOriginals && plan.lossy;
 		const ext = row.source_ext ?? 'bin';
-		const committed = media.markReady(id, {
-			conversion: plan.mode,
-			canonicalExt: 'mp4',
-			canonicalSize: size,
-			width: plan.width,
-			height: plan.height,
-			durationMs: Math.round(durationS * 1000),
-			hdrTonemapped: plan.colour === 'hdr',
-			audioDropped: plan.audioDropped,
-			slowmoRetimed: plan.slowmo,
-			takenAt: taken.takenAt,
-			takenMs: taken.takenMs,
-			gpsLat: gps?.lat ?? null,
-			gpsLon: gps?.lon ?? null,
-			gpsAlt: gps?.alt ?? null,
-			contentId: probe.tags.contentId,
-			sourceKept: keep,
-			sourceExt: ext
-		});
-		if (!committed) {
-			// No row describes the file just installed: take it out of library/ again.
-			await fs.rm(dest, { force: true }).catch(() => undefined);
-			throw new MediaError('retryable', `media ${id} is no longer processing; not committed`);
+		let committed = false;
+		try {
+			const size = await installCanonical(out, dest);
+			committed = (redo ? media.markRedone : media.markReady)(id, {
+				conversion: plan.mode,
+				canonicalExt: 'mp4',
+				canonicalSize: size,
+				width: plan.width,
+				height: plan.height,
+				durationMs: Math.round(durationS * 1000),
+				hdrTonemapped: plan.colour === 'hdr',
+				audioDropped: plan.audioDropped,
+				slowmoRetimed: plan.slowmo,
+				takenAt: taken.takenAt,
+				takenMs: taken.takenMs,
+				gpsLat: gps?.lat ?? null,
+				gpsLon: gps?.lon ?? null,
+				gpsAlt: gps?.alt ?? null,
+				contentId: probe.tags.contentId,
+				sourceKept: keep,
+				sourceExt: ext
+			});
+		} finally {
+			// Not committed: no row describes the file just installed; take it out of library/ again
+			// (a redo's live file goes back).
+			if (!committed) await undoInstall(dest, live).catch(() => undefined);
 		}
-		await settleSource(id, src, keep, ext, ctx);
+		if (!committed) throw new MediaError('retryable', `media ${id} is no longer ${redo ? 'being redone' : 'processing'}; not committed`);
+		// Committed: nothing below may fail the item (src/worker/README.md).
+		await settleSource(id, src, keep, ext, ctx.log, `video ${id}`);
 	} finally {
 		beat.stop();
 		await Promise.all([tmp, work].map((d) => fs.rm(d, { recursive: true, force: true }).catch(() => undefined)));
@@ -186,28 +188,4 @@ async function installCanonical(out: string, dest: string): Promise<number> {
 	await fs.rename(out, dest);
 	await fsyncPath(path.dirname(dest));
 	return (await fs.stat(dest)).size;
-}
-
-/**
- * After the commit: archive the source in originals/ (lossy conversion and KEEP_ORIGINALS) or
- * delete it. Never throws; if archiving fails the row is corrected to "no original kept".
- */
-async function settleSource(id: string, src: string, keep: boolean, ext: string, ctx: WorkerContext): Promise<void> {
-	const archived = ctx.paths.originalsPath(id, ext);
-	try {
-		if (!keep) {
-			await fs.rm(src, { force: true });
-		} else if (src !== archived) {
-			await fs.mkdir(path.dirname(archived), { recursive: true });
-			await fs.rename(src, archived);
-		}
-	} catch (e) {
-		ctx.log.error(`video ${id}: could not ${keep ? 'archive' : 'delete'} the source`, { error: errorDetail(e, 500) });
-		if (!keep) return;
-		try {
-			media.markOriginalDeleted(id);
-		} catch (e2) {
-			ctx.log.error(`video ${id}: could not record that the source was not kept`, { error: errorDetail(e2, 500) });
-		}
-	}
 }

@@ -11,13 +11,18 @@ import sharp from 'sharp';
 import { simpleParser, type ParsedMail } from 'mailparser';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+	ASKS_PER_HOUR,
 	createRemovalRequest,
+	EMAILS_PER_HOUR,
 	emailThumbnail,
+	HELD_BACK_ERROR,
 	removalEmail,
 	resendRemovalEmail,
+	resetRemovalLimits,
 	sendStuckRemovalEmails,
 	THUMB_CID,
-	THUMB_CONCURRENCY
+	THUMB_CONCURRENCY,
+	THUMB_QUEUE_MAX
 } from '#lib/server/removal';
 import { getDb } from '#lib/server/db';
 import { cacheFile, outboxDir } from '#lib/server/paths';
@@ -26,6 +31,7 @@ import * as media from '#lib/server/repo/media';
 import * as requests from '#lib/server/repo/requests';
 import type { Kind } from '#lib/shared/media-types';
 import { freshDb, setEnv } from '../helpers/env';
+import { actions as viewActions } from '../../src/routes/view/[id]/+page.server';
 
 const ORIGIN = 'http://localhost:3000';
 let seq = 0;
@@ -99,9 +105,31 @@ async function closedPort(): Promise<number> {
 
 let album: number;
 
+/** Waits until no request's email is still being sent (so none lands in the next test's database). */
+async function allSettled(): Promise<void> {
+	await vi.waitFor(
+		() => expect(getDb().prepare(`SELECT COUNT(*) FROM deletion_requests WHERE email_status = 'pending'`).pluck().get()).toBe(0),
+		{ timeout: 30_000 }
+	);
+}
+
+/** POST /view/<id>?/askRemove as `device` from address `ip`. */
+async function askOnPage(mediaId: string, device: string, ip: string) {
+	const url = new URL(`http://localhost:3000/view/${mediaId}?/askRemove`);
+	const event = {
+		locals: { role: 'family', deviceId: device, name: 'Cousin Sam' },
+		params: { id: mediaId },
+		url,
+		getClientAddress: () => ip,
+		request: new Request(url, { method: 'POST', body: new URLSearchParams({ reason: 'blurry_or_duplicate' }) })
+	};
+	return (await viewActions.askRemove(event as never)) as { status?: number; data?: { remove: { error?: string } }; remove?: { sent?: boolean } };
+}
+
 beforeEach(() => {
 	setEnv({ SMTP_HOST: undefined, SMTP_PORT: undefined, ADMIN_EMAIL: 'admin@example.com' });
 	freshDb();
+	resetRemovalLimits();
 	fs.rmSync(outboxDir(), { recursive: true, force: true });
 	album = albums.create({ title: 'Retreat <2023> & "friends"', createdByName: 'Jo', createdByDevice: null }).id;
 });
@@ -198,6 +226,67 @@ describe('createRemovalRequest', () => {
 		const rid = await ask(id);
 		expect(await settled(rid)).toMatchObject({ email_status: 'failed', email_error: expect.stringContaining('ADMIN_EMAIL') });
 		expect(outboxFiles()).toEqual([]);
+	});
+});
+
+describe('flood protection (anyone with the family code can ask)', () => {
+	it(`lets one person ask ${ASKS_PER_HOUR} times an hour; then a friendly 429, and others can still ask`, async () => {
+		const ids: string[] = [];
+		for (let i = 0; i <= ASKS_PER_HOUR + 1; i++) ids.push(await readyItem(album, { preview: null }));
+		// A new device id for every request (a cleared cookie) doesn't help: the address counts too.
+		for (let i = 0; i < ASKS_PER_HOUR; i++) {
+			expect(await askOnPage(ids[i], `device${String(i).padStart(18, '0')}`, '203.0.113.5'), `request ${i + 1}`).toEqual({
+				remove: { sent: true }
+			});
+		}
+		const refused = await askOnPage(ids[ASKS_PER_HOUR], 'deviceZZZZZZZZZZZZZZZZ', '203.0.113.5');
+		expect(refused.status).toBe(429);
+		expect(refused.data?.remove.error).toMatch(/^That's a lot of requests at once\. Please wait \d+ minutes? and try again, or tell Michael\.$/);
+		expect(requests.listPending()).toHaveLength(ASKS_PER_HOUR);
+
+		// Someone else (another address and device) is not affected.
+		expect(await askOnPage(ids[ASKS_PER_HOUR + 1], 'deviceYYYYYYYYYYYYYYYY', '198.51.100.9')).toEqual({ remove: { sent: true } });
+		await allSettled();
+	});
+
+	it(`emails at most ${EMAILS_PER_HOUR} requests an hour; the rest wait on the admin page, and one email says so`, async () => {
+		const id = await readyItem(album, { preview: null });
+		const asked: number[] = [];
+		for (let i = 0; i < EMAILS_PER_HOUR + 3; i++) asked.push(await ask(id, { device: `device${String(i).padStart(18, '0')}` }));
+		await allSettled();
+		const statuses = asked.map((rid) => requests.get(rid)!);
+		expect(statuses.slice(0, EMAILS_PER_HOUR).every((r) => r.email_status === 'saved')).toBe(true);
+		for (const r of statuses.slice(EMAILS_PER_HOUR)) expect(r).toMatchObject({ email_status: 'failed', email_error: HELD_BACK_ERROR });
+
+		// The notice is sent once, not once per held-back request.
+		await vi.waitFor(() => expect(outboxFiles()).toHaveLength(EMAILS_PER_HOUR + 1));
+		const mails = await Promise.all(outboxFiles().map((f) => simpleParser(fs.readFileSync(path.join(outboxDir(), f)))));
+		const notices = mails.filter((m) => m.subject === 'More removal requests are waiting');
+		expect(notices).toHaveLength(1);
+		const [notice] = notices;
+		expect(notice.text).toContain(`More than ${EMAILS_PER_HOUR} removal requests came in within an hour.`);
+		expect(notice.text).toContain(`${ORIGIN}/admin`);
+
+		// The admin's "Resend" still emails a held-back one.
+		expect(await resendRemovalEmail(asked.at(-1)!)).toBe('saved');
+	});
+
+	it(`gives up on the picture rather than queue more than ${THUMB_QUEUE_MAX} for ffmpeg`, async () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fp-fake-ffmpeg-'));
+		const bin = path.join(dir, 'ffmpeg');
+		fs.writeFileSync(bin, `#!/bin/sh\necho run >> "${dir}/runs"\nsleep 0.05\nprintf picture\n`, { mode: 0o755 });
+		const extra = 3;
+		const ids: string[] = [];
+		for (let i = 0; i < THUMB_CONCURRENCY + THUMB_QUEUE_MAX + extra; i++) ids.push(await readyItem(album, { preview: [8, 8] }));
+		setEnv({ FFMPEG_BIN: bin });
+		try {
+			const pics = await Promise.all(ids.map((id) => emailThumbnail(id, 'photo')));
+			expect(pics.filter((p) => p === null)).toHaveLength(extra);
+			expect(fs.readFileSync(path.join(dir, 'runs'), 'utf8').trim().split('\n')).toHaveLength(THUMB_CONCURRENCY + THUMB_QUEUE_MAX);
+		} finally {
+			setEnv({ FFMPEG_BIN: undefined });
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
 

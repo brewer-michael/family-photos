@@ -83,15 +83,26 @@ export function downloadName(item: NameSource): string {
 /**
  * Returns a function that hands out unique names: the second "IMG_1234.jpg" becomes
  * "IMG_1234 (2).jpg". Comparison ignores case (Windows and macOS file systems do).
+ *
+ * Each name remembers where its numbering got to, so thousands of files with the same name (a
+ * whole album of "Scan.jpg") cost one step each, not a search from "(2)" every time. Names are
+ * never given back, so every number below that point is still taken.
  */
 export function createNameAllocator(reserved: readonly string[] = []): (name: string) => string {
 	const taken = new Set(reserved.map((n) => n.toLowerCase()));
+	/** Lower-cased name → the next " (n)" to try for it. */
+	const nextNumber = new Map<string, number>();
 	return (name) => {
-		const dot = name.lastIndexOf('.');
-		const stem = dot > 0 ? name.slice(0, dot) : name;
-		const ext = dot > 0 ? name.slice(dot) : '';
+		const key = name.toLowerCase();
 		let candidate = name;
-		for (let n = 2; taken.has(candidate.toLowerCase()); n++) candidate = `${stem} (${n})${ext}`;
+		if (taken.has(key)) {
+			const dot = name.lastIndexOf('.');
+			const stem = dot > 0 ? name.slice(0, dot) : name;
+			const ext = dot > 0 ? name.slice(dot) : '';
+			let n = nextNumber.get(key) ?? 2;
+			for (; taken.has((candidate = `${stem} (${n})${ext}`).toLowerCase()); n++);
+			nextNumber.set(key, n + 1);
+		}
 		taken.add(candidate.toLowerCase());
 		return candidate;
 	};

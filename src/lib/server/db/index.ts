@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import Database from 'better-sqlite3';
-import { dbPath } from '#lib/server/paths';
+import { backupsDir, dbPath } from '#lib/server/paths';
 import { LATEST_VERSION, migrations } from './migrations/index';
 
 export type DB = Database.Database;
@@ -36,8 +36,13 @@ export function openDb(opts: OpenDbOptions): DB {
 		if (!opts.readonly) db.pragma('journal_mode = WAL');
 		db.pragma('foreign_keys = ON');
 		db.pragma('busy_timeout = 5000');
-		db.pragma('synchronous = NORMAL');
+		// FULL: every commit is on disk before it returns. The lanes commit an item and only then
+		// archive or delete its source on /photos, a different filesystem with no ordering against
+		// /config; with NORMAL a power cut could roll a WAL commit back after the files moved.
+		db.pragma('synchronous = FULL');
 		if (opts.migrate) {
+			const v = userVersion(db);
+			if (file !== ':memory:' && v > 0 && v < LATEST_VERSION) copyBeforeMigrating(db, v);
 			migrate(db);
 			seed(db);
 		} else {
@@ -64,6 +69,36 @@ export function openDb(opts: OpenDbOptions): DB {
 
 export function userVersion(db: DB): number {
 	return db.pragma('user_version', { simple: true }) as number;
+}
+
+/**
+ * Before an upgrade changes the schema: a copy of the database as it is, in
+ * .backups/app-pre-v<N>-<UTC date>.sqlite, which the version that made it can still open (going
+ * back after a bad upgrade). The nightly rotation leaves these alone. One per version and day, so a
+ * start that fails and is retried doesn't pile them up. Without the copy nothing is upgraded.
+ */
+function copyBeforeMigrating(db: DB, version: number): void {
+	const dir = backupsDir();
+	const target = path.join(dir, `app-pre-v${version}-${new Date().toISOString().slice(0, 10)}.sqlite`);
+	if (fs.existsSync(target)) return;
+	const partial = `${target}.partial`;
+	try {
+		fs.mkdirSync(dir, { recursive: true });
+		fs.rmSync(partial, { force: true });
+		db.prepare('VACUUM INTO ?').run(partial); // synchronous, consistent, a single file
+		fs.renameSync(partial, target);
+	} catch (e) {
+		try {
+			fs.rmSync(partial, { force: true });
+		} catch {
+			// the error below says what is wrong with the folder
+		}
+		throw new Error(
+			`Could not copy the database to ${dir} before upgrading it from version ${version} to ${LATEST_VERSION} ` +
+				`(${(e as Error).message}). Nothing was changed. Free some space on the photos share or fix its permissions, then start again.`
+		);
+	}
+	console.log(`[db] copied the database to ${target} before upgrading it from version ${version} to ${LATEST_VERSION}`);
 }
 
 /** Applies every migration newer than PRAGMA user_version, each in its own transaction. Idempotent. */

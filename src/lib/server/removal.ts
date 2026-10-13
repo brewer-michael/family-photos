@@ -9,16 +9,25 @@
  *
  * The outcome is recorded as email_status sent/saved/failed (+ email_error); the admin can resend.
  * The JPEG is made by ffmpeg from the cached display.webp (photos) or poster.webp (videos), so sharp
- * never loads in the web process; at most THUMB_CONCURRENCY of those run at once (anyone with the
- * family code can send requests, and a fresh device id is just a cleared cookie away). Links in the
- * email only lead to pages: removing, moving and dismissing are POST-only, so link scanners can't
- * act on them.
+ * never loads in the web process. Links in the email only lead to pages: removing, moving and
+ * dismissing are POST-only, so link scanners can't act on them.
+ *
+ * Anyone with the family code can send requests, and a fresh device id is just a cleared cookie
+ * away, so nothing here may be used to flood the admin's inbox (and get their SMTP account blocked):
+ * - askLimiter: each person (by address and device) may ask ASKS_PER_HOUR times an hour, and
+ *   everyone together ten times that (the view page's ?/askRemove checks it);
+ * - at most EMAILS_PER_HOUR request emails an hour. Past that a request is stored but not emailed
+ *   (email_status 'failed', so it is listed for "Resend" on the admin page) and one email per hour
+ *   tells the admin that more are waiting;
+ * - at most THUMB_CONCURRENCY ffmpeg runs at once for the pictures, with THUMB_QUEUE_MAX waiting;
+ *   past that an email goes without its picture.
  */
 import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import { getConfig, publicOrigin } from './config';
 import { cacheFile } from './paths';
 import { sendMail, type MailMessage } from './mail';
+import { createRateLimiter } from './ratelimit';
 import * as media from './repo/media';
 import * as requests from './repo/requests';
 import { formatTaken } from '#lib/client/format';
@@ -47,12 +56,46 @@ export const THUMB_MAX_PX = 600;
 const THUMB_TIMEOUT_MS = 30_000;
 /** ffmpeg processes for email pictures running at once; the rest wait their turn. */
 export const THUMB_CONCURRENCY = 2;
+/** Email pictures waiting for ffmpeg at most; past that, the email goes without its picture. */
+export const THUMB_QUEUE_MAX = 20;
+
+const HOUR_MS = 60 * 60_000;
+/** "Ask to remove" requests per person (each of their address keys, and their device) per hour. */
+export const ASKS_PER_HOUR = 20;
+/** Per person, and ten times that from everyone together (createRateLimiter's globalMax). */
+export const askLimiter = createRateLimiter({ max: ASKS_PER_HOUR, windowMs: HOUR_MS, globalMax: ASKS_PER_HOUR * 10 });
+/** Request emails per hour at most; the rest are only on the admin page (see holdBack()). */
+export const EMAILS_PER_HOUR = 30;
+/** email_error of a request that was stored but not emailed because of EMAILS_PER_HOUR. */
+export const HELD_BACK_ERROR =
+	`Not emailed: more than ${EMAILS_PER_HOUR} removal requests came in within an hour, and the rest ` +
+	`are only listed here so your email account isn't flooded. Resend emails this one.`;
+
+/** When this hour's request emails were started (oldest first). */
+let emailedAt: number[] = [];
+/** When the admin was last told that requests are being held back. */
+let heldNoticeAt = -Infinity;
+
+/** Takes one of this hour's EMAILS_PER_HOUR, if any is left. */
+function takeEmailSlot(now: number): boolean {
+	emailedAt = emailedAt.filter((t) => now - t < HOUR_MS);
+	if (emailedAt.length >= EMAILS_PER_HOUR) return false;
+	emailedAt.push(now);
+	return true;
+}
+
+/** Forgets the hourly counts (askLimiter, EMAILS_PER_HOUR, the notice). For tests. */
+export function resetRemovalLimits(): void {
+	askLimiter.reset();
+	emailedAt = [];
+	heldNoticeAt = -Infinity;
+}
 
 /** The server's time zone (Unraid sets TZ), as on the pages. */
 const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
 
 /** Throws ValidationError for bad input. Idempotent per device+item while pending. */
-export async function createRemovalRequest(input: RemovalRequestInput): Promise<{ id: number }> {
+export async function createRemovalRequest(input: RemovalRequestInput): Promise<{ id: number; created: boolean }> {
 	const { request, created } = requests.create({
 		mediaId: input.mediaId,
 		requesterName: input.requesterName,
@@ -60,8 +103,46 @@ export async function createRemovalRequest(input: RemovalRequestInput): Promise<
 		reason: input.reason,
 		details: input.details
 	});
-	if (created) void emailRequest(request.id, input.origin);
-	return { id: request.id };
+	if (created) {
+		if (takeEmailSlot(Date.now())) void emailRequest(request.id, input.origin);
+		else holdBack(request.id, input.origin);
+	}
+	return { id: request.id, created };
+}
+
+/** Over EMAILS_PER_HOUR: the request stays on the admin page only; the admin hears once an hour. */
+function holdBack(id: number, origin: string): void {
+	requests.setEmailStatus(id, 'failed', HELD_BACK_ERROR);
+	console.warn(`[removal] request ${id} was not emailed: more than ${EMAILS_PER_HOUR} request emails this hour`);
+	const now = Date.now();
+	if (now - heldNoticeAt < HOUR_MS) return;
+	heldNoticeAt = now;
+	const to = getConfig().adminEmail;
+	if (!to) return;
+	sendMail(heldBackEmail(to, origin)).catch((e: unknown) => {
+		console.warn(`[removal] the "more requests are waiting" email failed: ${e instanceof Error ? e.message : String(e)}`);
+	});
+}
+
+/** The one email an hour that says more requests came in than were emailed. */
+export function heldBackEmail(to: string, origin: string): MailMessage {
+	const adminUrl = `${origin}/admin`;
+	const lead = `More than ${EMAILS_PER_HOUR} removal requests came in within an hour.`;
+	const rest =
+		"To keep your email account from being blocked, the others aren't emailed one by one. " +
+		'Nothing has been removed. They are all waiting on the admin page.';
+	const e = escapeHtml;
+	return {
+		to,
+		subject: 'More removal requests are waiting',
+		text: `${lead}\n\n${rest}\n\nOpen the admin page: ${adminUrl}\n`,
+		html:
+			`<!doctype html><html><body style="margin:0;padding:24px;background:#fff8ef;color:#2b1d14;` +
+			`font-family:system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;font-size:17px;line-height:1.5">` +
+			`<p style="margin:0 0 16px;font-size:20px;font-weight:bold">${e(lead)}</p><p style="margin:0 0 16px">${e(rest)}</p>` +
+			`<p style="margin:0"><a href="${e(adminUrl)}" style="display:inline-block;padding:12px 20px;border-radius:10px;` +
+			`font-weight:bold;text-decoration:none;background:#9c3d1f;color:#ffffff">Open the admin page</a></p></body></html>`
+	};
 }
 
 /** Sends a request's email again (admin "Resend"). Resolves with the recorded status. */
@@ -167,6 +248,10 @@ export async function emailThumbnail(id: string, kind: Kind | null): Promise<Buf
 	const order: CacheVariant[] = kind === 'video' ? ['poster', 'thumb'] : ['display', 'thumb'];
 	const src = order.map((v) => cacheFile(id, v)).find((f) => fs.existsSync(f));
 	if (!src) return null;
+	if (thumbsRunning >= THUMB_CONCURRENCY && thumbsWaiting.length >= THUMB_QUEUE_MAX) {
+		console.warn(`[removal] no picture for ${id}: ${THUMB_QUEUE_MAX} emails are already waiting for one`);
+		return null;
+	}
 	try {
 		return await inTurn(() => ffmpegJpeg(src));
 	} catch (e) {

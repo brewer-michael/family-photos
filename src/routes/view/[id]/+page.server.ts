@@ -5,8 +5,9 @@ import * as media from '#lib/server/repo/media';
 import * as memories from '#lib/server/repo/memories';
 import * as requests from '#lib/server/repo/requests';
 import { memoryList, saveTarget, viewItem } from '#lib/server/repo/ui';
-import { createRemovalRequest } from '#lib/server/removal';
-import { publicOrigin } from '#lib/server/config';
+import { askLimiter, createRemovalRequest } from '#lib/server/removal';
+import { getConfig, publicOrigin } from '#lib/server/config';
+import { clientKeys } from '#lib/server/ratelimit';
 import { ValidationError } from '#lib/shared/errors';
 import { isMediaId, REMOVAL_REASONS, type RemovalReason } from '#lib/shared/media-types';
 
@@ -104,14 +105,28 @@ export const actions: Actions = {
 		return { memory: { deleted: true } };
 	},
 
-	/** "Ask to remove": stored first, then the admin is emailed (one pending request per device). */
-	askRemove: async ({ params, request, locals }) => {
+	/**
+	 * "Ask to remove": stored first, then the admin is emailed (one pending request per device, and
+	 * a few dozen an hour per person; see #lib/server/removal for the limits on emails).
+	 */
+	askRemove: async (event) => {
+		const { params, request, locals } = event;
 		const { row } = viewable(params.id, locals);
 		const who = author(locals);
 		const form = await request.formData();
 		const reason = text(form.get('reason')) as RemovalReason;
 		if (!REMOVAL_REASONS.includes(reason)) return fail(400, { remove: { error: 'Please pick a reason.' } });
 		if (requests.hasPendingFor(row.id, who.device)) return { remove: { sent: true } };
+		const keys = [...clientKeys(event), `device:${who.device}`];
+		const limit = askLimiter.check(keys);
+		if (limit.limited) {
+			const minutes = Math.max(1, Math.ceil(limit.retryAfterS / 60));
+			return fail(429, {
+				remove: {
+					error: `That's a lot of requests at once. Please wait ${minutes} ${minutes === 1 ? 'minute' : 'minutes'} and try again, or tell ${getConfig().adminName}.`
+				}
+			});
+		}
 		try {
 			await createRemovalRequest({
 				mediaId: row.id,
@@ -125,6 +140,7 @@ export const actions: Actions = {
 			if (e instanceof ValidationError) return fail(400, { remove: { error: e.message } });
 			throw e;
 		}
+		askLimiter.fail(keys); // counts requests, not failures
 		return { remove: { sent: true } };
 	}
 };

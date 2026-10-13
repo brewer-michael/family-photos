@@ -157,6 +157,8 @@
 	}
 	.facts {
 		display: grid;
+		/* A link value is a tap-height box (.tap): line its text up with the label. */
+		align-items: baseline;
 		grid-template-columns: max-content 1fr;
 		gap: 0.4rem 1rem;
 		margin: 0 0 1.5rem;

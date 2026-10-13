@@ -20,6 +20,8 @@ const notFound = () =>
  * /media/<id>/<thumb|display|poster|file>[?dl=1] for the family (the gate requires access).
  * - thumb/poster: whenever the cache file exists (a video's poster appears while it processes).
  * - display/file: ready items only. `file` is the canonical JPEG/PNG/GIF/MP4, `?dl=1` as an attachment.
+ *   A photo whose display.webp is missing (cache/ lost, its previews not rebuilt yet: queue.ts
+ *   queueMissingPreviews) gets its canonical file instead, uncached, so the viewer keeps working.
  * - Trashed items, and items of a deleted album: admin only. Anything else is a 404, so ids can't
  *   be probed.
  */
@@ -52,7 +54,20 @@ const handler: RequestHandler = async ({ params, request, url, locals }) => {
 		cacheControl: ready ? IMMUTABLE : 'private, no-cache',
 		disposition
 	});
-	return res ?? notFound();
+	if (res) return res;
+	if (variant === 'display' && ready && row.kind === 'photo' && row.canonical_ext) {
+		// The same picture, browser-safe but full size; not cached, so display.webp is used once it is back.
+		const canonical = await serveFile(request, {
+			path: libraryPath(row.id, row.canonical_ext),
+			contentType: CANONICAL_MIME[row.canonical_ext],
+			etag: `"${row.id}-${row.pipeline_version}-display-file"`,
+			lastModified: row.taken_ms ?? row.created_at,
+			cacheControl: 'private, no-cache',
+			disposition: null
+		});
+		if (canonical) return canonical;
+	}
+	return notFound();
 };
 
 export const GET = handler;

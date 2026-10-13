@@ -17,9 +17,14 @@ test.describe('albums', () => {
 		await expect(page.getByRole('heading', { level: 1, name: title })).toBeVisible();
 		await expect(page.getByText('Summer 2023')).toBeVisible();
 		await expect(page.getByText('Started by Aunt Linda')).toBeVisible();
-		// A new album opens with the uploader showing.
-		await expect(page.getByRole('button', { name: 'Add photos & videos' }).first()).toHaveAttribute('aria-expanded', 'true');
+		// A new album opens with the uploader showing, and just one big add button: the uploader's own.
+		await expect(page.getByRole('button', { name: 'Choose photos & videos' })).toBeVisible();
+		await expect(page.getByRole('button', { name: 'Add photos & videos' })).toHaveCount(0);
 		await expect(page.getByText('No photos here yet.')).toBeVisible();
+		await expect(page.getByText('Tap the big button above to put the first ones in.')).toBeVisible();
+		const chooser = page.waitForEvent('filechooser');
+		await page.getByRole('button', { name: 'Choose photos & videos' }).click();
+		await (await chooser).setFiles([]);
 
 		await page.getByRole('link', { name: 'Change name or details' }).click();
 		await page.getByLabel('Album name').fill(`${title} (renamed)`);
@@ -80,12 +85,28 @@ test.describe('albums', () => {
 		// Newest first: the video (June) leads, with its length on the badge.
 		await expect(grid.getByRole('link').first()).toHaveAccessibleName('Video, 0:01, from June 1, 2022, added by Grandpa Al');
 		await expect(grid.getByRole('listitem').first()).toContainText('0:01');
-		await expect(page.getByRole('button', { name: 'Add photos & videos' }).first()).toHaveAttribute('aria-expanded', 'false');
+		// The uploader waits behind one tap, which also opens the picker straight away.
+		await expect(page.getByRole('button', { name: 'Add photos & videos' })).toBeVisible();
+		await expect(page.locator('#add-section')).toHaveCount(0);
 
 		await page.getByRole('link', { name: 'Show more' }).click();
 		await expect(grid.getByRole('listitem')).toHaveCount(65);
 		await expect(page.getByRole('link', { name: 'Show more' })).toHaveCount(0);
 		await expect(page.locator(':focus')).toHaveAttribute('href', /^\/view\//);
+	});
+
+	test('"Add photos & videos" shows the uploader and opens the picker in one tap', async ({ page }) => {
+		const album = seedAlbum('One tap');
+		await seedMedia(album, { name: 'IMG_0001.HEIC', takenAt: '2024-07-04T12:00:00-07:00' });
+		await login(page, 'Grandma Jo');
+		await page.goto(`/album/${album}`);
+		const chooser = page.waitForEvent('filechooser', { timeout: 5_000 });
+		await page.getByRole('button', { name: 'Add photos & videos' }).click();
+		await (await chooser).setFiles([]);
+		await expect(page.locator('#add-section')).toBeVisible();
+		// Nothing hides it again; the uploader's own button is the one add button from now on.
+		await expect(page.getByRole('button', { name: 'Add photos & videos' })).toHaveCount(0);
+		await expect(page.getByRole('button', { name: 'Choose photos & videos' })).toBeVisible();
 	});
 
 	test('when an upload finishes after "Show more", no tile falls between the pages', async ({ page }) => {
@@ -138,6 +159,19 @@ test.describe('albums', () => {
 		await expect(page.getByText(`to ${newTitle}`)).toBeVisible();
 	});
 
+	test('a long unbroken album name never makes a phone page scroll sideways', async ({ page }) => {
+		const title = `Thanksgiving2024AtGreatAuntMargaretsFarmhouse${Date.now()}`;
+		const album = seedAlbum(title);
+		await seedMedia(album, { name: 'IMG_0001.HEIC', takenAt: '2024-11-28T12:00:00-08:00' });
+		await page.setViewportSize({ width: 360, height: 740 });
+		await login(page, 'Grandma Jo');
+		for (const path of ['/add', '/', `/album/${album}`, `/add?album=${album}`]) {
+			await page.goto(path);
+			await expect(page.getByText(title).first()).toBeVisible();
+			expect(await page.evaluate(() => document.documentElement.scrollWidth), path).toBeLessThanOrEqual(360);
+		}
+	});
+
 	test("only the uploader (and the admin) see an album's unfinished uploads", async ({ page, browser, baseURL }, testInfo) => {
 		const album = seedAlbum('Uploads in progress');
 		await login(page, 'Aunt Linda');
@@ -147,12 +181,17 @@ test.describe('albums', () => {
 
 		await page.goto(`/album/${album}`);
 		const pending = page.getByRole('list', { name: 'Still on their way' });
-		await expect(pending.getByRole('listitem')).toHaveCount(2);
+		await expect(pending.getByRole('listitem')).toHaveCount(1);
 		await expect(pending).toContainText('beach');
 		await expect(pending).not.toContainText(/MOV|HEIC/);
 		await expect(pending).toContainText('Getting your video ready…');
-		await expect(pending).toContainText("We couldn't add this one. Michael has been told.");
 		await expect(pending.locator('img')).toHaveCount(1); // the video's early poster
+		// A failed one isn't "on its way": it has a heading of its own.
+		await expect(page.getByRole('heading', { level: 2, name: "These didn't work" })).toBeVisible();
+		const failed = page.getByRole('list', { name: "These didn't work" });
+		await expect(failed.getByRole('listitem')).toHaveCount(1);
+		await expect(failed).toContainText('broken');
+		await expect(failed).toContainText("We couldn't add this one. Michael has been told.");
 
 		const other = await browser.newContext({ ...testInfo.project.use, baseURL });
 		const otherPage = await other.newPage();
@@ -160,9 +199,11 @@ test.describe('albums', () => {
 		await otherPage.goto(`/album/${album}`);
 		await expect(otherPage.getByRole('heading', { level: 1, name: 'Uploads in progress' })).toBeVisible();
 		await expect(otherPage.getByRole('list', { name: 'Still on their way' })).toHaveCount(0);
+		await expect(otherPage.getByRole('list', { name: "These didn't work" })).toHaveCount(0);
 		await adminLogin(otherPage);
 		await otherPage.goto(`/album/${album}`);
-		await expect(otherPage.getByRole('list', { name: 'Still on their way' }).getByRole('listitem')).toHaveCount(2);
+		await expect(otherPage.getByRole('list', { name: 'Still on their way' }).getByRole('listitem')).toHaveCount(1);
+		await expect(otherPage.getByRole('list', { name: "These didn't work" }).getByRole('listitem')).toHaveCount(1);
 		await other.close();
 	});
 

@@ -9,7 +9,7 @@
  * lacks AMBIENT_VIEWING_ENVIRONMENT) for the video lane and the startup self-check.
  */
 import { execFile, type ExecFileException } from 'node:child_process';
-import { getConfig } from '#lib/server/config';
+import { envWithoutSecrets, getConfig } from '#lib/server/config';
 import { MediaError } from '#lib/shared/errors';
 
 /** Subset of ffprobe -show_streams JSON we rely on (everything else is in `raw`). */
@@ -413,7 +413,8 @@ function exec(bin: string, args: string[], timeoutMs: number, signal?: AbortSign
 		execFile(
 			bin,
 			args,
-			{ timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, killSignal: 'SIGKILL', signal },
+			// ffprobe reads uploaded bytes (intake runs it in the web process): no secrets for it.
+			{ timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, killSignal: 'SIGKILL', signal, env: envWithoutSecrets() },
 			(error, stdout, stderr) => {
 				if (error) reject({ error, stderr: String(stderr) } satisfies ExecFailure);
 				else resolve(stdout);

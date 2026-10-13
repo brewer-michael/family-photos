@@ -3,6 +3,11 @@
  * straight away, tus uploads two at a time, small local previews, a Screen Wake Lock while sending,
  * and /api/status polling until every item has settled. Uploader.svelte renders it.
  *
+ * A dropped connection is retried on RETRY_DELAYS even while the browser says it is offline
+ * (tus-js-client's default gives up at once then). If it is still offline after the last retry, the
+ * file waits for the browser's `online` event and carries on from where it stopped: it never ends
+ * as "didn't send" just because the Wi-Fi dropped for a while.
+ *
  * Nothing is converted, resized or hashed here: files go up exactly as picked, and the server
  * decides what they are from their bytes. Only obvious non-media (documents, archives, audio, SVG,
  * empty files) is skipped. tus-js-client is loaded on first use, in the browser only.
@@ -27,11 +32,24 @@ const GAP_DELAY_MS = 600;
 const GAP_GIVE_UP_MS = 2 * 60_000;
 
 export const NOT_MEDIA_TEXT = "That one isn't a photo or video.";
-const SEND_FAILED_TEXT = "This one didn't send. Check your connection, then try again.";
+export const SEND_FAILED_TEXT = "This one didn't send. Check your connection, then try again.";
+
+/** The browser knows it has no connection (navigator.onLine can only be trusted when false). */
+const isOffline = () => typeof navigator !== 'undefined' && navigator.onLine === false;
+
+/**
+ * tus-js-client's own retry rule (network errors, 5xx, 409, 423; plus 429), without its "only while
+ * the browser says it is online" condition.
+ */
+export function shouldRetrySend(err: Error | DetailedError): boolean {
+	const status = ('originalResponse' in err ? err.originalResponse?.getStatus() : null) ?? 0;
+	return status < 400 || status >= 500 || status === 409 || status === 423 || status === 429;
+}
 
 /**
  * waiting → sending → sent (then the server's status takes over), or skipped (not media) or
- * error (the upload itself failed; "Try again" sends it again, resuming where it stopped).
+ * error (the upload itself failed; "Try again" sends it again, resuming where it stopped). An item
+ * whose connection dropped stays 'sending' (with `offline`) until the internet is back.
  */
 export type Stage = 'waiting' | 'sending' | 'sent' | 'skipped' | 'error';
 
@@ -56,6 +74,8 @@ export class UploadItem {
 	problem = $state<string | null>(null);
 	/** "Try again" in flight. */
 	retrying = $state(false);
+	/** Sending, but the browser is offline: it carries on by itself when the internet is back. */
+	offline = $state(false);
 	/**
 	 * /api/status stopped answering for it (the admin removed it, or this browser's sign-in
 	 * changed): there is nothing more to follow, so the tile stays at "✓ Sent".
@@ -89,7 +109,12 @@ export class UploadItem {
 
 type TusModule = typeof import('tus-js-client');
 let tusModule: Promise<TusModule> | null = null;
-const loadTus = () => (tusModule ??= import('tus-js-client'));
+/** A failed load (e.g. offline before the first upload) is tried again next time. */
+const loadTus = () =>
+	(tusModule ??= import('tus-js-client').catch((e: unknown) => {
+		tusModule = null;
+		throw e;
+	}));
 
 /** Words for a failed upload: the server's own short sentence for 401/403/404/413, else generic. */
 function sendProblem(err: Error | DetailedError): string {
@@ -104,8 +129,11 @@ function sendProblem(err: Error | DetailedError): string {
 
 export interface UploadBatchOptions {
 	albumId: () => number;
-	/** Every file of the batch has settled and at least one was sent. */
-	ondone?: () => void;
+	/**
+	 * Every file of the batch has settled and at least one was sent. `unsent`: how many didn't send
+	 * (their tiles say why and offer "Try again"; a retry that works calls ondone again).
+	 */
+	ondone?: (result: { unsent: number }) => void;
 	/**
 	 * After `ondone`, hand the sent files over to the page (which lists them itself): their tiles
 	 * make way for a one-line `summary`. Tiles only the uploader knows about (not sent, or skipped)
@@ -155,6 +183,10 @@ export class UploadBatch {
 	readonly bytesTotal = $derived(this.toSend.filter((i) => i.stage !== 'error').reduce((n, i) => n + i.file.size, 0));
 	readonly bytesSent = $derived(this.toSend.filter((i) => i.stage !== 'error').reduce((n, i) => n + i.sent, 0));
 	readonly allSettled = $derived(this.items.length > 0 && this.items.every((i) => i.settled));
+	/** Files whose upload failed (stage 'error'): nothing is done until "Try again". */
+	readonly unsent = $derived(this.items.filter((i) => i.stage === 'error').length);
+	/** Some file is waiting for the internet to come back. */
+	readonly offline = $derived(this.items.some((i) => i.offline));
 
 	readonly #opts: UploadBatchOptions;
 	#active = 0;
@@ -171,6 +203,12 @@ export class UploadBatch {
 	#picking = false;
 	#gapTimer: ReturnType<typeof setTimeout> | null = null;
 	#destroyed = false;
+	/**
+	 * Uploads that ran out of retries while offline. Each keeps its sending slot and its 'sending'
+	 * stage (so the screen stays awake and leaving still asks) until `online`.
+	 */
+	#parked = new Set<UploadItem>();
+	#listening = false;
 
 	constructor(opts: UploadBatchOptions) {
 		this.#opts = opts;
@@ -230,6 +268,11 @@ export class UploadBatch {
 		this.#checkDone();
 	}
 
+	/** "Try again" on every file that didn't send. */
+	retryAll(): void {
+		for (const item of this.items) if (item.stage === 'error') void this.retry(item);
+	}
+
 	/** "Try again": re-send a failed upload, or ask the server to retry a failed item. */
 	async retry(item: UploadItem): Promise<void> {
 		if (!item.canRetry || item.retrying) return;
@@ -269,11 +312,21 @@ export class UploadBatch {
 			finished = true;
 			item.stage = stage;
 			item.problem = problem;
+			item.offline = false;
 			item.upload = null;
 			this.#active--;
 			this.#pump();
 			this.#poll(POLL_VISIBLE_MS);
 			this.#checkDone();
+		};
+		/** Out of retries while offline: wait for the connection instead of giving up. */
+		const park = () => {
+			if (finished) return;
+			finished = true;
+			item.offline = true;
+			item.upload = null;
+			this.#parked.add(item);
+			this.#listenForInternet();
 		};
 		try {
 			const { Upload } = await loadTus();
@@ -283,15 +336,23 @@ export class UploadBatch {
 				retryDelays: RETRY_DELAYS,
 				removeFingerprintOnSuccess: true,
 				metadata: { filename: item.file.name, lastModified: String(item.file.lastModified), albumId },
+				onShouldRetry: (err) => {
+					item.offline = isOffline();
+					return shouldRetrySend(err);
+				},
 				onProgress: (sent) => {
 					item.sent = sent;
+					item.offline = false;
 				},
 				onSuccess: ({ lastResponse }) => {
 					item.sent = item.file.size;
 					item.mediaId = lastResponse.getHeader('X-Media-Id') ?? null;
 					finish('sent');
 				},
-				onError: (err) => finish('error', sendProblem(err))
+				onError: (err) => {
+					if (isOffline() && !this.#destroyed) park();
+					else finish('error', sendProblem(err));
+				}
 			});
 			item.upload = upload;
 			// Resume an earlier, interrupted upload of this same file into this same album.
@@ -300,14 +361,45 @@ export class UploadBatch {
 			if (this.#destroyed) finish('error', SEND_FAILED_TEXT);
 			else upload.start();
 		} catch {
-			finish('error', SEND_FAILED_TEXT);
+			if (isOffline() && !this.#destroyed) park();
+			else finish('error', SEND_FAILED_TEXT);
 		}
 	}
+
+	#listenForInternet(): void {
+		if (this.#listening || typeof window === 'undefined') return;
+		this.#listening = true;
+		window.addEventListener('online', this.#online);
+	}
+
+	#stopListening(): void {
+		if (!this.#listening) return;
+		this.#listening = false;
+		window.removeEventListener('online', this.#online);
+	}
+
+	/**
+	 * The internet is back: parked uploads go back in line and carry on where they stopped (a new
+	 * tus Upload, with a fresh set of retries, finds the earlier one like "Try again" does).
+	 */
+	readonly #online = (): void => {
+		if (this.#destroyed) return;
+		for (const item of this.items) item.offline = false;
+		const parked = [...this.#parked];
+		this.#parked.clear();
+		this.#stopListening();
+		for (const item of parked) {
+			if (item.stage !== 'sending') continue;
+			item.stage = 'waiting';
+			this.#active--;
+		}
+		this.#pump();
+	};
 
 	#checkDone(): void {
 		if (this.#destroyed || this.#doneFired || !this.allSettled || !this.items.some((i) => i.stage === 'sent')) return;
 		this.#doneFired = true;
-		this.#opts.ondone?.();
+		this.#opts.ondone?.({ unsent: this.unsent });
 		if (this.#opts.clearOnDone?.()) this.#handOver();
 	}
 
@@ -392,9 +484,13 @@ export class UploadBatch {
 		return typeof document !== 'undefined' && document.visibilityState === 'hidden';
 	}
 
-	/** The page became visible again: refresh now and take the wake lock back if still sending. */
+	/**
+	 * The page became visible again: refresh now, take the wake lock back if still sending, and
+	 * carry on with parked uploads if the connection came back meanwhile.
+	 */
 	visible(): void {
 		this.#poll(0);
+		if (this.#parked.size > 0 && !isOffline()) this.#online();
 		if (this.sending) void this.#holdWakeLock();
 	}
 
@@ -460,6 +556,8 @@ export class UploadBatch {
 			if (i.preview) URL.revokeObjectURL(i.preview);
 		}
 		if (this.#pollTimer) clearTimeout(this.#pollTimer);
+		this.#parked.clear();
+		this.#stopListening();
 		this.#clearGap();
 		this.#releaseWakeLock();
 	}

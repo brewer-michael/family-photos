@@ -34,8 +34,15 @@ phone's text size, and no gestures you have to know about.
 
 ## Screenshots
 
-_Screenshots of the home page, an album, the photo viewer and the admin page go here (in
-`docs/screenshots/`) once the first release is running on real phones._
+Taken on an iPhone-sized screen with sample pictures.
+
+| Family code | Home | Adding photos |
+|---|---|---|
+| <img src="docs/screenshots/family-code.png" width="260" alt="Welcome page asking for the family code"> | <img src="docs/screenshots/home.png" width="260" alt="Home page with the Add photos and videos button, new photos and albums"> | <img src="docs/screenshots/uploading.png" width="260" alt="Photos being sent, with progress for each one"> |
+
+| Viewing a photo | Asking to remove | Admin |
+|---|---|---|
+| <img src="docs/screenshots/viewer.png" width="260" alt="A photo with Save to my phone, Write a memory and Ask to remove buttons"> | <img src="docs/screenshots/ask-to-remove.png" width="260" alt="The ask-to-remove dialog with reasons to pick"> | <img src="docs/screenshots/admin.png" width="260" alt="The admin page with a removal request waiting"> |
 
 ## Quick start on Unraid
 
@@ -45,8 +52,9 @@ home should reach the site (see [Putting it on the internet safely](#putting-it-
 ### 1. One time only: make the image public
 
 GitHub builds the Docker image and stores it in the GitHub Container Registry (GHCR) whenever `main`
-changes. A new GHCR package starts out **private**, and Unraid can't download private images. After
-the first successful run of the **Docker image** workflow:
+changes and every test passes. A new GHCR package starts out **private**, and Unraid can't download
+private images. After the first successful run of the **CI** workflow on `main` (its last job,
+**Publish the tested image**, pushes it):
 
 1. On GitHub, open your profile → **Packages** → **family-photos** → **Package settings**.
 2. Under **Danger Zone**, choose **Change visibility** → **Public**.
@@ -88,8 +96,10 @@ Fill in the form. The ones marked with \* are required.
 - [ ] **Paths**: keep **App data** (`/config`) on your cache or SSD pool so the site stays quick. The
       **Photos and videos** share (`/photos`) can live on the array.
 - [ ] **Extra Parameters** (switch on **Advanced View** at the top right): leave
-      `--cpu-shares=128 --memory=4g` there. Without it, getting a video ready takes about half the CPU
-      from Plex and your other containers; with it, Plex gets priority whenever both are busy.
+      `--cpu-shares=128 --memory=4g --restart=unless-stopped` there. Without the first two, getting a
+      video ready takes about half the CPU from Plex and your other containers; with them, Plex gets
+      priority whenever both are busy. The last one starts the site again by itself if it ever
+      stops unexpectedly.
 
 Click **Apply**. When the container is running:
 
@@ -285,41 +295,66 @@ didn't work always keep their file, so they can be tried again.
 |---|---|---|
 | `/photos/library/` | The photos and videos everyone sees | The files that matter most |
 | `/photos/originals/` | Archived originals (admin only) | Only with `KEEP_ORIGINALS=true` |
-| `/photos/.backups/` | Nightly copies of the database, the newest 7 | |
-| `/photos/.incoming/`, `/photos/.work/` | Uploads and conversions in progress | Temporary; cleaned up automatically |
+| `/photos/.backups/` | Daily copies of the database, the newest 7, plus one from before each upgrade | |
+| `/photos/.incoming/` | Uploads still arriving, waiting to be added, or that didn't work | The only copy until they're added. Ones that didn't work stay until you try them again or move them to the trash; uploads abandoned halfway are removed after 2 days |
+| `/photos/.work/` | Conversions in progress | Temporary; cleaned up automatically |
 | `/config/app.sqlite` | The database: albums, memories, names, who added what | |
-| `/config/cache/` | Previews and thumbnails | |
+| `/config/cache/` | Previews and thumbnails | Made again from `library/` when missing |
 | `/config/outbox/` | Saved emails when no email server is set | |
 | `/config/tmp/` | Scratch space while converting | Temporary |
 
 ## Backups
 
 Back up both folders. Some backup tools skip folders whose names start with a dot, so check that
-`.backups` is included.
+`.backups` and `.incoming` are included.
 
-- **The photos share** (`/mnt/user/family-photos`): `library/`, `originals/` and `.backups/`. The
-  database is copied into `.backups/` every night (the last 7 days are kept), so this share on its
-  own holds everything, with the database at most a day old. Skip `.incoming/` and `.work/`.
-- **App data** (`/mnt/user/appdata/family-photos`): the live database and the previews. The
-  **Appdata Backup** plugin stops the container for a moment while it copies, so the database copy is
-  consistent.
+- **The photos share** (`/mnt/user/family-photos`): `library/`, `originals/`, `.backups/` and
+  `.incoming/`. The database is copied into `.backups/` a minute after each start and then every 24
+  hours, as `app-YYYY-MM-DD.sqlite` (the last 7 days are kept). The admin page shows when the last
+  copy was made, or why it wasn't. `.incoming/` holds uploads that didn't work or are still waiting
+  to be added, and it is their only copy until they are. Only `.work/` is safe to skip.
+- **App data** (`/mnt/user/appdata/family-photos`): the live database and the previews (`cache/`).
+  The **Appdata Backup** plugin stops the container for a moment while it copies, so the database
+  copy is consistent.
+
+If the app data folder is lost, the photos share is enough to carry on, with the database at most a
+day old: restore it from `.backups/` (below), and the previews are made again from `library/` after
+the container starts, newest first and after any new uploads. For a large collection that takes a
+few hours. Meanwhile photos still open, and tiles still waiting for their preview stay empty.
+**Rebuild missing previews** under **Storage** on the admin page looks for missing ones again
+without a restart.
 
 Keep at least one copy away from the server (another machine, a USB disk you rotate, or a cloud
 backup).
 
-**Restoring the database** from a nightly copy: stop the container, copy
+**Restoring the database** from a copy: stop the container, copy
 `/mnt/user/family-photos/.backups/app-YYYY-MM-DD.sqlite` to
 `/mnt/user/appdata/family-photos/app.sqlite`, delete `app.sqlite-wal` and `app.sqlite-shm` next to
-it if they exist, and start the container.
+it if they exist, and start the container. Pick the newest copy from *before* the problem, which
+isn't always the newest file. Photos and videos added after that copy was made stay in `library/`
+but don't show in the app.
+
+A **Reset access** you made after that copy was taken stays in effect: it is also recorded in
+`.backups/access-gen`, so QR cards and sign-ins it revoked keep not working, and the cards you
+printed after it keep working. Only if you also restored the photos share (or its `.backups` folder)
+from an older backup, press **Reset access** again after starting and print new cards.
+
+If appdata is lost or replaced (a failed cache drive, a changed path), the app starts with an
+empty database. It then makes no new copies, so the old ones aren't pushed out, and the admin page
+says so: restore the newest copy as above. To start over with an empty database on purpose, move
+the old copies out of `.backups` first.
 
 ## Updating
 
 - **Docker** tab → **Check for Updates** → **apply update**, or let the **Auto Update Applications**
-  plugin do it. The database is upgraded automatically when the new version starts.
-- `latest` follows the `main` branch. To move only when you choose, set **Repository** to a version,
+  plugin do it. The database is upgraded automatically when the new version starts. Before an
+  upgrade changes it, it is copied to `.backups/app-pre-vN-YYYY-MM-DD.sqlite` (kept until you delete
+  it). To go back after a bad upgrade: set **Repository** to the version you had, then restore that
+  copy as in [Backups](#backups). The older version can't open a database the newer one upgraded.
+- `latest` is the newest commit on `main` that passed every test. To move only when you choose, set **Repository** to a version,
   e.g. `ghcr.io/brewer-michael/family-photos:1.2` (follows 1.2.x fixes) or `…:1.2.3` (exactly that).
-- A new release is published by pushing a git tag like `v1.2.3`. GitHub then builds the image,
-  smoke-tests it and pushes `1.2.3`, `1.2` and `sha-<commit>`.
+- A new release is published by pushing a git tag like `v1.2.3`. GitHub then runs every test,
+  builds and smoke-tests the image, and pushes that same image as `1.2.3`, `1.2` and `sha-<commit>`.
 - Don't download the template again (it would replace your settings). If a release adds a setting
   you want, add it at the bottom of the container's edit page with **Add another Path, Port,
   Variable, Label or Device**.
@@ -339,7 +374,8 @@ hours. If you changed `PUID`/`PGID` or copied files in as root, run **Tools → 
 
 **Videos take very long, or Plex stutters while videos are converting.** Near the top of the log a line
 like `[entrypoint] cgroup v2: cpu.weight=… ` shows the CPU share. If the next line starts with
-"Hint: no --cpu-shares is set", put `--cpu-shares=128 --memory=4g` back into **Extra Parameters**.
+"Hint: no --cpu-shares is set", put `--cpu-shares=128 --memory=4g --restart=unless-stopped` back into
+**Extra Parameters**.
 Lower `VIDEO_THREADS` (e.g. `2`) to leave more cores free, or raise it to finish videos sooner. CPU
 pinning set in Unraid is respected.
 
@@ -364,9 +400,17 @@ sure you're running it (Repository `ghcr.io/brewer-michael/family-photos`) and u
 
 **Forgot the admin password.** Set a new `ADMIN_PASSWORD` in the template and click **Apply**.
 
-**The container restarts while converting very large files.** `--memory=4g` covers a 200-megapixel
-photo and a 4K video at the same time. If the log shows restarts and the server has memory to spare,
-raise it to `--memory=6g`.
+**Very large files fail with "signal SIGKILL".** When the container runs out of memory, Linux
+stops the biggest process in it: the photo or video converter, not the site. The log then shows
+`[queue] the photo lane exited (signal SIGKILL); restarting in …` (or the video lane), or a converter
+that "failed (signal SIGKILL)", and the item is tried again; after 3 tries it is listed under
+**Uploads that didn't work** with "Gave up after 3 attempts" and "signal SIGKILL" in its details.
+`--memory=4g` covers a 200-megapixel photo and a 4K video at the same time. If the server has memory
+to spare, raise it to `--memory=6g` in **Extra Parameters**, then press **Try again** on the item.
+
+**The site stopped and didn't come back.** Look at the end of the log for the error. Check that
+**Extra Parameters** includes `--restart=unless-stopped`: with it, Docker starts the container again
+by itself when it stops unexpectedly (not when you stop it).
 
 ## All settings
 
@@ -392,10 +436,12 @@ Set in the Unraid template. Empty means "use the default". Unraid also passes yo
 | `PUID`, `PGID` | 99, 100 | Owner of the files the app writes |
 | `UMASK` | 022 | Permissions for new files (`002` adds group write) |
 
-**Extra Parameters** (required): `--cpu-shares=128 --memory=4g`.
+**Extra Parameters** (required): `--cpu-shares=128 --memory=4g --restart=unless-stopped`.
 
 Rarely needed: `HEIF_DEC_BIN`, `EXIFTOOL_BIN`, `FFMPEG_BIN` and `FFPROBE_BIN` point at other tool
-binaries. The image itself sets `PORT=3000`, `CONFIG_DIR=/config`, `PHOTOS_DIR=/photos`,
+binaries. `SHUTDOWN_TIMEOUT` (default 8) is how many seconds requests still in flight get to finish
+when the container stops; keep it under Docker's 10-second stop limit (or raise both, with
+`--stop-timeout=30` in Extra Parameters). The image itself sets `PORT=3000`, `CONFIG_DIR=/config`, `PHOTOS_DIR=/photos`,
 `PROTOCOL_HEADER=x-forwarded-proto`, `BODY_SIZE_LIMIT=64M` and `UV_THREADPOOL_SIZE=8`.
 [`.env.example`](.env.example) describes every setting in detail.
 
@@ -442,15 +488,18 @@ install the same way.
 
 **Continuous integration** (`.github/workflows/`):
 
-- `ci.yml`, on pushes to `main` and on pull requests (or run by hand): check, unit tests, build and
-  end-to-end tests on Node 22 and 24; **media-parity**, which runs `npm run test:media` inside
-  `node:24-trixie-slim` with exactly the image's media packages (installed by
-  `docker/media-tools.sh`), so tests that skip on a laptop run there; and a lint job for the Unraid
-  template (`xmllint`) and the shell scripts (`sh -n`, ShellCheck).
-- `docker.yml`, on `main`, `v*` tags and pull requests: builds the image and smoke-tests it
-  (`scripts/ci-docker-smoke.sh`: healthy, sign-in page served, files owned by 99:100, both worker
-  lanes start, a writable home folder, time zone, media self-check passes). Except for pull requests,
-  a second job, the only one allowed to write packages, then pushes it to
+`ci.yml`, on pushes to `main`, `v*` tags and pull requests (or run by hand):
+
+- check, unit tests, build and end-to-end tests on Node 22 and 24;
+- **media-parity**, which runs `npm run test:media` inside `node:24-trixie-slim` with exactly the
+  image's media packages (installed by `docker/media-tools.sh`), so tests that skip on a laptop run
+  there;
+- a lint job for the Unraid template (`xmllint`) and the shell scripts (`sh -n`, ShellCheck);
+- **image**: builds the Docker image and smoke-tests it (`scripts/ci-docker-smoke.sh`: healthy,
+  sign-in page served, files owned by 99:100, both worker lanes start, a writable home folder, time
+  zone, media self-check passes);
+- **publish**, except for pull requests and only once all of the above passed: the only job allowed
+  to write packages pushes the smoke-tested image itself (not a rebuild) to
   `ghcr.io/brewer-michael/family-photos`.
 
 ## Release checklist (real devices)

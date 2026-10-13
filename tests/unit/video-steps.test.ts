@@ -61,6 +61,19 @@ describe('video metadata', () => {
 			takenMs: Date.UTC(2024, 6, 4, 18, 22, 31),
 			offset: null
 		});
+		// Apple date without an offset and no creation_time: the wall time in the server's zone.
+		const prevTz = process.env.TZ;
+		process.env.TZ = 'America/Chicago';
+		try {
+			expect(resolveTaken({ ...base, creationDate: '2024-07-04T18:00:00' })).toEqual({
+				takenAt: '2024-07-04T18:00:00',
+				takenMs: Date.UTC(2024, 6, 4, 23, 0, 0),
+				offset: null
+			});
+		} finally {
+			if (prevTz === undefined) delete process.env.TZ;
+			else process.env.TZ = prevTz;
+		}
 		// creation_time alone is an instant, not a local time: taken_at stays null (readers use taken_ms
 		// in the server's zone), so an evening clip west of UTC isn't shown on the next day.
 		expect(resolveTaken({ ...base, creationTime: '2024-07-05T03:30:00.000000Z' })).toEqual({

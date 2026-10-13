@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import os from 'node:os';
 import path from 'node:path';
-import { ConfigError, loadConfig, publicOrigin } from '#lib/server/config';
-import { setEnv } from '../helpers/env';
+import { ConfigError, SECRET_ENV, envWithoutSecrets, getConfig, loadConfig, publicOrigin, useLaneConfig } from '#lib/server/config';
+import { setEnv, TEST_ADMIN_PASSWORD, TEST_FAMILY_PASSWORD } from '../helpers/env';
 
 const base = { FAMILY_PASSWORD: 'blue lake cabin', ADMIN_PASSWORD: 'admin-test-pass', PUBLIC_URL: 'https://photos.example.com' };
 
@@ -136,5 +136,40 @@ describe('loadConfig()', () => {
 		expect(loadConfig({ ...base, VIDEO_THREADS: 'auto' }).videoThreads).toBe(
 			Math.max(2, Math.floor(os.availableParallelism() / 2))
 		);
+	});
+});
+
+describe('secrets and the worker lanes', () => {
+	it('envWithoutSecrets() drops the family code, admin password and SMTP password, and nothing else', () => {
+		const env = { ...base, SMTP_HOST: 'smtp.example.com', SMTP_USER: 'me@example.com', SMTP_PASS: 'mail-secret', PATH: '/usr/bin' };
+		expect(envWithoutSecrets(env)).toEqual({ PUBLIC_URL: base.PUBLIC_URL, SMTP_HOST: 'smtp.example.com', SMTP_USER: 'me@example.com', PATH: '/usr/bin' });
+		expect(env.FAMILY_PASSWORD).toBe(base.FAMILY_PASSWORD); // a copy
+		expect([...SECRET_ENV]).toEqual(['FAMILY_PASSWORD', 'ADMIN_PASSWORD', 'SMTP_PASS']);
+	});
+
+	it('a lane loads its config without the secrets, and ignores them if it was given them anyway', () => {
+		const lane = loadConfig({ PUBLIC_URL: base.PUBLIC_URL, SMTP_HOST: 'smtp.example.com' }, { lane: true });
+		expect(lane).toMatchObject({ familyPassword: '', adminPassword: '', publicUrl: base.PUBLIC_URL });
+		expect(lane.smtp?.pass).toBeNull();
+		const given = loadConfig({ ...base, SMTP_HOST: 'smtp.example.com', SMTP_PASS: 'mail-secret' }, { lane: true });
+		expect(given).toMatchObject({ familyPassword: '', adminPassword: '' });
+		expect(given.smtp?.pass).toBeNull();
+		// Everything else is still checked.
+		expect(() => loadConfig({}, { lane: true })).toThrow(/PUBLIC_URL is not set/);
+		// The web process still needs them.
+		expect(() => loadConfig({ PUBLIC_URL: base.PUBLIC_URL })).toThrow(/FAMILY_PASSWORD is not set/);
+	});
+
+	it('useLaneConfig() also drops the secrets from the process environment, for the tools it runs', () => {
+		setEnv({ SMTP_PASS: 'mail-secret' });
+		try {
+			const c = useLaneConfig();
+			expect(c.familyPassword).toBe('');
+			expect(getConfig()).toBe(c);
+			for (const key of SECRET_ENV) expect(process.env[key]).toBeUndefined();
+		} finally {
+			setEnv({ FAMILY_PASSWORD: TEST_FAMILY_PASSWORD, ADMIN_PASSWORD: TEST_ADMIN_PASSWORD, SMTP_PASS: undefined });
+		}
+		expect(getConfig().familyPassword).toBe(TEST_FAMILY_PASSWORD);
 	});
 });

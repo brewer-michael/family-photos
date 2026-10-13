@@ -57,3 +57,10 @@
 	stroke-linecap="round"
 	stroke-linejoin="round"><path {d} /></svg
 >
+
+<style>
+	/* Next to text that wraps (a flex row), an icon keeps its size instead of being squeezed. */
+	svg {
+		flex-shrink: 0;
+	}
+</style>

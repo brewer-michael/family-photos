@@ -3,7 +3,7 @@ import type { Handle, ServerInit } from '@sveltejs/kit/hooks';
 import { building } from '$app/env';
 import { boot } from '#lib/server/boot';
 import { issueAccess, readAccess, readDevice } from '#lib/server/auth';
-import { gate } from '#lib/server/gate';
+import { allowsLargeBody, bodyTooLarge, gate } from '#lib/server/gate';
 
 export const init: ServerInit = () => {
 	if (!building) boot();
@@ -16,10 +16,10 @@ export const init: ServerInit = () => {
 // server.js on every response, including the ones Kit answers without calling this hook; the
 // CSP comes from Kit (vite.config.ts).
 
-function plain(status: number, message: string): Response {
+function plain(status: number, message: string, extra: Record<string, string> = {}): Response {
 	return new Response(message, {
 		status,
-		headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }
+		headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...extra }
 	});
 }
 
@@ -33,6 +33,13 @@ export const handle: Handle = async ({ event, resolve }) => {
 	// Defence in depth: never let a proxy/client tunnel another method through POST.
 	if (request.headers.has('x-http-method-override')) {
 		return plain(400, 'Method override is not allowed');
+	}
+
+	// Only tus uploads may send big bodies (BODY_SIZE_LIMIT is sized for their chunks). Checked
+	// before anything reads the body, so an unauthenticated 64 MB form post to /login is refused
+	// instead of buffered and parsed. The connection is closed rather than draining the rest.
+	if (!allowsLargeBody(event.route.id, event.isRemoteRequest) && (await bodyTooLarge(request))) {
+		return plain(413, 'That request is too large', { connection: 'close' });
 	}
 
 	const access = readAccess(cookies);

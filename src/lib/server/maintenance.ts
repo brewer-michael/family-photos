@@ -2,9 +2,12 @@
  * Maintenance (main process; docs/PLAN.md "Storage layout" and "Removal requests").
  *
  * Daily (first run one minute after start):
- *   - items in the trash for more than 30 days are deleted for good (files, then rows)
+ *   - items in the trash for more than 30 days are deleted for good (rows, then files; files that
+ *     could not be deleted are tried again)
  *   - `duplicate` rows older than 24 h are deleted, with any upload/original they still have
- *   - db.backup() → PHOTOS_DIR/.backups/app-YYYY-MM-DD.sqlite; the newest 7 are kept
+ *   - db.backup() → PHOTOS_DIR/.backups/app-YYYY-MM-DD.sqlite; the newest 7 are kept. Skipped
+ *     (with the reason on the admin page) while the newest copy there is of a different database:
+ *     app.sqlite was lost or replaced, and copying the new one would push the real copies out.
  *   - .incoming sweep: tus files untouched for 48 h whose token no item uses, and FileStore
  *     <token>.json files the lanes leave behind for items that are done (their token is cleared)
  *   - cache dirs of items that no longer exist (untouched for an hour)
@@ -19,15 +22,16 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import Database from 'better-sqlite3';
 import { getConfig, publicOrigin } from './config';
-import { getDb } from './db';
+import { getDb, tx } from './db';
 import { backupPath, backupsDir, cacheRoot, incomingDir } from './paths';
 import { pruneOutbox, sendMail, type MailMessage, type MailResult } from './mail';
 import { sendStuckRemovalEmails } from './removal';
-import { ERROR_CODE_LABELS, TRASH_KEEP_MS, deleteItemFiles, purgeTrash, removeInside } from './admin';
+import { ERROR_CODE_LABELS, TRASH_KEEP_MS, deleteQueuedFiles, purgeTrash, removeInside } from './admin';
 import * as media from './repo/media';
-import { albumTitles, existingMediaIds } from './repo/admin';
-import { getNumber, setNumber } from './repo/settings';
+import { albumTitles, existingMediaIds, queueFileDeletions } from './repo/admin';
+import { deleteSetting, getNumber, getSecret, getSetting, setNumber, setSetting } from './repo/settings';
 import { ULID_RE } from '#lib/shared/media-types';
 
 const MINUTE_MS = 60_000;
@@ -50,6 +54,13 @@ export const DIGEST_MIN_GAP_MS = HOUR_MS - 5 * MINUTE_MS;
 const DIGEST_SETTING = 'failure_digest_at';
 
 const BACKUP_NAME = /^app-\d{4}-\d{2}-\d{2}\.sqlite$/;
+/** A backup being written when the app stopped (with what SQLite may have left next to it). */
+const PARTIAL_NAME = /^app-.*\.sqlite\.partial(-wal|-shm|-journal)?$/;
+/** Files SQLite keeps next to a database file. */
+const SIDE_FILES = ['-wal', '-shm', '-journal'];
+const BACKUP_OK_SETTING = 'backup_ok_at';
+const BACKUP_ERROR_SETTING = 'backup_error';
+const BACKUP_ERROR_AT_SETTING = 'backup_error_at';
 /** A tus upload (<token>) or its FileStore metadata (<token>.json); see paths.incomingPath(). */
 const INCOMING_NAME = /^([A-Za-z0-9_-]{16,64})(\.json)?$/;
 const SHARD_NAME = /^[0-9A-HJKMNP-TV-Z]{2}$/;
@@ -78,35 +89,134 @@ async function mtime(p: string): Promise<number | null> {
 // Daily steps
 // ---------------------------------------------------------------------------
 
-/** Deletes old `duplicate` rows and whatever files they still have. Returns how many. */
+/**
+ * Deletes old `duplicate` rows and whatever files they still have (rows first, recording the files
+ * in the same transaction; see admin.deleteQueuedFiles). Returns how many.
+ */
 export async function purgeDuplicates(now: number = Date.now()): Promise<number> {
-	const rows = media.purgeDuplicatesOlderThan(DUPLICATE_KEEP_MS, now);
-	for (const row of rows) await deleteItemFiles(row);
+	const rows = tx(() => {
+		const gone = media.purgeDuplicatesOlderThan(DUPLICATE_KEEP_MS, now);
+		queueFileDeletions(gone, now);
+		return gone;
+	});
+	await deleteQueuedFiles();
 	return rows.length;
 }
 
-/**
- * Backs the database up to .backups/app-<UTC date>.sqlite (written as .partial, then renamed) and
- * keeps the newest BACKUPS_KEPT. Returns the backup's path.
- */
-export async function backupDatabase(now: number = Date.now()): Promise<string> {
-	const dir = backupsDir();
-	await fs.promises.mkdir(dir, { recursive: true });
-	const file = backupPath(new Date(now));
-	const partial = `${file}.partial`;
-	await fs.promises.rm(partial, { force: true });
-	await getDb().backup(partial);
-	await fs.promises.rename(partial, file);
-
-	const entries = await list(dir);
-	const backups = entries
+/** Nightly backups in .backups, newest first. */
+function backupNames(entries: readonly fs.Dirent[]): string[] {
+	return entries
 		.filter((e) => e.isFile() && BACKUP_NAME.test(e.name))
 		.map((e) => e.name)
 		.sort()
 		.reverse();
-	const stale = entries.filter((e) => e.isFile() && e.name.endsWith('.sqlite.partial')).map((e) => e.name);
-	for (const name of [...backups.slice(BACKUPS_KEPT), ...stale]) await removeInside(dir, path.join(dir, name));
+}
+
+/**
+ * The `secret` setting in a backup: which database it is a copy of (seed() picks it at random on
+ * first boot and nothing changes it; "Reset access" changes access_gen). undefined when the file
+ * can't be read as one of our databases.
+ */
+function backupIdentity(file: string): string | undefined {
+	// A read-only open of a copy in WAL mode (as copies were before they were made single files)
+	// leaves an empty -wal and -shm next to it; those are removed again.
+	const absent = ['-wal', '-shm'].map((s) => file + s).filter((f) => !fs.existsSync(f));
+	let db: Database.Database | null = null;
+	try {
+		db = new Database(file, { readonly: true, fileMustExist: true });
+		const value = db.prepare("SELECT value FROM settings WHERE key = 'secret'").pluck().get();
+		return typeof value === 'string' ? value : undefined;
+	} catch {
+		return undefined;
+	} finally {
+		db?.close();
+		for (const f of absent) fs.rmSync(f, { force: true });
+	}
+}
+
+/** Why no backup was made while .backups holds copies of another database (admin page and log). */
+export function differentDatabaseMessage(newest: string): string {
+	return (
+		`No new copy was made: the copies in .backups (the newest is ${newest}) are of a different database, ` +
+		'so app.sqlite was lost or replaced, and a new copy would push them out. To get the albums back, stop ' +
+		'the container and restore the newest copy from before the problem (see "Backups" in the README). ' +
+		'To start over on purpose, move the old copies out of .backups.'
+	);
+}
+
+/**
+ * Backs the database up to .backups/app-<UTC date>.sqlite (written as .partial, made a single file
+ * with no -wal, then renamed) and keeps the newest BACKUPS_KEPT. Refuses (throws, writing and
+ * deleting nothing) when the newest readable copy there is of a different database. The outcome is
+ * kept in settings for the admin page (backupStatus). Returns the backup's path.
+ */
+export async function backupDatabase(now: number = Date.now()): Promise<string> {
+	try {
+		const file = await writeBackup(now);
+		setNumber(BACKUP_OK_SETTING, now);
+		deleteSetting(BACKUP_ERROR_SETTING);
+		deleteSetting(BACKUP_ERROR_AT_SETTING);
+		return file;
+	} catch (e) {
+		try {
+			setSetting(BACKUP_ERROR_SETTING, e instanceof Error ? e.message : String(e));
+			setNumber(BACKUP_ERROR_AT_SETTING, now);
+		} catch {
+			// the database itself is in trouble; the log has the backup error
+		}
+		throw e;
+	}
+}
+
+async function writeBackup(now: number): Promise<string> {
+	const dir = backupsDir();
+	await fs.promises.mkdir(dir, { recursive: true });
+	const live = getSecret();
+	for (const name of backupNames(await list(dir))) {
+		const identity = backupIdentity(path.join(dir, name));
+		if (identity === undefined) continue; // not readable as ours: look at the next one
+		if (identity !== live) throw new Error(differentDatabaseMessage(name));
+		break;
+	}
+
+	const file = backupPath(new Date(now));
+	const partial = `${file}.partial`;
+	for (const f of [partial, ...SIDE_FILES.map((s) => partial + s)]) await fs.promises.rm(f, { force: true });
+	await getDb().backup(partial);
+	const copy = new Database(partial);
+	try {
+		copy.pragma('journal_mode = DELETE'); // one self-contained file, also when opened read-only
+	} finally {
+		copy.close();
+	}
+	// Side files of the copy being replaced would be applied to the new one when it is opened.
+	for (const s of SIDE_FILES) await fs.promises.rm(file + s, { force: true });
+	await fs.promises.rename(partial, file);
+
+	const entries = await list(dir);
+	const old = backupNames(entries).slice(BACKUPS_KEPT);
+	const stale = entries.filter((e) => e.isFile() && PARTIAL_NAME.test(e.name)).map((e) => e.name);
+	for (const name of [...old.flatMap((n) => [n, ...SIDE_FILES.map((s) => n + s)]), ...stale]) {
+		await removeInside(dir, path.join(dir, name));
+	}
 	return file;
+}
+
+export interface BackupStatus {
+	/** When the last database copy was made. */
+	lastOkAt: number | null;
+	/** Why the last attempt didn't work (cleared by the next copy that works). */
+	error: string | null;
+	errorAt: number | null;
+}
+
+/** The nightly backup's last outcome, for the admin page. */
+export function backupStatus(): BackupStatus {
+	return {
+		lastOkAt: getNumber(BACKUP_OK_SETTING) ?? null,
+		error: getSetting(BACKUP_ERROR_SETTING) ?? null,
+		errorAt: getNumber(BACKUP_ERROR_AT_SETTING) ?? null
+	};
 }
 
 /** Deletes tus uploads (and their .json) untouched for 48 h whose token no item uses. Returns how many uploads. */

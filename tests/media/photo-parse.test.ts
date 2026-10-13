@@ -139,6 +139,18 @@ describe('decoder list', () => {
 	});
 });
 
+/** Runs fn with process.env.TZ set (Node re-reads TZ on assignment), then restores it. */
+function inZone(tz: string, fn: () => void): void {
+	const prev = process.env.TZ;
+	process.env.TZ = tz;
+	try {
+		fn();
+	} finally {
+		if (prev === undefined) delete process.env.TZ;
+		else process.env.TZ = prev;
+	}
+}
+
 describe('taken date', () => {
 	const fallback = { clientMtimeMs: Date.UTC(2023, 0, 2, 3, 4, 5), uploadedMs: Date.UTC(2025, 0, 1) };
 
@@ -148,10 +160,30 @@ describe('taken date', () => {
 			takenMs: Date.UTC(2024, 6, 4, 18, 22, 31, 123),
 			offset: '-07:00'
 		});
-		expect(parseExifDate('2024:07:04 11:22:31')).toEqual({ takenAt: '2024-07-04T11:22:31', takenMs: Date.UTC(2024, 6, 4, 11, 22, 31), offset: null });
+		// No offset: the wall time in the server's zone (whatever TZ this machine has).
+		expect(parseExifDate('2024:07:04 11:22:31')).toEqual({ takenAt: '2024-07-04T11:22:31', takenMs: new Date(2024, 6, 4, 11, 22, 31).getTime(), offset: null });
 		expect(parseExifDate('2024:07:04 11:22:31.5+0200')).toMatchObject({ takenAt: '2024-07-04T11:22:31+02:00', takenMs: Date.UTC(2024, 6, 4, 9, 22, 31, 500) });
 		expect(parseExifDate('2024-07-04T11:22:31Z')).toMatchObject({ takenAt: '2024-07-04T11:22:31+00:00', offset: '+00:00' });
 		expect(parseExifDate('1985:06:01 12:00:00')).toMatchObject({ takenAt: '1985-06-01T12:00:00' });
+	});
+
+	it('reads a wall time without an offset in the server time zone, so mixed devices sort together', () => {
+		inZone('America/Chicago', () => {
+			// Grandpa's camera at 6 pm CDT (no offset) vs an iPhone at 1 pm and 5 pm CDT (with offsets).
+			const canon = resolveTaken({ 'ExifIFD:DateTimeOriginal': '2024:07:04 18:00:00', 'ExifIFD:SubSecTimeOriginal': '25' }, fallback);
+			expect(canon).toEqual({ takenAt: '2024-07-04T18:00:00', takenMs: Date.UTC(2024, 6, 4, 23, 0, 0, 250), offset: null });
+			const iphone1pm = resolveTaken({ 'ExifIFD:DateTimeOriginal': '2024:07:04 13:00:00', 'ExifIFD:OffsetTimeOriginal': '-05:00' }, fallback);
+			const iphone5pm = resolveTaken({ 'ExifIFD:DateTimeOriginal': '2024:07:04 17:00:00', 'ExifIFD:OffsetTimeOriginal': '-05:00' }, fallback);
+			expect(iphone1pm.takenMs).toBeLessThan(iphone5pm.takenMs);
+			expect(iphone5pm.takenMs).toBeLessThan(canon.takenMs);
+			// Winter: CST (-06:00), from the zone's rules for that date.
+			expect(parseExifDate('2024:01:15 08:30:00')?.takenMs).toBe(Date.UTC(2024, 0, 15, 14, 30));
+			// An explicit offset is never second-guessed by the server's zone.
+			expect(parseExifDate('2024:07:04 18:00:00', '+02:00')?.takenMs).toBe(Date.UTC(2024, 6, 4, 16, 0));
+		});
+		inZone('UTC', () => {
+			expect(parseExifDate('2024:07:04 18:00:00')?.takenMs).toBe(Date.UTC(2024, 6, 4, 18, 0));
+		});
 	});
 
 	it('rejects unset, partial and impossible dates', () => {

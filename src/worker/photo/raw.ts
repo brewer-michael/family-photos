@@ -7,8 +7,9 @@
  */
 import path from 'node:path';
 import sharp from 'sharp';
-import { MediaError } from '#lib/shared/errors';
+import { MediaError, errorDetail } from '#lib/shared/errors';
 import { exiftool } from '../exiftool';
+import { exiftoolTransient } from './metadata';
 
 export const RAW_MIN_LONG_EDGE = 1600;
 
@@ -18,7 +19,10 @@ export const RAW_FILE_TYPES = new Set([
 	'NEF', 'NRW', 'ORF', 'ORI', 'PEF', 'RAF', 'RW2', 'RWL', 'SR2', 'SRF', 'SRW'
 ]);
 
-/** Extracts the largest usable preview into `dir` and returns its path (no tags copied yet). */
+/**
+ * Extracts the largest usable preview into `dir` and returns its path (no tags copied yet). A
+ * transient exiftool failure (timeout, exiftool gone, disk) is retryable rather than "no preview".
+ */
 export async function rawPreview(src: string, dir: string): Promise<string> {
 	const et = exiftool();
 	const candidates: { file: string; pixels: number; longEdge: number }[] = [];
@@ -29,11 +33,16 @@ export async function rawPreview(src: string, dir: string): Promise<string> {
 		const file = path.join(dir, `${tag}.jpg`);
 		try {
 			await extract(src, file);
+		} catch (e) {
+			if (exiftoolTransient(e)) throw new MediaError('retryable', `exiftool could not extract the RAW's ${tag}: ${errorDetail(e, 500)}`);
+			continue; // this RAW has no such preview
+		}
+		try {
 			const m = await sharp(file).metadata();
 			if (m.format !== 'jpeg') continue;
 			candidates.push({ file, pixels: m.width * m.height, longEdge: Math.max(m.width, m.height) });
 		} catch {
-			// This RAW has no such preview (or it is unreadable): try the next one.
+			// The extracted preview is unreadable: try the next one.
 		}
 	}
 	const best = candidates.filter((c) => c.longEdge >= RAW_MIN_LONG_EDGE).sort((a, b) => b.pixels - a.pixels)[0];

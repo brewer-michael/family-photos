@@ -78,59 +78,61 @@ export function get(id: number, opts: { includeDeleted?: boolean } = {}): AlbumR
 	return row;
 }
 
-const SUMMARY_SQL = `
-	SELECT a.*,
-		COALESCE(c.item_count, 0)  AS item_count,
-		COALESCE(c.photo_count, 0) AS photo_count,
-		COALESCE(c.video_count, 0) AS video_count,
-		COALESCE(
-			(SELECT m.id FROM media m WHERE m.id = a.cover_media_id AND m.album_id = a.id
-				AND m.status = 'ready' AND m.deleted_at IS NULL AND m.live_photo_of IS NULL),
-			(SELECT m.id FROM media m WHERE m.album_id = a.id
-				AND m.status = 'ready' AND m.deleted_at IS NULL AND m.live_photo_of IS NULL
-				ORDER BY m.taken_ms DESC, m.id DESC LIMIT 1)
-		) AS cover_id
-	FROM albums a
-	LEFT JOIN (
-		SELECT album_id,
-			COUNT(*) AS item_count,
-			SUM(kind = 'photo') AS photo_count,
-			SUM(kind = 'video') AS video_count
-		FROM media
-		WHERE status = 'ready' AND deleted_at IS NULL AND live_photo_of IS NULL
-		GROUP BY album_id
-	) c ON c.album_id = a.id`;
-
-type SummaryRaw = Omit<AlbumSummary, 'cover_kind'>;
-
-function withCoverKind(rows: SummaryRaw[]): AlbumSummary[] {
-	if (rows.length === 0) return [];
-	const kindOf = stmt('SELECT kind FROM media WHERE id = ?');
-	return rows.map((r) => ({
-		...r,
-		cover_kind: r.cover_id ? (((kindOf.get(r.cover_id) as { kind: Kind | null } | undefined)?.kind ?? null)) : null
-	}));
+/**
+ * Albums with their counts, cover and the cover's kind, in one query. `oneAlbum` puts the album
+ * filter inside the counting subquery (a `?` for the album id, bound twice), so a single album's
+ * summary reads only that album's rows (media_album_view) instead of grouping the whole library
+ * and keeping one group.
+ */
+function summarySql(oneAlbum: boolean): string {
+	return `
+	SELECT s.*, (SELECT m.kind FROM media m WHERE m.id = s.cover_id) AS cover_kind
+	FROM (
+		SELECT a.*,
+			COALESCE(c.item_count, 0)  AS item_count,
+			COALESCE(c.photo_count, 0) AS photo_count,
+			COALESCE(c.video_count, 0) AS video_count,
+			COALESCE(
+				(SELECT m.id FROM media m WHERE m.id = a.cover_media_id AND m.album_id = a.id
+					AND m.status = 'ready' AND m.deleted_at IS NULL AND m.live_photo_of IS NULL),
+				(SELECT m.id FROM media m WHERE m.album_id = a.id
+					AND m.status = 'ready' AND m.deleted_at IS NULL AND m.live_photo_of IS NULL
+					ORDER BY m.taken_ms DESC, m.id DESC LIMIT 1)
+			) AS cover_id
+		FROM albums a
+		LEFT JOIN (
+			SELECT album_id,
+				COUNT(*) AS item_count,
+				SUM(kind = 'photo') AS photo_count,
+				SUM(kind = 'video') AS video_count
+			FROM media
+			WHERE ${oneAlbum ? 'album_id = ? AND ' : ''}status = 'ready' AND deleted_at IS NULL AND live_photo_of IS NULL
+			GROUP BY album_id
+		) c ON c.album_id = a.id
+		${oneAlbum ? 'WHERE a.id = ?' : ''}
+	) s`;
 }
+
+const ALL_SUMMARIES = summarySql(false);
+const ONE_SUMMARY = summarySql(true);
 
 /** Albums with counts and cover, most recently updated first. */
 export function list(opts: { includeDeleted?: boolean } = {}): AlbumSummary[] {
-	const where = opts.includeDeleted ? '' : 'WHERE a.deleted_at IS NULL';
-	const rows = stmt(`${SUMMARY_SQL} ${where} ORDER BY a.updated_at DESC, a.id DESC`).all() as SummaryRaw[];
-	return withCoverKind(rows);
+	const where = opts.includeDeleted ? '' : 'WHERE s.deleted_at IS NULL';
+	return stmt(`${ALL_SUMMARIES} ${where} ORDER BY s.updated_at DESC, s.id DESC`).all() as AlbumSummary[];
 }
 
 /** One album with counts and cover. */
 export function getSummary(id: number, opts: { includeDeleted?: boolean } = {}): AlbumSummary | undefined {
-	const rows = stmt(`${SUMMARY_SQL} WHERE a.id = ?`).all(id) as SummaryRaw[];
-	const row = withCoverKind(rows)[0];
+	if (!Number.isInteger(id)) return undefined;
+	const row = stmt(ONE_SUMMARY).get(id, id) as AlbumSummary | undefined;
 	if (!row || (row.deleted_at !== null && !opts.includeDeleted)) return undefined;
 	return row;
 }
 
 /** Soft-deleted albums (admin trash). */
 export function listDeleted(): AlbumSummary[] {
-	const rows = stmt(`${SUMMARY_SQL} WHERE a.deleted_at IS NOT NULL ORDER BY a.deleted_at DESC`).all() as SummaryRaw[];
-	return withCoverKind(rows);
+	return stmt(`${ALL_SUMMARIES} WHERE s.deleted_at IS NOT NULL ORDER BY s.deleted_at DESC`).all() as AlbumSummary[];
 }
 
 /** Updates the given fields (undefined = unchanged, null = clear). Returns the new row. */
