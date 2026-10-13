@@ -1,0 +1,23 @@
+# The image build needs package*.json, the sources and configs that `npm run build` reads
+# (src/, static/, *.config.ts, tsconfig.json), server.js and docker/. Keep out generated files,
+# local data, tests and anything that could hold secrets.
+.git
+.github
+**/node_modules
+build
+build-worker
+.svelte-kit
+data
+tmp
+test-results
+playwright-report
+blob-report
+coverage
+.fp-e2e-*
+tests
+docs
+unraid
+.env
+.env.*
+Dockerfile
+.dockerignore

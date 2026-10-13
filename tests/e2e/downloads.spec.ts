@@ -127,4 +127,23 @@ test.describe('downloads', () => {
 		await expect(page.getByRole('status').filter({ hasText: 'All 2 are in your Downloads.' })).toBeVisible();
 		await expect.poll(() => names.sort()).toEqual(['IMG_0001.jpg', 'IMG_0002.jpg']);
 	});
+
+	test('"Save all" on a phone stops when you leave the album', async ({ page }, testInfo) => {
+		test.skip(testInfo.project.name !== 'mobile', 'computers get the ZIP');
+		const album = seedAlbum('Leave half-way');
+		for (let i = 1; i <= 8; i++) await seedMedia(album, { name: `IMG_000${i}.HEIC`, takenAt: `2023-07-0${i}T10:00:00` });
+		await login(page, 'Grandma Jo');
+		await page.goto(`/album/${album}`);
+
+		let count = 0;
+		page.on('download', () => (count += 1));
+		await page.getByRole('button', { name: 'Save all to my phone' }).click();
+		await expect.poll(() => count).toBeGreaterThan(0);
+		await page.getByRole('link', { name: 'All albums' }).click();
+		await expect(page).toHaveURL(/\/$/);
+		const atLeave = count;
+		await page.waitForTimeout(2500); // five more would have started by now
+		expect(count).toBeLessThanOrEqual(atLeave + 1);
+		expect(count).toBeLessThan(8);
+	});
 });

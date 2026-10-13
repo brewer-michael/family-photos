@@ -1,12 +1,23 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { describe, expect, it } from 'vitest';
-import type { FfprobeResult } from '#lib/server/media/probe';
+import { afterEach, describe, expect, it } from 'vitest';
+import { ffprobeJson, type FfprobeResult } from '#lib/server/media/probe';
 import { MediaError } from '#lib/shared/errors';
-import { testEnv } from '../helpers/env';
-import { creationTimeFor, exifDate, gpsCoordinates, parseIso6709, parseLocalDate, resolveTaken } from '../../src/worker/video/metadata';
+import { setEnv, testEnv } from '../helpers/env';
+import {
+	creationTimeFor,
+	exifDate,
+	exiftoolArgs,
+	exiftoolTimeoutMs,
+	gpsCoordinates,
+	parseIso6709,
+	parseLocalDate,
+	resolveTaken,
+	writeVideoMetadata,
+	type Taken
+} from '../../src/worker/video/metadata';
 import { faststartProblem, topLevelBoxes } from '../../src/worker/video/mp4';
-import { ProgressParser, hardCapMs, toMediaError } from '../../src/worker/video/progress';
+import { ProgressParser, hardCapMs, runConversion, toMediaError } from '../../src/worker/video/progress';
 import { checkOutput } from '../../src/worker/video/verify';
 import { RunError } from '../../src/worker/spawn';
 
@@ -50,9 +61,11 @@ describe('video metadata', () => {
 			takenMs: Date.UTC(2024, 6, 4, 18, 22, 31),
 			offset: null
 		});
-		expect(resolveTaken({ ...base, creationTime: '2024-07-04T18:22:31.000000Z' })).toEqual({
-			takenAt: '2024-07-04T18:22:31Z',
-			takenMs: Date.UTC(2024, 6, 4, 18, 22, 31),
+		// creation_time alone is an instant, not a local time: taken_at stays null (readers use taken_ms
+		// in the server's zone), so an evening clip west of UTC isn't shown on the next day.
+		expect(resolveTaken({ ...base, creationTime: '2024-07-05T03:30:00.000000Z' })).toEqual({
+			takenAt: null,
+			takenMs: Date.UTC(2024, 6, 5, 3, 30),
 			offset: null
 		});
 		// Unset camera clocks (1904/1970) fall through.
@@ -70,6 +83,59 @@ describe('video metadata', () => {
 		expect(exifDate('2024-07-04T11:22:31-07:00')).toBe('2024:07:04 11:22:31-07:00');
 		expect(gpsCoordinates({ lat: 37.3349, lon: -122.009, alt: 10 })).toBe('37.3349, -122.009, 10');
 		expect(gpsCoordinates({ lat: 1 / 3, lon: 2, alt: null })).toBe('0.333333, 2');
+	});
+});
+
+/** An executable shell script in the test's temp dir (a stand-in for ffmpeg/ffprobe/exiftool). */
+function fakeTool(name: string, body: string): string {
+	const f = path.join(testEnv().root, name);
+	fs.writeFileSync(f, `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+	return f;
+}
+
+describe('exiftool step', () => {
+	const taken: Taken = { takenAt: '2024-07-04T11:22:31-07:00', takenMs: Date.UTC(2024, 6, 4, 18, 22, 31), offset: '-07:00' };
+	const gps = { lat: 37.3349, lon: -122.009, alt: 10 };
+	const signal = new AbortController().signal;
+	const saved = process.env.EXIFTOOL_PATH;
+	afterEach(() => {
+		if (saved === undefined) delete process.env.EXIFTOOL_PATH;
+		else process.env.EXIFTOOL_PATH = saved;
+	});
+	const mp4 = () => {
+		const f = path.join(testEnv().root, 'meta.mp4');
+		fs.writeFileSync(f, Buffer.alloc(1024));
+		return f;
+	};
+
+	it('allows 60 s plus 1 s per 10 MB, and enables large files', () => {
+		expect(exiftoolTimeoutMs(0)).toBe(60_000);
+		expect(exiftoolTimeoutMs(4_300_000_000)).toBe(490_000);
+		expect(exiftoolArgs('/w/x.mp4', { 'Keys:CreationDate': '2024:07:04 11:22:31-07:00' })).toEqual([
+			'-overwrite_original', '-api', 'QuickTimeUTC=1', '-api', 'LargeFileSupport=1', '-Keys:CreationDate=2024:07:04 11:22:31-07:00', '/w/x.mp4'
+		]);
+	});
+
+	it('runs its own exiftool with the date and both GPS tags', async () => {
+		const log = path.join(testEnv().root, 'exiftool-args.txt');
+		process.env.EXIFTOOL_PATH = fakeTool('exiftool-ok', `printf '%s\\n' "$@" > '${log}'\necho '    1 image files updated'`);
+		const file = mp4();
+		await writeVideoMetadata(file, taken, gps, signal);
+		expect(fs.readFileSync(log, 'utf8').trim().split('\n')).toEqual([
+			...exiftoolArgs(file, { 'Keys:CreationDate': '2024:07:04 11:22:31-07:00', 'Keys:GPSCoordinates': '37.3349, -122.009, 10', 'UserData:GPSCoordinates': '37.3349, -122.009, 10' })
+		]);
+	});
+
+	it('skips exiftool when there is nothing to write', async () => {
+		process.env.EXIFTOOL_PATH = path.join(testEnv().root, 'no-such-exiftool');
+		await expect(writeVideoMetadata(mp4(), { takenAt: null, takenMs: 1, offset: null }, null, signal)).resolves.toBeUndefined();
+	});
+
+	it('maps exiftool failures to retryable', async () => {
+		process.env.EXIFTOOL_PATH = fakeTool('exiftool-err', `echo 'Error: End of processing at large atom (LargeFileSupport not enabled)' >&2\nexit 1`);
+		await expect(writeVideoMetadata(mp4(), taken, null, signal)).rejects.toMatchObject({ code: 'retryable', detail: expect.stringMatching(/LargeFileSupport/) });
+		process.env.EXIFTOOL_PATH = fakeTool('exiftool-noop', `echo '    0 image files updated'`);
+		await expect(writeVideoMetadata(mp4(), taken, null, signal)).rejects.toMatchObject({ code: 'retryable', detail: expect.stringMatching(/did not update/) });
 	});
 });
 
@@ -95,16 +161,77 @@ describe('ffmpeg progress', () => {
 	});
 
 	it('maps runner failures to media errors', () => {
-		const exit = new RunError('exit', 'ffmpeg', 1, '[mov] moov atom not found\nError opening input', 'ffmpeg failed');
-		expect(toMediaError(exit, 'ffmpeg')).toMatchObject({ name: 'MediaError', code: 'corrupt' });
-		const other = new RunError('exit', 'ffmpeg', 1, 'Option not found', 'ffmpeg failed');
-		expect(toMediaError(other, 'ffmpeg')).toMatchObject({ code: 'retryable' });
+		const exit = (stderr: string) => new RunError('exit', 'ffmpeg', 1, stderr, 'ffmpeg failed');
+		expect(toMediaError(exit('[mov] moov atom not found\nError opening input: Invalid data found when processing input'), 'ffmpeg')).toMatchObject({ name: 'MediaError', code: 'corrupt' });
+		expect(toMediaError(exit('[hevc] Could not find ref with POC 3\nDecode error rate 0.9 exceeds maximum 0.666667'), 'ffmpeg')).toMatchObject({ code: 'corrupt' });
+		expect(toMediaError(exit('Option not found'), 'ffmpeg')).toMatchObject({ code: 'retryable' });
+		// A few bad frames are normal in camera files; they don't make a failed run 'corrupt'.
+		const glitch = '[h264] error while decoding MB 12 7, bytestream -5\n[h264] concealing 300 DC, 300 AC errors\nError while decoding stream #0:0: Invalid data found when processing input';
+		expect(toMediaError(exit(`${glitch}\nConversion failed!`), 'ffmpeg')).toMatchObject({ code: 'retryable' });
+		// System trouble wins over input errors seen on the way.
+		expect(toMediaError(exit(`${glitch}\nDecode error rate 0.7 exceeds maximum 0.666667\nav_interleaved_write_frame(): No space left on device`), 'ffmpeg')).toMatchObject({ code: 'retryable' });
+		expect(toMediaError(exit('Error opening input: Input/output error'), 'ffmpeg')).toMatchObject({ code: 'retryable' });
 		const stall = new RunError('aborted', 'ffmpeg', null, '', 'ffmpeg aborted');
-		const e = toMediaError(stall, 'ffmpeg', true);
-		expect(MediaError.is(e) && e.detail).toMatch(/stalled/);
+		const e = toMediaError(stall, 'ffmpeg', 180_000);
+		expect(MediaError.is(e) && e.detail).toMatch(/stalled: no progress for 180 s/);
 		expect(toMediaError(new RunError('timeout', 'ffmpeg', null, '', 'ffmpeg exceeded 420 s'), 'ffmpeg')).toMatchObject({ code: 'retryable' });
 		const plain = new Error('x');
 		expect(toMediaError(plain, 'ffmpeg')).toBe(plain);
+	});
+});
+
+describe('runConversion', () => {
+	const base = { expectedDurationS: 10, sourceDurationS: 10, signal: new AbortController().signal };
+
+	it('reports progress from -progress blocks and resolves on exit 0', async () => {
+		const ffmpeg = fakeTool('ffmpeg-ok', `printf 'out_time_us=2500000\\nspeed=2.5x\\nprogress=continue\\nout_time_us=10000000\\nprogress=end\\n'`);
+		const seen: [number, number | undefined][] = [];
+		await runConversion(ffmpeg, [], { ...base, progress: (pct, etaS) => seen.push([pct, etaS]) });
+		expect(seen).toEqual([[25, 3], [99, 0]]);
+	});
+
+	it('kills ffmpeg when out_time stops advancing (stall) → retryable', async () => {
+		const ffmpeg = fakeTool('ffmpeg-stall', `while :; do printf 'out_time_us=1000000\\nspeed=1x\\nprogress=continue\\n'; sleep 0.05; done`);
+		const started = Date.now();
+		await expect(runConversion(ffmpeg, [], { ...base, progress: () => undefined, stallMs: 400 })).rejects.toMatchObject({
+			code: 'retryable',
+			detail: expect.stringMatching(/ffmpeg stalled: no progress for 0.4 s/)
+		});
+		expect(Date.now() - started).toBeLessThan(5_000);
+	});
+
+	it('kills ffmpeg at the hard cap even while it advances → retryable', async () => {
+		const ffmpeg = fakeTool('ffmpeg-slow', `i=0\nwhile :; do i=$((i+10000)); printf 'out_time_us=%d\\nprogress=continue\\n' $i; sleep 0.05; done`);
+		await expect(runConversion(ffmpeg, [], { ...base, progress: () => undefined, timeoutMs: 400 })).rejects.toMatchObject({
+			code: 'retryable',
+			detail: expect.stringMatching(/exceeded/)
+		});
+	});
+
+	it('maps an unreadable input to corrupt', async () => {
+		const ffmpeg = fakeTool('ffmpeg-bad', `echo 'Error opening input: Invalid data found when processing input' >&2\nexit 1`);
+		await expect(runConversion(ffmpeg, [], { ...base, progress: () => undefined })).rejects.toMatchObject({ code: 'corrupt' });
+	});
+});
+
+describe('ffprobe errors', () => {
+	afterEach(() => setEnv({ FFPROBE_BIN: undefined }));
+	const file = () => {
+		const f = path.join(testEnv().root, 'probe-me.mp4');
+		fs.writeFileSync(f, 'x');
+		return f;
+	};
+
+	it('a timeout or a missing ffprobe is retryable', async () => {
+		setEnv({ FFPROBE_BIN: fakeTool('ffprobe-hang', 'exec sleep 10') });
+		await expect(ffprobeJson(file(), { timeoutMs: 200 })).rejects.toMatchObject({ name: 'MediaError', code: 'retryable' });
+		setEnv({ FFPROBE_BIN: path.join(testEnv().root, 'no-such-ffprobe') });
+		await expect(ffprobeJson(file())).rejects.toMatchObject({ code: 'retryable', detail: expect.stringMatching(/ENOENT/) });
+	});
+
+	it('an unreadable file is corrupt', async () => {
+		setEnv({ FFPROBE_BIN: fakeTool('ffprobe-bad', `echo 'probe-me.mp4: Invalid data found when processing input' >&2\nexit 1`) });
+		await expect(ffprobeJson(file())).rejects.toMatchObject({ code: 'corrupt', detail: expect.stringMatching(/Invalid data/) });
 	});
 });
 

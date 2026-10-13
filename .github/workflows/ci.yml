@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Check, unit and e2e tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22: the oldest supported (package.json engines); 24: what the Docker image runs.
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # Ubuntu's libheif 1.17 ships heif-convert instead of heif-dec; the app detects either.
+      - name: Install media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg libimage-exiftool-perl unzip \
+            libheif-examples libheif-plugin-libde265 libheif-plugin-dav1d libheif-plugin-ffmpegdec libheif-plugin-x265
+
+      # Like the Dockerfile: better-sqlite3's own prebuilt binary, not a local compile (npm 11 would
+      # run node-gyp for it), so `prepare` (svelte-kit sync) runs as a step of its own.
+      - run: npm ci --ignore-scripts
+      - run: npm run prepare
+      - run: npm run check
+      - run: npm test
+      - run: npm run build
+
+      - name: Install Chromium for Playwright
+        run: npx playwright install --with-deps chromium
+
+      - run: npm run test:e2e
+
+      - name: Upload the Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-node${{ matrix.node }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  media-parity:
+    name: Media tests (production toolchain)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    # The Docker image's base and media packages (docker/media-tools.sh): ffmpeg 7.1, libheif 1.19
+    # with heif-dec, exiftool 13. Tests that skip locally on ffmpeg 6.1 run here.
+    container: node:24-trixie-slim
+    steps:
+      - uses: actions/checkout@v7
+
+      # Plus the x265 encoder plugin, which the tests use to build a very large HEIC with heif-enc.
+      - name: Install the image's media tools
+        run: sh docker/media-tools.sh install libheif-plugin-x265
+
+      - name: Check the media tools like the image build does
+        run: sh docker/media-tools.sh check
+
+      # No Python or compiler in this image; see the test job.
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm run prepare
+      - run: npm run test:media

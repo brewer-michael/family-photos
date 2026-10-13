@@ -1,7 +1,7 @@
 import { fail, redirect } from '@sveltejs/kit';
 import type { Actions, PageServerLoad } from './$types';
 import { checkAdminPassword, issueAccess, safeNext } from '#lib/server/auth';
-import { adminLimiter, clientKeys } from '#lib/server/ratelimit';
+import { adminLimiter, signInSubject } from '#lib/server/ratelimit';
 
 function afterLogin(name: string | null, next: string): string {
 	return name ? next : `/name?next=${encodeURIComponent(next)}`;
@@ -20,7 +20,7 @@ export const actions: Actions = {
 		const next = safeNext(String(form.get('next') ?? ''), '/admin');
 		const password = String(form.get('password') ?? '');
 
-		const keys = clientKeys(event);
+		const keys = signInSubject(event);
 		const limit = adminLimiter.check(keys);
 		if (limit.limited) {
 			const minutes = Math.max(1, Math.ceil(limit.retryAfterS / 60));

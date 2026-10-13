@@ -52,15 +52,26 @@ export class ProgressParser {
 	}
 }
 
-/** Decode/demux errors in ffmpeg's stderr: the source itself is broken. */
-const CORRUPT_STDERR = /Invalid data found|moov atom not found|error while decoding|Invalid NAL|corrupt|truncat|Error splitting the input|could not find codec parameters|Packet mismatch/i;
+/** System trouble in ffmpeg's stderr (disk full, I/O error, out of memory): worth another try. */
+const TRANSIENT_STDERR = /No space left on device|Input\/output error|Cannot allocate memory|Resource temporarily unavailable|Too many open files|Disk quota exceeded|Stale file handle/i;
 
-/** RunError → MediaError. Timeouts, stalls, signals and spawn failures are retryable. */
-export function toMediaError(e: unknown, what: string, stalled = false): unknown {
+/**
+ * Fatal input errors in ffmpeg's stderr: the source can't be opened, or most of it doesn't decode
+ * (ffmpeg gives up past its maximum decode error rate). A few bad frames don't stop ffmpeg, so
+ * per-frame decode messages alone don't make a file corrupt.
+ */
+const CORRUPT_STDERR = /Error opening input|moov atom not found|could not find codec parameters|Decode error rate .* exceeds maximum/i;
+
+/**
+ * RunError → MediaError. Timeouts, stalls (`stalledMs`: the watchdog killed it after that long
+ * without progress), signals, spawn failures and system errors are retryable; a non-zero exit on
+ * an unreadable source is 'corrupt'.
+ */
+export function toMediaError(e: unknown, what: string, stalledMs?: number): unknown {
 	if (!(e instanceof RunError)) return e;
 	const tail = e.stderr.trim().split('\n').slice(-5).join(' | ');
-	if (stalled) return new MediaError('retryable', `${what} stalled: no progress for ${STALL_MS / 1000} s`);
-	if (e.reason === 'exit' && e.code !== null && CORRUPT_STDERR.test(e.stderr)) {
+	if (stalledMs !== undefined) return new MediaError('retryable', `${what} stalled: no progress for ${stalledMs / 1000} s`);
+	if (e.reason === 'exit' && e.code !== null && !TRANSIENT_STDERR.test(e.stderr) && CORRUPT_STDERR.test(e.stderr)) {
 		return new MediaError('corrupt', `${what} could not read the video: ${tail}`);
 	}
 	return new MediaError('retryable', `${e.message}${tail && !e.message.includes(tail) ? ` (${tail})` : ''}`);
@@ -71,25 +82,29 @@ export interface ConversionOptions {
 	sourceDurationS: number;
 	signal: AbortSignal;
 	progress(pct: number, etaS?: number): void;
+	/** Overrides STALL_MS and the hard cap (tests). */
+	stallMs?: number;
+	timeoutMs?: number;
 }
 
 /** Runs ffmpeg for the conversion. Rejects with MediaError. */
 export async function runConversion(ffmpegBin: string, args: readonly string[], o: ConversionOptions): Promise<void> {
 	const parser = new ProgressParser(o.expectedDurationS);
+	const stallMs = o.stallMs ?? STALL_MS;
 	const local = new AbortController();
 	const forward = () => local.abort(o.signal.reason);
 	if (o.signal.aborted) forward();
 	o.signal.addEventListener('abort', forward, { once: true });
 	let stalled = false;
 	const watchdog = setInterval(() => {
-		if (Date.now() - parser.lastAdvanceMs > STALL_MS) {
+		if (Date.now() - parser.lastAdvanceMs > stallMs) {
 			stalled = true;
 			local.abort(new Error('stalled'));
 		}
-	}, 5_000);
+	}, Math.min(5_000, stallMs / 4));
 	try {
 		await run(ffmpegBin, args, {
-			timeoutMs: hardCapMs(o.sourceDurationS),
+			timeoutMs: o.timeoutMs ?? hardCapMs(o.sourceDurationS),
 			signal: local.signal,
 			ionice: true,
 			collectStdout: false,
@@ -99,7 +114,7 @@ export async function runConversion(ffmpegBin: string, args: readonly string[], 
 			}
 		});
 	} catch (e) {
-		throw toMediaError(e, 'ffmpeg', stalled);
+		throw toMediaError(e, 'ffmpeg', stalled ? stallMs : undefined);
 	} finally {
 		clearInterval(watchdog);
 		o.signal.removeEventListener('abort', forward);

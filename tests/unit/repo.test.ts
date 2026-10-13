@@ -190,6 +190,17 @@ describe('media lifecycle', () => {
 		expect(media.markReady(id, { conversion: 'none', canonicalExt: 'jpg', canonicalSize: 1, width: 1, height: 1, takenMs: 1, sourceKept: false })).toBe(false);
 	});
 
+	it('markReady falls back to created_at for a takenMs that is not a valid epoch time', () => {
+		for (const [i, bad] of [NaN, Infinity, -Infinity, 1e300, -9e15].entries()) {
+			const id = ready(defaultAlbum, `sha-bad-date-${i}`, bad);
+			const row = media.getById(id)!;
+			expect(row.taken_ms, String(bad)).toBe(row.created_at);
+		}
+		const edge = ready(defaultAlbum, 'sha-edge-date', -8.64e15); // the earliest a Date can hold
+		expect(media.getById(edge)!.taken_ms).toBe(-8.64e15);
+		expect(media.listByAlbum(defaultAlbum).items).toHaveLength(6);
+	});
+
 	it('markFailed and requeue never touch a ready row (a failure reported after the commit)', () => {
 		const id = ready(defaultAlbum, 'sha-done', 1);
 		expect(media.markFailed(id, 'retryable', 'timeout after commit')).toBe(false);
@@ -215,6 +226,15 @@ describe('media lifecycle', () => {
 		expect(media.listFailed().map((r) => r.id)).toEqual([id]);
 		expect(media.retry(id)).toBe('queued');
 		expect(media.getById(id)).toMatchObject({ status: 'queued', attempts: 0, error_code: null });
+	});
+
+	it('retry refuses a trashed failed item', () => {
+		const id = queued(defaultAlbum, 'sha-fail-trash');
+		media.claimForProcessing(id);
+		media.markFailed(id, 'retryable', 'timeout');
+		expect(media.softDelete(id, 'not wanted')).toBe(true);
+		expect(media.retry(id)).toBeNull();
+		expect(media.getById(id)).toMatchObject({ status: 'failed', error_code: 'retryable' });
 	});
 
 	it('requeueInterrupted re-queues processing rows and fails ones out of attempts', () => {
@@ -341,6 +361,33 @@ describe('media lifecycle', () => {
 		const r = media.move(b, other.id);
 		expect(r).toMatchObject({ ok: false, reason: 'duplicate' });
 		expect(media.move(b, 99999)).toEqual({ ok: false, reason: 'album_not_found' });
+	});
+
+	it('move() refuses when the Live Photo video’s bytes are already live in the target album', () => {
+		const other = albums.create({ title: 'Other', createdByName: null, createdByDevice: null });
+		const photo = ready(defaultAlbum, 'mvlp-photo', 1, { contentId: 'MV' });
+		const video = ready(defaultAlbum, 'mvlp-video', 1, { kind: 'video', contentId: 'MV', durationMs: 2000 });
+		expect(media.getById(video)!.live_photo_of).toBe(photo);
+		const there = ready(other.id, 'mvlp-video', 1, { kind: 'video', durationMs: 2000 });
+		expect(media.move(photo, other.id)).toEqual({ ok: false, reason: 'duplicate', conflictId: there });
+		expect([media.getById(photo)!.album_id, media.getById(video)!.album_id]).toEqual([defaultAlbum, defaultAlbum]);
+		// Once that copy is trashed, the pair moves together.
+		media.softDelete(there, 'gone');
+		expect(media.move(photo, other.id)).toEqual({ ok: true });
+		expect([media.getById(photo)!.album_id, media.getById(video)!.album_id]).toEqual([other.id, other.id]);
+	});
+
+	it('restore() refuses when the Live Photo video’s bytes are live in the album again', () => {
+		const photo = ready(defaultAlbum, 'rslp-photo', 1, { contentId: 'RS' });
+		const video = ready(defaultAlbum, 'rslp-video', 1, { kind: 'video', contentId: 'RS', durationMs: 2000 });
+		media.softDelete(photo, 'oops');
+		const reupload = ready(defaultAlbum, 'rslp-video', 1, { kind: 'video', durationMs: 2000 });
+		expect(media.restore(photo)).toEqual({ ok: false, reason: 'duplicate', conflictId: reupload });
+		expect(media.getById(photo)!.deleted_at).not.toBeNull();
+		expect(media.getById(video)!.deleted_at).not.toBeNull();
+		media.softDelete(reupload, 'make room');
+		expect(media.restore(photo)).toEqual({ ok: true });
+		expect(media.livePhotoVideoFor(photo)!.id).toBe(video);
 	});
 
 	it('storage totals', () => {

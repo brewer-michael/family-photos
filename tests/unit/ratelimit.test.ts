@@ -1,14 +1,19 @@
 import { describe, expect, it } from 'vitest';
+import { DEVICE_COOKIE, accessValue, deviceValue } from '#lib/server/auth';
 import {
 	adminLimiter,
 	clientIp,
 	clientKeys,
 	createRateLimiter,
 	ipKey,
+	isProxyHop,
 	isTrustedProxy,
 	loginLimiter,
-	normalizeIp
+	normalizeIp,
+	signInSubject,
+	type RateLimitSubject
 } from '#lib/server/ratelimit';
+import { FakeCookies } from '../helpers/cookies';
 
 describe('rate limiter', () => {
 	it('allows 10 failures per 15 minutes; the 11th attempt is limited', () => {
@@ -69,6 +74,29 @@ describe('rate limiter', () => {
 		rl.clear('ip-0'); // a success clears the client's own count, not the global one
 		expect(rl.check('another', 10).limited).toBe(true);
 		expect(rl.check('a-brand-new-ip', 60_001).limited).toBe(false); // the first global failures expired
+	});
+
+	it('known devices have a global pool of their own: strangers cannot lock them out', () => {
+		const rl = createRateLimiter({ max: 10, windowMs: 60_000, globalMax: 5 });
+		const known = (ip: string, device: string): RateLimitSubject => ({ keys: [ip, `device:${device}`], knownDevice: true });
+		for (let i = 0; i < 5; i++) rl.fail(`stranger-${i}`, i);
+		expect(rl.check('another-stranger', 10).limited).toBe(true);
+		expect(rl.check(known('ip-a', 'a'), 10)).toEqual({ limited: false, retryAfterS: 0, failures: 0 });
+		// A known device's failures don't count against strangers' pool, and vice versa…
+		rl.reset();
+		for (let i = 0; i < 4; i++) rl.fail(known(`ip-${i}`, `d${i}`), i);
+		expect(rl.check('stranger', 10).limited).toBe(false);
+		expect(rl.check(known('ip-x', 'x'), 10).limited).toBe(false);
+		// …but known devices together still have a ceiling (fresh device ids can be minted by anyone
+		// with the family code), and the per-key limits still apply.
+		rl.fail(known('ip-4', 'd4'), 4);
+		expect(rl.check(known('ip-x', 'x'), 10)).toMatchObject({ limited: true, retryAfterS: 60 });
+		expect(rl.check('stranger', 10).limited).toBe(false);
+		const solo = createRateLimiter({ max: 3, windowMs: 60_000, globalMax: 1000 });
+		for (let i = 0; i < 3; i++) solo.fail(known(`rotating-${i}`, 'same-device'), i);
+		expect(solo.check(known('rotating-99', 'same-device'), 10)).toMatchObject({ limited: true, failures: 3 });
+		solo.clear(known('rotating-99', 'same-device')); // a success clears the device key too
+		expect(solo.check(known('rotating-99', 'same-device'), 10).limited).toBe(false);
 	});
 
 	it('bounds memory: per-key history and the number of keys', () => {
@@ -149,6 +177,38 @@ describe('client identity', () => {
 		expect(clientIp(ev({ 'x-real-ip': '2.2.2.2' }))).toBe('2.2.2.2');
 	});
 
+	it('skips forwarded addresses that are proxy hops (Cloudflare → NPM, cloudflared → NPM)', () => {
+		// Cloudflare (orange cloud) → Nginx Proxy Manager: X-Real-IP is the Cloudflare edge.
+		const viaEdge = (visitor: string, edge = '162.158.10.20') =>
+			ev({ 'cf-connecting-ip': visitor, 'x-real-ip': edge }, '172.17.0.5');
+		expect(clientKeys(viaEdge('203.0.113.7'))).toEqual(['203.0.113.7']);
+		expect(clientKeys(viaEdge('2001:db8:1:2::9', '2400:cb00:2049:1::a29f:1a2b'))).toEqual(['2001:db8:1:2::/64']);
+		expect(clientIp(viaEdge('203.0.113.7'))).toBe('203.0.113.7');
+		// cloudflared → NPM on one Docker network: X-Real-IP is cloudflared's private address.
+		expect(clientKeys(ev({ 'cf-connecting-ip': '203.0.113.7', 'x-real-ip': '172.18.0.3' }, '172.18.0.2'))).toEqual(['203.0.113.7']);
+		// Proxies listed in TRUSTED_PROXIES count as hops too.
+		expect(
+			clientKeys(ev({ 'cf-connecting-ip': '203.0.113.7', 'x-real-ip': '198.51.100.1' }, '198.51.100.2'), ['198.51.100.0/24'])
+		).toEqual(['203.0.113.7']);
+		// Nothing but hops: the peer stands for the client.
+		expect(clientKeys(ev({ 'x-real-ip': '104.16.0.1' }, '172.17.0.5'))).toEqual(['172.17.0.5']);
+		expect(clientKeys(ev({ 'cf-connecting-ip': '10.1.1.1', 'x-real-ip': '::1' }, '172.17.0.5'))).toEqual(['172.17.0.5']);
+	});
+
+	it('knows Cloudflare\'s published ranges (edges of the embedded list)', () => {
+		for (const ip of ['173.245.48.0', '173.245.63.255', '104.16.0.1', '104.27.255.255', '172.71.255.255', '131.0.75.255', '::ffff:162.159.0.1']) {
+			expect(isProxyHop(ip, ['none']), ip).toBe(true);
+		}
+		for (const ip of ['2400:cb00::1', '2606:4700:10::6816:1', '2a06:98c7:ffff::1', '2c0f:f248:0:ffff::1']) {
+			expect(isProxyHop(ip, ['none']), ip).toBe(true);
+		}
+		for (const ip of ['173.245.64.0', '104.28.0.1', '172.72.0.1', '1.1.1.1', '2a06:98d0::1', '2606:4701::1', 'garbage']) {
+			expect(isProxyHop(ip, ['none']), ip).toBe(false);
+		}
+		expect(isProxyHop('192.168.1.2')).toBe(true); // default TRUSTED_PROXIES=private
+		expect(isProxyHop('192.168.1.2', ['none'])).toBe(false);
+	});
+
 	it('ignores spoofed headers from a public peer (direct exposure)', () => {
 		const pub = (h: Record<string, string>) => ev(h, '198.51.100.23');
 		expect(clientKeys(pub({ 'cf-connecting-ip': '1.1.1.1', 'x-real-ip': '2.2.2.2' }))).toEqual(['198.51.100.23']);
@@ -179,6 +239,48 @@ describe('client identity', () => {
 		expect(attemptsUntilLimited((i) => ev({ 'cf-connecting-ip': '203.0.113.50', 'x-real-ip': `2.2.2.${i}` }, '172.17.0.6'))).toBe(10);
 		// IPv6 client hopping addresses inside its /64.
 		expect(attemptsUntilLimited((i) => ev({}, `2001:db8:1:2::${(i + 1).toString(16)}`))).toBe(10);
+		// Cloudflare Tunnel: faking X-Real-IP as a Cloudflare or private address only drops that header.
+		expect(attemptsUntilLimited((i) => ev({ 'cf-connecting-ip': '203.0.113.50', 'x-real-ip': i % 2 ? `104.16.0.${i}` : `10.0.0.${i}` }, '172.17.0.6'))).toBe(10);
+		// NPM reached directly (bypassing Cloudflare), the client fakes CF-Connecting-IP as a Cloudflare edge.
+		expect(attemptsUntilLimited((i) => ev({ 'cf-connecting-ip': `162.158.0.${i}`, 'x-real-ip': '203.0.113.51' }, '172.17.0.5'))).toBe(10);
+	});
+
+	it('visitors behind one Cloudflare edge (Cloudflare → NPM) are limited separately', () => {
+		const rl = createRateLimiter({ max: 10, windowMs: 15 * 60_000, globalMax: 1000 });
+		const visitor = (ip: string) => clientKeys(ev({ 'cf-connecting-ip': ip, 'x-real-ip': '172.70.1.1' }, '172.17.0.5'));
+		for (let i = 0; i < 10; i++) rl.fail(visitor('203.0.113.60'), i);
+		expect(rl.check(visitor('203.0.113.60'), 20).limited).toBe(true);
+		expect(rl.check(visitor('203.0.113.61'), 20)).toEqual({ limited: false, retryAfterS: 0, failures: 0 });
+	});
+
+	it('signInSubject: a valid fp_device cookie adds the device as a key and uses the known-device pool', () => {
+		const cookies = new FakeCookies();
+		const e = { ...ev({ 'x-real-ip': '203.0.113.9' }), cookies: cookies.asCookies() };
+		expect(signInSubject(e)).toEqual({ keys: ['203.0.113.9'], knownDevice: false });
+		const d = 'devSAMAAAAAAAAAAAAAAAA';
+		cookies.set(DEVICE_COOKIE, deviceValue({ d, n: 'Sam' }));
+		expect(signInSubject(e)).toEqual({ keys: ['203.0.113.9', `device:${d}`], knownDevice: true });
+		expect(signInSubject({ ...e, getClientAddress: () => '198.51.100.23' })).toEqual({
+			keys: ['198.51.100.23', `device:${d}`],
+			knownDevice: true
+		});
+		// Forged, tampered or wrong-cookie values don't count.
+		for (const bad of [deviceValue({ d, n: 'Sam' }).replace(/.$/, (c) => (c === 'A' ? 'B' : 'A')), accessValue('family'), 'x.y']) {
+			cookies.set(DEVICE_COOKIE, bad);
+			expect(signInSubject(e), bad).toEqual({ keys: ['203.0.113.9'], knownDevice: false });
+		}
+	});
+
+	it('a stranger flood fills the global ceiling, and a known device can still try (login limiter)', () => {
+		loginLimiter.reset();
+		const cookies = new FakeCookies();
+		const stranger = (i: number) => signInSubject({ ...ev({}, `2001:db8:${i.toString(16)}::1`), cookies: new FakeCookies().asCookies() });
+		for (let i = 0; i < 100; i++) loginLimiter.fail(stranger(i));
+		expect(loginLimiter.check(stranger(1000)).limited).toBe(true);
+		cookies.set(DEVICE_COOKIE, deviceValue({ d: 'devKIMAAAAAAAAAAAAAAAA', n: 'Kim' }));
+		const known = signInSubject({ ...ev({}, '203.0.113.80'), cookies: cookies.asCookies() });
+		expect(loginLimiter.check(known).limited).toBe(false);
+		loginLimiter.reset();
 	});
 
 	it('survives getClientAddress throwing', () => {

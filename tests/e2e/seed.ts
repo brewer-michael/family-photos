@@ -77,6 +77,25 @@ export function seedAlbum(title: string, opts: { device?: string; by?: string } 
 	}
 }
 
+const takenMsOf = (takenAt: string) => {
+	const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/.exec(takenAt)!;
+	return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+};
+
+const pictureOf = (item: Pick<SeedItem, 'color'>) =>
+	sharp({ create: { width: 640, height: 480, channels: 3, background: item.color ?? '#c96f3b' } });
+
+/** Writes a ready item's canonical file and thumbnails; returns the canonical file's size. */
+async function writeReadyFiles(id: string, item: Pick<SeedItem, 'kind' | 'color'>): Promise<number> {
+	const kind = item.kind ?? 'photo';
+	const picture = pictureOf(item);
+	const canonical = kind === 'video' ? sampleVideo() : await picture.clone().jpeg({ quality: 80 }).toBuffer();
+	write(libraryFile(id, kind === 'video' ? 'mp4' : 'jpg'), canonical);
+	write(cacheFile(id, 'thumb'), await picture.clone().resize(480, 360).webp().toBuffer());
+	if (kind === 'photo') write(cacheFile(id, 'display'), await picture.clone().webp().toBuffer());
+	return canonical.length;
+}
+
 /** Inserts one item (ready by default) with its files where the pipeline would put them. Returns its id. */
 export async function seedMedia(albumId: number, item: SeedItem): Promise<string> {
 	const id = newId();
@@ -84,18 +103,8 @@ export async function seedMedia(albumId: number, item: SeedItem): Promise<string
 	const status = item.status ?? 'ready';
 	const ready = status === 'ready';
 	const ext = kind === 'video' ? 'mp4' : 'jpg';
-	const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/.exec(item.takenAt)!;
-	const takenMs = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
-	const picture = sharp({ create: { width: 640, height: 480, channels: 3, background: item.color ?? '#c96f3b' } });
-	let size = 1000;
-	if (ready) {
-		const canonical = kind === 'video' ? sampleVideo() : await picture.clone().jpeg({ quality: 80 }).toBuffer();
-		size = canonical.length;
-		write(libraryFile(id, ext), canonical);
-		write(cacheFile(id, 'thumb'), await picture.clone().resize(480, 360).webp().toBuffer());
-		if (kind === 'photo') write(cacheFile(id, 'display'), await picture.clone().webp().toBuffer());
-	}
-	if (kind === 'video') write(cacheFile(id, 'poster'), await picture.clone().webp().toBuffer());
+	const size = ready ? await writeReadyFiles(id, item) : 1000;
+	if (kind === 'video') write(cacheFile(id, 'poster'), await pictureOf(item).webp().toBuffer());
 
 	const d = db();
 	try {
@@ -128,7 +137,7 @@ export async function seedMedia(albumId: number, item: SeedItem): Promise<string
 			ready ? 480 : null,
 			ready && kind === 'video' ? 1000 : null,
 			ready ? item.takenAt : null,
-			ready ? takenMs : null,
+			ready ? takenMsOf(item.takenAt) : null,
 			item.livePhotoOf ?? null,
 			now,
 			now,
@@ -140,6 +149,24 @@ export async function seedMedia(albumId: number, item: SeedItem): Promise<string
 		d.close();
 	}
 	return id;
+}
+
+/** Finishes an unfinished seeded photo or video, as the worker would: files written, then ready. */
+export async function markSeededReady(id: string, item: Pick<SeedItem, 'kind' | 'takenAt' | 'color'>): Promise<void> {
+	const kind = item.kind ?? 'photo';
+	const size = await writeReadyFiles(id, item);
+	const d = db();
+	try {
+		const now = Date.now();
+		d.prepare(
+			`UPDATE media SET status = 'ready', error_code = NULL, pipeline_version = 1, conversion = 'transcode',
+				canonical_ext = ?, canonical_size = ?, width = 640, height = 480, duration_ms = ?, taken_at = ?, taken_ms = ?,
+				updated_at = ? WHERE id = ?`
+		).run(kind === 'video' ? 'mp4' : 'jpg', size, kind === 'video' ? 1000 : null, item.takenAt, takenMsOf(item.takenAt), now, id);
+		d.prepare('UPDATE albums SET updated_at = ? WHERE id = (SELECT album_id FROM media WHERE id = ?)').run(now, id);
+	} finally {
+		d.close();
+	}
 }
 
 /** The device id inside a context's signed fp_device cookie (body = base64url JSON {d, n}). */

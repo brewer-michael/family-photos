@@ -511,11 +511,15 @@ const int = (v: number | null | undefined): number | null =>
 	v === null || v === undefined || !Number.isFinite(v) ? null : Math.round(v);
 const real = (v: number | null | undefined): number | null =>
 	v === null || v === undefined || !Number.isFinite(v) ? null : v;
+/** Epoch ms within the range a Date can hold (±8.64e15), rounded; null otherwise. */
+const epochMs = (v: number): number | null => (Number.isFinite(v) && Math.abs(v) <= 8.64e15 ? Math.round(v) : null);
 
 /**
  * processing → ready (the worker's commit step, after the canonical file was renamed
  * into library/). Clears the upload token and error, touches the album, and pairs
- * Live Photos. Returns false if the row wasn't processing.
+ * Live Photos. A takenMs that isn't a valid epoch time (NaN, ±Infinity, beyond what a Date
+ * can hold) falls back to the row's created_at, so a ready row always has its sort key.
+ * Returns false if the row wasn't processing.
  */
 export function markReady(id: string, f: ReadyFields): boolean {
 	return tx(() => {
@@ -523,7 +527,7 @@ export function markReady(id: string, f: ReadyFields): boolean {
 		const r = stmt(
 			`UPDATE media SET status = 'ready', conversion = ?, canonical_ext = ?, canonical_size = ?,
 				width = ?, height = ?, duration_ms = ?, hdr_tonemapped = ?, audio_dropped = ?, slowmo_retimed = ?,
-				taken_at = ?, taken_ms = ?, gps_lat = ?, gps_lon = ?, gps_alt = ?, content_id = ?,
+				taken_at = ?, taken_ms = COALESCE(?, created_at), gps_lat = ?, gps_lon = ?, gps_alt = ?, content_id = ?,
 				source_kept = ?, source_ext = COALESCE(?, source_ext), pipeline_version = ?,
 				upload_token = NULL, error_code = NULL, error_detail = NULL, updated_at = ?
 			 WHERE id = ? AND status = 'processing'`
@@ -538,7 +542,7 @@ export function markReady(id: string, f: ReadyFields): boolean {
 			f.audioDropped ? 1 : 0,
 			f.slowmoRetimed ? 1 : 0,
 			f.takenAt ?? null,
-			int(f.takenMs),
+			epochMs(f.takenMs),
 			real(f.gpsLat),
 			real(f.gpsLon),
 			real(f.gpsAlt),
@@ -637,12 +641,12 @@ export function requeue(id: string, detail?: string): boolean {
  * duplicate instead: its upload token is cleared (the .incoming sweep deletes that file) and an
  * archived original stays recorded (source_kept/source_ext) until purgeDuplicatesOlderThan()
  * hands the row to maintenance, which deletes it. Returns the new status, or null if it can't
- * be retried.
+ * be retried (including a trashed row).
  */
 export function retry(id: string): Status | null {
 	return tx((): Status | null => {
 		const row = getById(id);
-		if (!row || row.status !== 'failed') return null;
+		if (!row || row.status !== 'failed' || row.deleted_at !== null) return null;
 		if (!row.upload_token && !row.source_kept) return null;
 		if (row.source_sha256) {
 			const dup = findDuplicate(row.album_id, row.source_sha256, id);
@@ -726,18 +730,36 @@ export type MoveResult =
 	| { ok: false; reason: 'not_found' | 'album_not_found' }
 	| { ok: false; reason: 'duplicate'; conflictId: string };
 
-/** Moves an item (and its hidden Live Photo video) to another album. */
+/** An item and its hidden Live Photo video(s): the rows move/trash/restore act on together. */
+function withLivePhotoVideos(row: MediaRow): MediaRow[] {
+	return [row, ...(stmt('SELECT * FROM media WHERE live_photo_of = ?').all(row.id) as MediaRow[])];
+}
+
+/**
+ * The live item in `albumId` that one of `rows`, once live there, would collide with on the
+ * media_album_sha index. Duplicate and failed rows are exempt from the index.
+ */
+function conflictIn(albumId: number, rows: readonly MediaRow[]): MediaRow | undefined {
+	for (const r of rows) {
+		if (!r.source_sha256 || r.status === 'duplicate' || r.status === 'failed') continue;
+		const dup = findDuplicate(albumId, r.source_sha256, r.id);
+		if (dup) return dup;
+	}
+	return undefined;
+}
+
+/**
+ * Moves an item (and its hidden Live Photo video) to another album. Refused when the same bytes
+ * (of the item or of its video) are already live there.
+ */
 export function move(id: string, albumId: number): MoveResult {
 	return tx((): MoveResult => {
 		const row = getById(id);
 		if (!row) return { ok: false, reason: 'not_found' };
 		if (!getAlbum(albumId)) return { ok: false, reason: 'album_not_found' };
 		if (row.album_id === albumId) return { ok: true };
-		const exempt = row.status === 'duplicate' || row.status === 'failed' || row.deleted_at !== null;
-		if (row.source_sha256 && !exempt) {
-			const dup = findDuplicate(albumId, row.source_sha256, id);
-			if (dup) return { ok: false, reason: 'duplicate', conflictId: dup.id };
-		}
+		const dup = conflictIn(albumId, withLivePhotoVideos(row).filter((r) => r.deleted_at === null));
+		if (dup) return { ok: false, reason: 'duplicate', conflictId: dup.id };
 		const now = Date.now();
 		stmt('UPDATE media SET album_id = ?, updated_at = ? WHERE id = ? OR live_photo_of = ?').run(albumId, now, id, id);
 		touchAlbum(albumId, now);
@@ -761,15 +783,16 @@ export type RestoreResult =
 	| { ok: false; reason: 'not_found' }
 	| { ok: false; reason: 'duplicate'; conflictId: string };
 
-/** Restores a trashed item (and its Live Photo video) unless the same bytes are live in the album again. */
+/**
+ * Restores a trashed item (and its Live Photo video) unless the same bytes (of the item or of
+ * its video) are live in the album again.
+ */
 export function restore(id: string): RestoreResult {
 	return tx((): RestoreResult => {
 		const row = getById(id);
 		if (!row || row.deleted_at === null) return { ok: false, reason: 'not_found' };
-		if (row.source_sha256 && row.status !== 'duplicate' && row.status !== 'failed') {
-			const dup = findDuplicate(row.album_id, row.source_sha256, id);
-			if (dup) return { ok: false, reason: 'duplicate', conflictId: dup.id };
-		}
+		const dup = conflictIn(row.album_id, withLivePhotoVideos(row).filter((r) => r.deleted_at !== null));
+		if (dup) return { ok: false, reason: 'duplicate', conflictId: dup.id };
 		stmt(
 			`UPDATE media SET deleted_at = NULL, deleted_reason = NULL, updated_at = ?
 			 WHERE (id = ? OR live_photo_of = ?) AND deleted_at IS NOT NULL`

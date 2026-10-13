@@ -49,7 +49,8 @@ export function cleanStem(stem: string): string {
 	return RESERVED_STEM.test(s) ? `_${s}` : s;
 }
 
-function stemOf(name: string): string {
+/** "IMG_1234.HEIC" → "IMG_1234" (any folder part dropped). */
+export function stemOf(name: string): string {
 	const base = name.replace(/^.*[\\/]/, '');
 	const dot = base.lastIndexOf('.');
 	return dot > 0 ? base.slice(0, dot) : base;

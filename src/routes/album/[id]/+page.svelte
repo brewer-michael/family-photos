@@ -22,12 +22,16 @@
 	const uploaderMounted = $derived(showUploader || uploaderChoice?.albumId === data.album.id);
 	let uploaderSection = $state<HTMLElement>();
 
-	/** Pages fetched by "Show more" (for this album only). */
-	let more = $state<{ albumId: number; items: TileDTO[]; next: string | null } | null>(null);
+	/**
+	 * Tiles fetched by "Show more", continuing the first page that ended at `from`. Once the first
+	 * page changes (new photos at the top push its end along), they no longer follow on from it.
+	 */
+	let more = $state<{ albumId: number; from: string; items: TileDTO[]; next: string | null } | null>(null);
 	let loadingMore = $state(false);
 	let moreError = $state('');
-	const extra = $derived(more?.albumId === data.album.id ? more.items : []);
-	const next = $derived(more?.albumId === data.album.id ? more.next : data.next);
+	const current = $derived(more && more.albumId === data.album.id && more.from === data.next ? more : null);
+	const extra = $derived(current?.items ?? []);
+	const next = $derived(current ? current.next : data.next);
 	const tiles = $derived.by(() => {
 		const seen = new Set(data.items.map((t) => t.id));
 		return [...data.items, ...extra.filter((t) => !seen.has(t.id))];
@@ -40,16 +44,22 @@
 		uploaderSection?.focus();
 	}
 
+	async function fetchTiles(before: string, limit?: number): Promise<{ items: TileDTO[]; next: string | null }> {
+		const q = `before=${encodeURIComponent(before)}${limit ? `&limit=${limit}` : ''}`;
+		const res = await fetch(`/album/${data.album.id}/items?${q}`);
+		if (!res.ok) throw new Error(String(res.status));
+		return (await res.json()) as { items: TileDTO[]; next: string | null };
+	}
+
 	async function showMore(e: MouseEvent) {
-		if (!next) return;
+		const from = data.next;
+		if (!next || !from) return;
 		e.preventDefault();
 		loadingMore = true;
 		moreError = '';
 		try {
-			const res = await fetch(`/album/${data.album.id}/items?before=${encodeURIComponent(next)}`);
-			if (!res.ok) throw new Error(String(res.status));
-			const page = (await res.json()) as { items: TileDTO[]; next: string | null };
-			more = { albumId: data.album.id, items: [...extra, ...page.items], next: page.next };
+			const page = await fetchTiles(next);
+			more = { albumId: data.album.id, from, items: [...extra, ...page.items], next: page.next };
 			await tick();
 			// Keyboard and screen-reader users continue at the first new tile.
 			if (page.items[0]) document.querySelector<HTMLElement>(`a[href="/view/${page.items[0].id}"]`)?.focus();
@@ -60,8 +70,21 @@
 		}
 	}
 
-	function refresh() {
-		void invalidateAll();
+	/**
+	 * New uploads are ready: reload the first page, then the tiles "Show more" had added, as far
+	 * down as before, from the first page's new end (so none fall between the two).
+	 */
+	async function refresh() {
+		const shown = extra.length;
+		await invalidateAll();
+		const from = data.next;
+		if (shown === 0 || !from) return;
+		try {
+			const page = await fetchTiles(from, shown);
+			more = { albumId: data.album.id, from, items: page.items, next: page.next };
+		} catch {
+			// The first page is fresh; "Show more" picks up from there.
+		}
 	}
 </script>
 

@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>family-photos</Name>
+  <Repository>ghcr.io/brewer-michael/family-photos:latest</Repository>
+  <Registry>https://github.com/brewer-michael/family-photos/pkgs/container/family-photos</Registry>
+  <Network>bridge</Network>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/brewer-michael/family-photos/issues</Support>
+  <Project>https://github.com/brewer-michael/family-photos</Project>
+  <Overview>A private website where your whole family shares photos and short videos. People get in with one shared family code or by scanning a printed QR card, tell it their first name once, and can then add photos and videos from any phone, make albums, write memories, and save anything back to their own phone. Nobody needs an account, an app or to know about file formats: iPhone photos and videos are turned into versions every phone and computer can open, automatically. Nothing is ever deleted by the family; they ask, and you decide on the admin page. Before you start: fill in the required settings below, keep the app data path on your cache or SSD pool, and leave the Extra Parameters (Advanced View) as they are, so getting videos ready never slows down Plex or other containers. Put it on the internet with Cloudflare Tunnel or Nginx Proxy Manager; the project page explains how.</Overview>
+  <Category>MediaApp:Photos</Category>
+  <WebUI>http://[IP]:[PORT:3000]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/brewer-michael/family-photos/main/unraid/family-photos.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/brewer-michael/family-photos/main/static/icons/icon-512.png</Icon>
+  <ExtraParams>--cpu-shares=128 --memory=4g</ExtraParams>
+  <Config Name="Web port" Target="3000" Default="3000" Mode="tcp" Description="Port for the website on your server. Point Cloudflare Tunnel or Nginx Proxy Manager at http://YOUR-SERVER-IP:this-port." Type="Port" Display="always" Required="true" Mask="false">3000</Config>
+  <Config Name="App data" Target="/config" Default="/mnt/user/appdata/family-photos" Mode="rw" Description="Database, previews and saved emails. Keep it on your cache or SSD pool so the site stays quick." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/family-photos</Config>
+  <Config Name="Photos and videos" Target="/photos" Default="/mnt/user/family-photos" Mode="rw" Description="Share that holds every photo and video, the archived originals and the nightly database backups (.backups). This is the folder to back up." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/family-photos</Config>
+  <Config Name="Site address (PUBLIC_URL)" Target="PUBLIC_URL" Default="" Mode="" Description="The address your family uses, without a path, e.g. https://photos.example.com. Links in emails and on QR cards use it." Type="Variable" Display="always" Required="true" Mask="false"/>
+  <Config Name="Family code (FAMILY_PASSWORD)" Target="FAMILY_PASSWORD" Default="" Mode="" Description="What everyone types to get in. Three short words work well, e.g. blue lake cabin (capitals and extra spaces don't matter). Changing it signs everyone out and stops printed QR cards." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Admin password (ADMIN_PASSWORD)" Target="ADMIN_PASSWORD" Default="" Mode="" Description="Your password for the admin page (/admin): at least 8 characters and different from the family code." Type="Variable" Display="always" Required="true" Mask="true"/>
+  <Config Name="Admin email (ADMIN_EMAIL)" Target="ADMIN_EMAIL" Default="" Mode="" Description="Where removal requests and problem alerts are sent. Empty: they only show on the admin page." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Admin first name (ADMIN_NAME)" Target="ADMIN_NAME" Default="" Mode="" Description="Shown to the family, e.g. &quot;Michael has been told.&quot; Empty: the site admin." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Site title (SITE_TITLE)" Target="SITE_TITLE" Default="" Mode="" Description="Name shown at the top of the site and in emails. Empty: Family Photos." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Email server (SMTP_HOST)" Target="SMTP_HOST" Default="" Mode="" Description="e.g. smtp.gmail.com or smtp.resend.com. Empty: emails are saved as files in the app data folder (outbox) instead of being sent." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Email port (SMTP_PORT)" Target="SMTP_PORT" Default="587" Mode="" Description="587 (STARTTLS) for most providers; 465 uses TLS from the start." Type="Variable" Display="always" Required="false" Mask="false">587</Config>
+  <Config Name="Email user name (SMTP_USER)" Target="SMTP_USER" Default="" Mode="" Description="Usually your full email address (Resend: resend)." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Email password (SMTP_PASS)" Target="SMTP_PASS" Default="" Mode="" Description="Gmail: an app password, not your normal password. Resend: an API key." Type="Variable" Display="always" Required="false" Mask="true"/>
+  <Config Name="Email sender (SMTP_FROM)" Target="SMTP_FROM" Default="" Mode="" Description="e.g. Family Photos &lt;photos@example.com&gt;. Must be an address your email provider lets you send from. Empty: the site title with SMTP_USER (or ADMIN_EMAIL)." Type="Variable" Display="always" Required="false" Mask="false"/>
+  <Config Name="Keep originals (KEEP_ORIGINALS)" Target="KEEP_ORIGINALS" Default="true" Mode="" Description="true: keep each converted upload exactly as the phone sent it, for you only (up to about 2.4 times the storage), so items can be redone later. false: delete it once the converted version is saved." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="Largest upload in GB (MAX_UPLOAD_GB)" Target="MAX_UPLOAD_GB" Default="50" Mode="" Description="Largest single photo or video, in GB." Type="Variable" Display="advanced" Required="false" Mask="false">50</Config>
+  <Config Name="Longest video in minutes (MAX_VIDEO_MINUTES)" Target="MAX_VIDEO_MINUTES" Default="120" Mode="" Description="Videos longer than this are not added; the person who sent one is told." Type="Variable" Display="advanced" Required="false" Mask="false">120</Config>
+  <Config Name="Video threads (VIDEO_THREADS)" Target="VIDEO_THREADS" Default="" Mode="" Description="CPU threads for getting one video ready. Empty or auto: half the cores, at least 2. Lower it to leave more for other containers." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+  <Config Name="Trusted proxies (TRUSTED_PROXIES)" Target="TRUSTED_PROXIES" Default="private" Mode="" Description="Addresses allowed to report the visitor's IP (for sign-in limits): comma-separated IPs or ranges like 172.17.0.0/16, private (home network and Docker ranges) or none. private suits Cloudflare Tunnel or Nginx Proxy Manager on your server or LAN." Type="Variable" Display="advanced" Required="false" Mask="false">private</Config>
+  <Config Name="User ID (PUID)" Target="PUID" Default="99" Mode="" Description="Files are written as this user. 99 is nobody, Unraid's default for shares." Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+  <Config Name="Group ID (PGID)" Target="PGID" Default="100" Mode="" Description="Files are written as this group. 100 is users, Unraid's default for shares." Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
+  <Config Name="UMASK" Target="UMASK" Default="022" Mode="" Description="Permissions for new files: 022 lets others read them, 002 also lets the users group write them." Type="Variable" Display="advanced" Required="false" Mask="false">022</Config>
+</Container>

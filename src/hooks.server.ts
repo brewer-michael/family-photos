@@ -1,4 +1,4 @@
-import { redirect, type RequestEvent } from '@sveltejs/kit';
+import { redirect } from '@sveltejs/kit';
 import type { Handle, ServerInit } from '@sveltejs/kit/hooks';
 import { building } from '$app/env';
 import { boot } from '#lib/server/boot';
@@ -12,44 +12,15 @@ export const init: ServerInit = () => {
 // Access rules live in #lib/server/gate (pure + unit-tested). It gates on event.route.id, i.e.
 // what Kit actually routed to, so percent-encoded paths (/%61dmin) can't slip past it. Static
 // files (build/client, static/) are served by adapter-node before this hook ever runs.
-
-const SECURITY_HEADERS: Record<string, string> = {
-	'x-robots-tag': 'noindex, nofollow',
-	'x-content-type-options': 'nosniff',
-	'referrer-policy': 'same-origin',
-	'x-frame-options': 'DENY'
-};
-
-function withSecurityHeaders(response: Response): Response {
-	for (const [k, v] of Object.entries(SECURITY_HEADERS)) {
-		if (!response.headers.has(k)) {
-			try {
-				response.headers.set(k, v);
-			} catch {
-				// immutable headers (e.g. a proxied fetch Response) — leave as is
-			}
-		}
-	}
-	return response;
-}
+// Security headers (nosniff, Referrer-Policy, X-Frame-Options, X-Robots-Tag) are set by
+// server.js on every response, including the ones Kit answers without calling this hook; the
+// CSP comes from Kit (vite.config.ts).
 
 function plain(status: number, message: string): Response {
-	return withSecurityHeaders(
-		new Response(message, { status, headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' } })
-	);
-}
-
-/**
- * 303 to an auth page. Plain page navigations get a Response carrying the security headers;
- * data, remote and form-action requests get Kit's redirect() so Kit can answer in the JSON
- * form its client expects.
- */
-function seeOther(event: RequestEvent, location: string): Response {
-	const method = event.request.method;
-	if ((method === 'GET' || method === 'HEAD') && !event.isDataRequest && !event.isRemoteRequest) {
-		return withSecurityHeaders(new Response(null, { status: 303, headers: { location, 'cache-control': 'no-store' } }));
-	}
-	redirect(303, location);
+	return new Response(message, {
+		status,
+		headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' }
+	});
 }
 
 function nextParam(url: URL): string {
@@ -80,20 +51,22 @@ export const handle: Handle = async ({ event, resolve }) => {
 		role: event.locals.role,
 		hasName: !!event.locals.name
 	});
+	// Kit answers a redirect() thrown here with a 303, or in the JSON form its client expects for
+	// data, remote and form-action requests.
 	switch (decision.action) {
 		case 'deny':
 			return plain(decision.status, decision.message);
 		case 'login':
-			return seeOther(event, `/login?next=${nextParam(url)}`);
+			redirect(303, `/login?next=${nextParam(url)}`);
 		case 'admin-login':
-			return seeOther(event, `/admin/login?next=${nextParam(url)}`);
+			redirect(303, `/admin/login?next=${nextParam(url)}`);
 		case 'name':
-			return seeOther(event, `/name?next=${nextParam(url)}`);
+			redirect(303, `/name?next=${nextParam(url)}`);
 	}
 
 	// Sliding renewal of the 400-day cookie (only on requests that go through to the app, so the
 	// Set-Cookie isn't lost on a response this hook builds itself).
 	if (access?.stale) issueAccess(cookies, url, access.role);
 
-	return withSecurityHeaders(await resolve(event));
+	return resolve(event);
 };

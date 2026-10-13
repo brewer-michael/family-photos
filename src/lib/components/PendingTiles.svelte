@@ -79,7 +79,7 @@
 				{/if}
 			</span>
 			<span class="body">
-				<span class="name">{row.name}</span>
+				{#if row.name}<span class="name">{row.name}</span>{/if}
 				<span class="line {line.tone}" role="status">
 					{#if line.tone === 'busy'}<span class="spinner" aria-hidden="true"></span>{/if}
 					{line.text}

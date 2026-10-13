@@ -42,6 +42,7 @@ export interface PendingDTO {
 	kind: Kind | null;
 	status: Status;
 	errorCode: ErrorCode | null;
+	/** The uploaded name without its extension ("beach"); may be empty. */
 	name: string;
 	posterUrl: string | null;
 }

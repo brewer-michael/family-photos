@@ -86,7 +86,8 @@ describe('repo/ui', () => {
 
 		const own = ui.pendingTiles(albumId, DEV_A);
 		expect(own.map((p) => p.id).sort()).toEqual([mine, failed].sort());
-		expect(own.find((p) => p.id === mine)).toMatchObject({ name: 'beach.MOV', status: 'received', posterUrl: `/media/${mine}/poster` });
+		// Named without the extension: no "MOV" or "HEIC" on screen.
+		expect(own.find((p) => p.id === mine)).toMatchObject({ name: 'beach', status: 'received', posterUrl: `/media/${mine}/poster` });
 		expect(own.find((p) => p.id === failed)).toMatchObject({ status: 'failed', errorCode: 'unsupported', posterUrl: null });
 		expect(ui.pendingTiles(albumId, null).map((p) => p.id).sort()).toEqual([mine, theirs, failed].sort());
 	});

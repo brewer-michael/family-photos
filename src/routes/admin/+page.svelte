@@ -1,17 +1,387 @@
 <script lang="ts">
+	import { enhance } from '$app/forms';
 	import type { PageProps } from './$types';
+	import Icon from '#lib/components/Icon.svelte';
+	import AdminIcon from '#lib/components/admin/AdminIcon.svelte';
+	import AdminNav from '#lib/components/admin/AdminNav.svelte';
+	import ConfirmAction from '#lib/components/admin/ConfirmAction.svelte';
+	import Note from '#lib/components/admin/Note.svelte';
+	import Thumb from '#lib/components/admin/Thumb.svelte';
+	import { formatDay } from '#lib/client/format';
 
-	let { data }: PageProps = $props();
+	let { data, form }: PageProps = $props();
+
+	const result = (section: string) => (form?.section === section ? form : null);
+	const day = (ms: number) => formatDay(ms, data.timeZone);
+	const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
+	const EMAIL_STATUS: Record<string, string> = {
+		pending: 'Email on its way',
+		sent: 'Emailed to you',
+		saved: 'Email saved to the outbox',
+		failed: "Email didn't send"
+	};
 </script>
 
-<h1>Admin</h1>
+<svelte:head>
+	<title>Admin · {data.siteTitle}</title>
+</svelte:head>
 
-{#each data.warnings as warning, i (i)}
-	<p role="status">{warning}</p>
-{/each}
+<div class="page">
+	<AdminNav />
+	<h1>Admin</h1>
 
-<p>Removal requests waiting: {data.pendingRequests}</p>
+	{#each data.warnings as warning, i (i)}
+		<p class="notice">{warning}</p>
+	{/each}
+	{#if data.email.problem}
+		<p class="notice warn"><AdminIcon name="mail" /> {data.email.problem} <a href="#email">Email</a></p>
+	{/if}
+	{#if data.selfCheck && !data.selfCheck.ok}
+		<p class="notice warn">
+			Some photos or videos can't be added until the media tools are fixed. <a href="#tools">See what's missing</a>
+		</p>
+	{/if}
 
-<form method="POST" action="/admin/logout">
-	<button type="submit">Leave admin mode</button>
-</form>
+	<section class="section" id="requests" aria-labelledby="requests-title">
+		<h2 id="requests-title"><Icon name="flag" /> Removal requests</h2>
+		{#if data.requests.length === 0}
+			<p class="empty">Nobody has asked for anything to be removed.</p>
+		{:else}
+			<ul class="rows">
+				{#each data.requests as r (r.id)}
+					<li class="row card">
+						<Thumb src={r.thumbUrl} kind={r.kind} alt="The {r.kind ?? 'photo'} {r.requester} asked about" />
+						<div class="text">
+							<p class="lead"><strong>{r.requester}</strong> asked to remove a {r.kind ?? 'photo'} from “{r.album}”</p>
+							<p>Why: {r.reason}</p>
+							{#if r.details}<p class="quote">“{r.details}”</p>{/if}
+							<p class="muted small">Asked {day(r.createdAt)} · {EMAIL_STATUS[r.emailStatus]}</p>
+						</div>
+						<a class="btn btn-primary" href="/admin/requests/{r.id}">
+							Review <span class="visually-hidden">the request from {r.requester}</span><Icon name="chevron-right" />
+						</a>
+					</li>
+				{/each}
+			</ul>
+		{/if}
+	</section>
+
+	<section class="section" id="problems" aria-labelledby="problems-title">
+		<h2 id="problems-title"><Icon name="retry" /> Uploads that didn't work</h2>
+		<Note result={result('failed')} />
+		{#if data.failed.length === 0}
+			<p class="empty">Everything that was added worked.</p>
+		{:else}
+			<ul class="rows">
+				{#each data.failed as f (f.id)}
+					<li class="row card">
+						<Thumb src={f.thumbUrl} kind={f.kind} alt={f.name} />
+						<div class="text">
+							<p class="lead"><strong>{f.name}</strong></p>
+							<p>Added by {f.by}{f.album ? ` to “${f.album}”` : ''} · {day(f.failedAt)}</p>
+							<p>{f.problem}.</p>
+							{#if f.detail}
+								<details class="detail">
+									<summary>Details for you</summary>
+									<pre>{f.code}: {f.detail}</pre>
+								</details>
+							{/if}
+							<div class="actions">
+								{#if f.hasSource}
+									<form method="POST" action="?/retry" use:enhance>
+										<input type="hidden" name="id" value={f.id} />
+										<button type="submit" class="btn"><Icon name="retry" /> Try again<span class="visually-hidden">: {f.name}</span></button>
+									</form>
+									<a class="btn" href="/admin/original/{f.id}" download>
+										<Icon name="save" /> Download original<span class="visually-hidden">: {f.name}</span>
+									</a>
+								{/if}
+								<form method="POST" action="?/trashFailed" use:enhance>
+									<input type="hidden" name="id" value={f.id} />
+									<button type="submit" class="btn btn-danger"><Icon name="trash" /> Move to trash<span class="visually-hidden">: {f.name}</span></button>
+								</form>
+							</div>
+						</div>
+					</li>
+				{/each}
+			</ul>
+		{/if}
+	</section>
+
+	<section class="section" id="email" aria-labelledby="email-title">
+		<h2 id="email-title"><AdminIcon name="mail" /> Email</h2>
+		{#if !data.email.to}
+			<p>Nobody gets emails: no admin email address is set (ADMIN_EMAIL).</p>
+		{:else if data.email.smtp}
+			<p>Removal requests and problems are emailed to <strong>{data.email.to}</strong>.</p>
+		{:else}
+			<p>
+				Emails for <strong>{data.email.to}</strong> are saved as files instead of being sent, because no email server is set
+				up. Set SMTP_HOST, SMTP_USER, SMTP_PASS and SMTP_FROM in the Unraid template to get them by email.
+			</p>
+		{/if}
+		<Note result={result('email')} />
+		{#if data.email.to}
+			<form method="POST" action="?/testEmail" use:enhance>
+				<button type="submit" class="btn"><AdminIcon name="mail" /> Send test email</button>
+			</form>
+		{/if}
+		{#if data.email.failedRequests.length > 0}
+			<h3>Request emails that didn't send</h3>
+			<ul class="plain">
+				{#each data.email.failedRequests as e (e.id)}
+					<li class="failed-email">
+						<span>From {e.requester}{e.error ? `: ${e.error}` : ''}</span>
+						<form method="POST" action="?/resendEmail" use:enhance>
+							<input type="hidden" name="id" value={e.id} />
+							<button type="submit" class="btn"><AdminIcon name="mail" /> Resend<span class="visually-hidden"> the email about {e.requester}'s request</span></button>
+						</form>
+					</li>
+				{/each}
+			</ul>
+		{/if}
+	</section>
+
+	<section class="section" id="tools" aria-labelledby="tools-title">
+		<h2 id="tools-title"><Icon name="computer" /> Media tools</h2>
+		{#if !data.selfCheck}
+			<p>Not checked yet. That happens when the app starts; reload this page in a minute.</p>
+		{:else}
+			{#if data.selfCheck.ok}
+				<p>Everything needed to get photos and videos ready is in place.</p>
+			{:else}
+				<ul class="problems">
+					{#each data.selfCheck.problems as p, i (i)}
+						<li>{p}</li>
+					{/each}
+				</ul>
+			{/if}
+			<details class="detail">
+				<summary>Versions (checked {day(data.selfCheck.checkedAt)})</summary>
+				<dl class="facts">
+					{#each Object.entries(data.selfCheck.tools) as [tool, version] (tool)}
+						<dt>{tool}</dt>
+						<dd>{version}</dd>
+					{/each}
+				</dl>
+			</details>
+		{/if}
+	</section>
+
+	<section class="section" id="storage" aria-labelledby="storage-title">
+		<h2 id="storage-title"><Icon name="album" /> Storage</h2>
+		<dl class="facts">
+			<dt>Photos and videos</dt>
+			<dd>{plural(data.storage.photos, 'photo', 'photos')} · {plural(data.storage.videos, 'video', 'videos')} · {data.storage.library}</dd>
+			<dt>Archived originals</dt>
+			<dd>{data.storage.originals} ({plural(data.storage.originalsCount, 'item', 'items')})</dd>
+			<dt>In the trash</dt>
+			<dd><a href="/admin/trash">{plural(data.storage.trash, 'item', 'items')}</a></dd>
+		</dl>
+		{#if !data.storage.keepOriginals}
+			<p class="muted">New originals are not kept (KEEP_ORIGINALS is off).</p>
+		{/if}
+		<Note result={result('storage')} />
+		{#if data.storage.deletableOriginals > 0}
+			<ConfirmAction label="Delete all archived originals…" confirmLabel="Yes, delete them" action="?/deleteOriginals">
+				{#snippet icon()}<Icon name="trash" />{/snippet}
+				<p>
+					Archived originals are the files exactly as the phones sent them, kept only for you. Deleting them frees
+					{data.storage.deletableBytes}. Everyone still sees and saves every photo and video as they are now, but they can't be
+					redone later with better settings.
+				</p>
+				<p>Uploads that didn't work keep theirs, so they can be tried again.</p>
+			</ConfirmAction>
+		{/if}
+		{#if data.storage.outdated > 0}
+			<p>{plural(data.storage.outdated, 'item was', 'items were')} made by an older version of this app and can be redone from the originals.</p>
+			<form method="POST" action="?/reprocessOutdated" use:enhance>
+				<button type="submit" class="btn"><Icon name="retry" /> Redo them</button>
+			</form>
+		{/if}
+	</section>
+
+	<section class="section" id="albums" aria-labelledby="albums-title">
+		<h2 id="albums-title"><Icon name="album" /> Albums</h2>
+		<Note result={result('albums')} />
+		<ul class="rows">
+			{#each data.albums as a (a.id)}
+				<li class="card album">
+					<h3><a href="/album/{a.id}">{a.title}</a></h3>
+					<p class="muted small">
+						{plural(a.visible, 'item', 'items')} showing{a.total > a.visible ? `, ${a.total} in all (including unfinished, failed and trashed)` : ''}
+					</p>
+					<div class="actions">
+						<details class="rename">
+							<summary class="btn"><Icon name="pencil" /> Rename<span class="visually-hidden"> {a.title}</span></summary>
+							<form method="POST" action="?/renameAlbum" use:enhance={() => async ({ update }) => update({ reset: false })}>
+								<input type="hidden" name="id" value={a.id} />
+								<div class="field">
+									<label for="album-title-{a.id}">New name</label>
+									<input id="album-title-{a.id}" class="input" name="title" value={a.title} maxlength="200" required />
+								</div>
+								<button type="submit" class="btn btn-primary"><Icon name="check" /> Save name</button>
+							</form>
+						</details>
+						{#if a.isDefault}
+							<p class="muted small">New photos go here when no album is picked, so it can't be deleted.</p>
+						{:else if a.total === 0}
+							<ConfirmAction label="Delete album…" confirmLabel="Yes, delete it" action="?/deleteAlbum" fields={{ id: a.id }}>
+								{#snippet icon()}<Icon name="trash" />{/snippet}
+								<p>“{a.title}” is empty. It will disappear from everyone's album list.</p>
+							</ConfirmAction>
+						{:else}
+							<ConfirmAction
+								label="Delete album…"
+								confirmLabel="Yes, move them and delete it"
+								action="?/deleteAlbum"
+								fields={{ id: a.id, move: 1 }}
+							>
+								{#snippet icon()}<Icon name="trash" />{/snippet}
+								<p>
+									“{a.title}” still has {plural(a.total, 'item', 'items')}. Albums are only deleted when they are empty, so
+									{a.total === 1 ? 'it' : 'they'} will be moved to “{data.defaultAlbumTitle}” first. Anything already there goes to
+									the trash instead.
+								</p>
+							</ConfirmAction>
+						{/if}
+					</div>
+				</li>
+			{/each}
+		</ul>
+	</section>
+
+	<section class="section" id="qr" aria-labelledby="qr-title">
+		<h2 id="qr-title"><AdminIcon name="qr" /> QR cards</h2>
+		<p>Print cards that let people in when they point their phone's camera at them: one for the whole site, and one for each album.</p>
+		<a class="btn" href="/admin/qr"><AdminIcon name="print" /> Open the QR cards</a>
+	</section>
+
+	<section class="section" id="access" aria-labelledby="access-title">
+		<h2 id="access-title"><AdminIcon name="key" /> Reset access</h2>
+		<p>If the family code or a QR card got to someone it shouldn't have, you can lock everyone out and start again.</p>
+		<Note result={result('access')} />
+		{#if result('access')?.ok}
+			<a class="btn" href="/admin/qr"><AdminIcon name="print" /> Print new QR cards</a>
+		{/if}
+		<ConfirmAction label="Reset access…" confirmLabel="Yes, reset access" action="?/resetAccess">
+			{#snippet icon()}<AdminIcon name="key" />{/snippet}
+			<p>
+				Everyone is signed out on every phone and computer and has to type the family code again. Every printed QR card
+				stops working, so you'll need to print new ones. You stay signed in.
+			</p>
+			<p>To change the family code itself, change FAMILY_PASSWORD in the Unraid template and restart.</p>
+		</ConfirmAction>
+	</section>
+</div>
+
+<style>
+	h2 {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+	}
+	.warn {
+		border-left-color: var(--danger);
+	}
+	.rows,
+	.plain {
+		list-style: none;
+		margin: 0;
+		padding: 0;
+		display: grid;
+		gap: var(--gap);
+	}
+	.row {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-start;
+		gap: 1rem;
+		padding: 1rem;
+	}
+	.row .text {
+		flex: 1 1 16rem;
+		min-width: 0;
+	}
+	.text p {
+		margin: 0 0 0.35rem;
+	}
+	.lead {
+		font-size: var(--fs-large);
+	}
+	.quote {
+		font-style: italic;
+		white-space: pre-wrap;
+	}
+	.small {
+		font-size: var(--fs-small);
+	}
+	.actions {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: flex-start;
+		gap: 0.75rem;
+		margin-top: 0.75rem;
+	}
+	.detail summary {
+		cursor: pointer;
+		min-height: var(--tap);
+		display: flex;
+		align-items: center;
+		font-weight: 600;
+		color: var(--primary);
+	}
+	.detail pre {
+		margin: 0;
+		padding: 0.75rem;
+		max-height: 16rem;
+		overflow: auto;
+		white-space: pre-wrap;
+		font-size: var(--fs-small);
+		background: var(--surface-2);
+		border-radius: var(--radius-small);
+	}
+	.facts {
+		display: grid;
+		grid-template-columns: minmax(8rem, max-content) 1fr;
+		gap: 0.35rem 1rem;
+		margin: 0 0 1rem;
+	}
+	.facts dt {
+		font-weight: 700;
+	}
+	.facts dd {
+		margin: 0;
+		overflow-wrap: anywhere;
+	}
+	.problems li {
+		margin-bottom: 0.5rem;
+	}
+	.failed-email {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		justify-content: space-between;
+		gap: 0.5rem 1rem;
+	}
+	.album {
+		padding: 1rem;
+	}
+	.album h3 {
+		margin-bottom: 0.25rem;
+	}
+	.rename summary {
+		list-style: none;
+	}
+	.rename summary::-webkit-details-marker {
+		display: none;
+	}
+	.rename form {
+		margin-top: 0.75rem;
+		max-width: 28rem;
+	}
+	section > form,
+	section > .btn {
+		margin-top: 0.5rem;
+	}
+</style>

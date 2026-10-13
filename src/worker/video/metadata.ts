@@ -4,10 +4,14 @@
  *
  * taken date fallback: Apple creationdate (local time + offset) → mvhd creation_time (UTC) →
  * the client's lastModified → upload time. Years before 2000 are skipped (unset camera clocks,
- * the 1904/1970 epochs).
+ * the 1904/1970 epochs). taken_at holds a local wall time only when the file has one (Apple
+ * creationdate); a UTC instant alone leaves it null, like the photo lane, so readers fall back
+ * to taken_ms in the server's time zone instead of showing UTC as the local time.
  */
+import fs from 'node:fs/promises';
 import { MediaError } from '#lib/shared/errors';
-import { exiftool } from '../exiftool';
+import { exiftoolBinary } from '../exiftool';
+import { run, RunError } from '../spawn';
 
 export interface Gps {
 	lat: number;
@@ -16,7 +20,7 @@ export interface Gps {
 }
 
 export interface Taken {
-	/** Local wall time plus offset when known ('2024-07-04T11:22:31-07:00'), a UTC instant ('…Z'), or null. */
+	/** Local wall time, plus the offset when known ('2024-07-04T11:22:31-07:00'), or null. */
 	takenAt: string | null;
 	/** UTC epoch ms. */
 	takenMs: number;
@@ -99,7 +103,7 @@ export function resolveTaken(input: {
 		return { takenAt: apple.local + offset, takenMs: apple.utcMs, offset };
 	}
 	if (apple) return { takenAt: apple.local, takenMs: utcMs ?? apple.utcMs, offset: null };
-	if (utcMs !== null) return { takenAt: new Date(utcMs).toISOString().replace(/\.\d{3}Z$/, 'Z'), takenMs: utcMs, offset: null };
+	if (utcMs !== null) return { takenAt: null, takenMs: utcMs, offset: null };
 	if (validMs(input.clientMtimeMs)) return { takenAt: null, takenMs: input.clientMtimeMs, offset: null };
 	return { takenAt: null, takenMs: input.uploadedMs, offset: null };
 }
@@ -120,12 +124,32 @@ export function gpsCoordinates(g: Gps): string {
 	return [f(g.lat), f(g.lon), ...(g.alt !== null ? [f(g.alt)] : [])].join(', ');
 }
 
+/** Time allowed for the exiftool step: 60 s + 1 s per 10 MB (ExifTool rewrites the whole file). */
+export function exiftoolTimeoutMs(bytes: number): number {
+	return 60_000 + Math.ceil(bytes / 10_000_000) * 1000;
+}
+
+/** exiftool arguments for the tags (`-api LargeFileSupport=1`: outputs over 4 GB on ExifTool < 12.88). */
+export function exiftoolArgs(file: string, tags: Record<string, string>): string[] {
+	return [
+		'-overwrite_original',
+		'-api', 'QuickTimeUTC=1',
+		'-api', 'LargeFileSupport=1',
+		...Object.entries(tags).map(([k, v]) => `-${k}=${v}`),
+		file
+	];
+}
+
 /**
  * The required exiftool step on the canonical MP4 (values come from the database): Keys:CreationDate
  * when the local offset is known (Apple reads Keys from moov/meta), and Keys + UserData (©xyz,
  * read by Google Photos) GPS. ExifTool fixes chunk offsets and keeps moov before mdat.
+ *
+ * Runs its own exiftool process rather than the lane's -stay_open instance: the rewrite takes time
+ * in proportion to the file, so it gets a size-based timeout, no automatic retry, and ctx.signal.
+ * Rejects with MediaError('retryable').
  */
-export async function writeVideoMetadata(file: string, taken: Taken, gps: Gps | null): Promise<void> {
+export async function writeVideoMetadata(file: string, taken: Taken, gps: Gps | null, signal: AbortSignal): Promise<void> {
 	const tags: Record<string, string> = {};
 	if (taken.offset && taken.takenAt) tags['Keys:CreationDate'] = exifDate(taken.takenAt);
 	if (gps) {
@@ -133,9 +157,17 @@ export async function writeVideoMetadata(file: string, taken: Taken, gps: Gps | 
 		tags['UserData:GPSCoordinates'] = gpsCoordinates(gps);
 	}
 	if (Object.keys(tags).length === 0) return;
+	const { size } = await fs.stat(file);
+	let stdout: string;
 	try {
-		await exiftool().write(file, tags, { writeArgs: ['-overwrite_original', '-api', 'QuickTimeUTC=1'] });
+		const r = await run(exiftoolBinary() ?? 'exiftool', exiftoolArgs(file, tags), { timeoutMs: exiftoolTimeoutMs(size), signal, ionice: true });
+		stdout = r.stdout.toString('utf8');
 	} catch (e) {
-		throw new MediaError('retryable', `exiftool could not write the date/place: ${(e as Error).message}`);
+		if (!(e instanceof RunError)) throw e;
+		const tail = e.stderr.trim().split('\n').slice(-3).join(' | ');
+		throw new MediaError('retryable', `exiftool could not write the date/place: ${e.message}${tail && !e.message.includes(tail) ? ` (${tail})` : ''}`);
+	}
+	if (!/\b1 image files updated\b/.test(stdout)) {
+		throw new MediaError('retryable', `exiftool did not update the file: ${stdout.trim().slice(0, 300)}`);
 	}
 }

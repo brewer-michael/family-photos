@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import { stmt } from '#lib/server/db';
 import { cacheFile } from '#lib/server/paths';
-import { createNameAllocator, downloadName } from '#lib/server/filenames';
+import { cleanStem, createNameAllocator, downloadName, stemOf } from '#lib/server/filenames';
 import * as albums from './albums';
 import * as media from './media';
 import * as memories from './memories';
@@ -67,6 +67,7 @@ export function albumCards(): AlbumCardDTO[] {
 /**
  * Unfinished uploads to show as tiles: this device's (or every device's, for the admin) items in
  * the album that are still on their way, or failed. Duplicates are left out (nothing to do).
+ * Each is labelled with its uploaded name without the extension ("beach", never "beach.MOV").
  */
 export function pendingTiles(albumId: number, device: string | null): PendingDTO[] {
 	return media
@@ -77,7 +78,7 @@ export function pendingTiles(albumId: number, device: string | null): PendingDTO
 			kind: r.kind,
 			status: r.status,
 			errorCode: r.error_code,
-			name: r.source_name,
+			name: cleanStem(stemOf(r.source_name)),
 			posterUrl: fs.existsSync(cacheFile(r.id, 'poster')) ? mediaUrl(r.id, 'poster') : null
 		}));
 }

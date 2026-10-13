@@ -6,6 +6,10 @@
  * Called by main.ts for a row the main process already claimed ('processing'). Known failures
  * are thrown as MediaError(code, detail); the main process decides retry. Nothing throws after
  * markReady() returned true. tmp/<id> and .work/<id> are removed in `finally`.
+ *
+ * Progress: ffmpeg reports its own; the steps before and after it (probe, poster, exiftool rewrite,
+ * verify, fsync) re-send 0 / 99 % every 30 s, so the queue's "no progress for 180 s" rule only
+ * catches a lane that has really stopped.
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -21,6 +25,8 @@ import { verifyOutput } from './video/verify';
 
 let capsLogged = false;
 
+const HEARTBEAT_MS = 30_000;
+
 /** ffmpeg capabilities, logged once per lane (on its first job). */
 async function laneCaps(ctx: WorkerContext): Promise<FfmpegCaps> {
 	const caps = await ffmpegCaps();
@@ -29,6 +35,23 @@ async function laneCaps(ctx: WorkerContext): Promise<FfmpegCaps> {
 		ctx.log.info(`ffmpeg: ${caps.version}`, { zscale: caps.zscale, tonemap: caps.tonemap, problems: capsProblems(caps) });
 	}
 	return caps;
+}
+
+/** Re-sends a fixed pct every 30 s while armed (`at`), for steps that report no progress of their own. */
+function heartbeat(ctx: WorkerContext) {
+	let timer: NodeJS.Timeout | null = null;
+	const stop = () => {
+		if (timer) clearInterval(timer);
+		timer = null;
+	};
+	return {
+		at(pct: number) {
+			stop();
+			ctx.progress(pct);
+			timer = setInterval(() => ctx.progress(pct), HEARTBEAT_MS);
+		},
+		stop
+	};
 }
 
 async function fsyncPath(p: string): Promise<void> {
@@ -54,7 +77,9 @@ export async function processVideo(id: string, ctx: WorkerContext): Promise<void
 	const work = ctx.paths.workDir(id);
 	await Promise.all([tmp, work].map((d) => fs.rm(d, { recursive: true, force: true })));
 	await Promise.all([tmp, work].map((d) => fs.mkdir(d, { recursive: true })));
+	const beat = heartbeat(ctx);
 	try {
+		beat.at(0);
 		const caps = await laneCaps(ctx);
 		const probe = await probeVideo(src, { maxDurationS: ctx.config.maxVideoSeconds, decoders: caps.decoders, signal: ctx.signal });
 		const hdrMeta =
@@ -87,7 +112,6 @@ export async function processVideo(id: string, ctx: WorkerContext): Promise<void
 			audioCopy: plan.audioCopy,
 			audioDropped: plan.audioDropped
 		});
-		ctx.progress(0);
 
 		// Poster first, so the tile shows a picture while the video converts. If the source frame
 		// can't be grabbed, it is taken from the canonical file after conversion instead.
@@ -100,13 +124,15 @@ export async function processVideo(id: string, ctx: WorkerContext): Promise<void
 			ctx.log.warn(`video ${id}: poster from the source failed; retrying from the converted file`, { error: errorDetail(e, 500) });
 		}
 
+		beat.stop();
 		await runConversion(ctx.config.ffmpegBin, plan.args, {
 			expectedDurationS: plan.expectedDurationS,
 			sourceDurationS: probe.durationS,
 			signal: ctx.signal,
 			progress: ctx.progress
 		});
-		await writeVideoMetadata(out, taken, gps);
+		beat.at(99);
+		await writeVideoMetadata(out, taken, gps, ctx.signal);
 		const durationS = await verifyOutput(out, { mode: plan.mode, audio: plan.audioIndex !== null, expectedDurationS: plan.expectedDurationS }, ctx.signal);
 		if (!poster) {
 			const canonical = await probeVideo(out, { decoders: caps.decoders, signal: ctx.signal, maxDurationS: Infinity });
@@ -118,7 +144,8 @@ export async function processVideo(id: string, ctx: WorkerContext): Promise<void
 			}
 		}
 
-		const size = await installCanonical(out, ctx.paths.libraryPath(id, 'mp4'));
+		const dest = ctx.paths.libraryPath(id, 'mp4');
+		const size = await installCanonical(out, dest);
 		const keep = ctx.config.keepOriginals && plan.lossy;
 		const ext = row.source_ext ?? 'bin';
 		const committed = media.markReady(id, {
@@ -140,9 +167,14 @@ export async function processVideo(id: string, ctx: WorkerContext): Promise<void
 			sourceKept: keep,
 			sourceExt: ext
 		});
-		if (!committed) throw new MediaError('retryable', `media ${id} is no longer processing; not committed`);
+		if (!committed) {
+			// No row describes the file just installed: take it out of library/ again.
+			await fs.rm(dest, { force: true }).catch(() => undefined);
+			throw new MediaError('retryable', `media ${id} is no longer processing; not committed`);
+		}
 		await settleSource(id, src, keep, ext, ctx);
 	} finally {
+		beat.stop();
 		await Promise.all([tmp, work].map((d) => fs.rm(d, { recursive: true, force: true }).catch(() => undefined)));
 	}
 }
@@ -171,6 +203,11 @@ async function settleSource(id: string, src: string, keep: boolean, ext: string,
 		}
 	} catch (e) {
 		ctx.log.error(`video ${id}: could not ${keep ? 'archive' : 'delete'} the source`, { error: errorDetail(e, 500) });
-		if (keep) media.markOriginalDeleted(id);
+		if (!keep) return;
+		try {
+			media.markOriginalDeleted(id);
+		} catch (e2) {
+			ctx.log.error(`video ${id}: could not record that the source was not kept`, { error: errorDetail(e2, 500) });
+		}
 	}
 }

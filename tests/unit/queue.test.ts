@@ -1,0 +1,280 @@
+/**
+ * Worker lanes against a fake worker (tests/fixtures/workers/fake-worker.mjs): real child
+ * processes over IPC, the real database, short timings.
+ */
+import { randomBytes } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { getProgress, queuePosition, startQueue, stopQueue, wakeQueue, type QueueTimings } from '#lib/server/queue';
+import * as albums from '#lib/server/repo/albums';
+import * as media from '#lib/server/repo/media';
+import { tmpRoot, workRoot } from '#lib/server/paths';
+import type { Kind } from '#lib/shared/media-types';
+import { freshDb, setEnv, testEnv } from '../helpers/env';
+
+vi.mock('#lib/server/selfcheck', () => ({ runSelfCheck: vi.fn(async () => null) }));
+
+const FAKE_WORKER = fileURLToPath(new URL('../fixtures/workers/fake-worker.mjs', import.meta.url));
+
+const FAST: Partial<QueueTimings> = {
+	photoTimeoutMs: 1500,
+	stallMs: 500,
+	killGraceMs: 300,
+	helloTimeoutMs: 10_000,
+	respawnBaseMs: 20,
+	respawnMaxMs: 100,
+	shutdownGraceMs: 1000
+};
+
+interface LogEvent {
+	type: string;
+	lane: Kind;
+	pid: number;
+	id?: string;
+	behaviour?: string;
+	attempts?: number;
+	execArgv?: string[];
+	argv?: string[];
+	uvThreadpoolSize?: string;
+	niceness?: number;
+}
+
+let album: number;
+let logFile: string;
+let seq = 0;
+
+function events(): LogEvent[] {
+	if (!fs.existsSync(logFile)) return [];
+	return fs
+		.readFileSync(logFile, 'utf8')
+		.split('\n')
+		.filter(Boolean)
+		.map((l) => JSON.parse(l) as LogEvent);
+}
+
+const jobs = (lane?: Kind) => events().filter((e) => e.type === 'job' && (!lane || e.lane === lane));
+const row = (id: string) => media.getById(id)!;
+
+/** A queued item whose source_name tells the fake worker what to do. */
+function queued(behaviour: string, kind: Kind = 'photo', opts: { estCostS?: number; sourceSize?: number } = {}): string {
+	const id = media.insertReceived({
+		uploadToken: randomBytes(16).toString('base64url'),
+		albumId: album,
+		sourceName: `${behaviour}-${++seq}.${kind === 'photo' ? 'jpg' : 'mov'}`,
+		sourceSize: opts.sourceSize ?? 1000,
+		clientMtimeMs: null,
+		uploadedByName: 'Aunt Linda',
+		uploadedByDevice: 'deviceAAAAAAAAAAAAAAAA'
+	});
+	const r = media.markQueued(id, {
+		kind,
+		sourceMime: kind === 'photo' ? 'image/jpeg' : 'video/quicktime',
+		sourceExt: kind === 'photo' ? 'jpg' : 'mov',
+		sourceSha256: randomBytes(32).toString('hex'),
+		estCostS: opts.estCostS ?? null
+	});
+	expect(r.outcome).toBe('queued');
+	return id;
+}
+
+const release = (id: string) => fs.writeFileSync(`${logFile}.release-${id}`, '');
+
+async function settled(id: string, status: string, timeout = 8000): Promise<void> {
+	await vi.waitFor(() => expect(row(id).status).toBe(status), { timeout, interval: 20 });
+}
+
+beforeEach(() => {
+	freshDb();
+	album = albums.create({ title: 'Queue test', createdByName: null, createdByDevice: null }).id;
+	logFile = path.join(testEnv().root, `worker-${Date.now()}-${++seq}.log`);
+	setEnv({ WORKER_ENTRY: FAKE_WORKER, FAKE_WORKER_LOG: logFile });
+});
+
+afterEach(async () => {
+	await stopQueue();
+});
+
+describe('lanes', () => {
+	it('spawns one niced child per lane with the memory cap, its lane and UV_THREADPOOL_SIZE=4', async () => {
+		startQueue({ timings: FAST });
+		await vi.waitFor(() => expect(events().filter((e) => e.type === 'start')).toHaveLength(2));
+		const base = os.getPriority();
+		for (const lane of ['photo', 'video'] as const) {
+			const start = events().find((e) => e.type === 'start' && e.lane === lane)!;
+			expect(start.execArgv).toContain('--max-old-space-size=512');
+			expect(start.argv).toEqual([`--lane=${lane}`]);
+			expect(start.uvThreadpoolSize).toBe('4');
+			expect(start.niceness).toBe(Math.min(19, base + (lane === 'photo' ? 10 : 15)));
+		}
+	});
+
+	it('runs photos first in, first out and videos cheapest first, one job at a time per lane', async () => {
+		const photos = [queued('ok'), queued('ok'), queued('ok')];
+		const long = queued('ok', 'video', { estCostS: 900 });
+		const short = queued('ok', 'video', { estCostS: 5 });
+		const medium = queued('ok', 'video', { estCostS: 60 });
+		startQueue({ timings: FAST });
+		for (const id of [...photos, long, short, medium]) await settled(id, 'ready');
+		expect(jobs('photo').map((e) => e.id)).toEqual(photos);
+		expect(jobs('video').map((e) => e.id)).toEqual([short, medium, long]);
+		for (const id of [...photos, short]) expect(row(id).attempts).toBe(1);
+	});
+
+	it('picks up work queued later when woken', async () => {
+		startQueue({ timings: FAST });
+		await vi.waitFor(() => expect(events().filter((e) => e.type === 'start')).toHaveLength(2));
+		const id = queued('ok');
+		wakeQueue();
+		await settled(id, 'ready');
+	});
+
+	it('keeps progress in memory while a job runs and reports queue positions', async () => {
+		const running = queued('hold', 'video', { estCostS: 1 });
+		const next = queued('ok', 'video', { estCostS: 2 });
+		const after = queued('ok', 'video', { estCostS: 3 });
+		startQueue({ timings: FAST });
+		await vi.waitFor(() => expect(getProgress(running)).toEqual({ pct: 42, etaS: 90 }));
+		expect(row(running).status).toBe('processing');
+		// The lane is busy with `running`, so `next` has one item ahead of it.
+		expect(queuePosition(next)).toBe(1);
+		expect(queuePosition(after)).toBe(2);
+		expect(queuePosition(running)).toBeUndefined();
+		release(running);
+		await settled(after, 'ready');
+		expect(getProgress(running)).toBeUndefined();
+		expect(queuePosition(next)).toBeUndefined();
+	});
+});
+
+describe('failures', () => {
+	it('retries a retryable failure and fails it after 3 attempts', async () => {
+		const id = queued('fail-retryable');
+		startQueue({ timings: FAST });
+		await settled(id, 'failed');
+		const r = row(id);
+		expect(r.attempts).toBe(3);
+		expect(r.error_code).toBe('retryable');
+		expect(r.error_detail).toContain('Gave up after 3 attempts');
+		expect(r.error_detail).toContain('flaky disk');
+		expect(jobs().filter((e) => e.id === id)).toHaveLength(3);
+	});
+
+	it('fails a non-retryable error at once', async () => {
+		const id = queued('fail-corrupt');
+		startQueue({ timings: FAST });
+		await settled(id, 'failed');
+		expect(row(id).attempts).toBe(1);
+		expect(row(id).error_code).toBe('corrupt');
+		expect(row(id).error_detail).toBe('broken bytes');
+	});
+
+	it('treats a crash as retryable, respawns the lane and carries on', async () => {
+		const crash = queued('crash');
+		const killed = queued('kill');
+		const ok = queued('ok');
+		startQueue({ timings: FAST });
+		await settled(ok, 'ready');
+		for (const id of [crash, killed]) {
+			expect(row(id).status).toBe('failed');
+			expect(row(id).error_code).toBe('retryable');
+			expect(row(id).attempts).toBe(3);
+		}
+		expect(row(crash).error_detail).toContain('exit code 3');
+		expect(row(killed).error_detail).toContain('SIGKILL');
+		// 6 crashes → 7 photo-lane processes (plus the video lane).
+		expect(events().filter((e) => e.type === 'start' && e.lane === 'photo')).toHaveLength(7);
+	});
+
+	it('kills a video lane that stops sending progress, then respawns it', async () => {
+		const stalled = queued('stall', 'video', { estCostS: 1 });
+		const ok = queued('ok', 'video', { estCostS: 2 });
+		startQueue({ timings: FAST });
+		await settled(stalled, 'failed', 15_000);
+		expect(row(stalled).attempts).toBe(3);
+		expect(row(stalled).error_detail).toContain('no progress');
+		await settled(ok, 'ready');
+	});
+
+	it('kills a photo job that runs too long, escalating to SIGKILL', async () => {
+		const stubborn = queued('stubborn');
+		const ok = queued('ok');
+		startQueue({ timings: { ...FAST, photoTimeoutMs: 300 } });
+		await settled(ok, 'ready', 15_000);
+		expect(row(stubborn).status).toBe('failed');
+		expect(row(stubborn).error_detail).toContain('took longer than');
+		expect(events().filter((e) => e.type === 'ignored-sigterm')).toHaveLength(3);
+	});
+
+	it('gives big photos the longer time limit', async () => {
+		const big = queued('hold', 'photo', { sourceSize: 41_000_000 });
+		startQueue({ timings: { ...FAST, photoTimeoutMs: 200, bigPhotoTimeoutMs: 20_000 } });
+		await vi.waitFor(() => expect(jobs('photo')).toHaveLength(1));
+		await new Promise((r) => setTimeout(r, 500));
+		expect(row(big).status).toBe('processing');
+		release(big);
+		await settled(big, 'ready');
+	});
+
+	it('leaves a committed item ready when its worker fails or crashes afterwards', async () => {
+		const failsLate = queued('ready-then-fail');
+		const crashesLate = queued('ready-then-crash');
+		const ok = queued('ok');
+		startQueue({ timings: FAST });
+		await settled(ok, 'ready');
+		for (const id of [failsLate, crashesLate]) {
+			expect(row(id).status).toBe('ready');
+			expect(row(id).attempts).toBe(1);
+			expect(row(id).error_code).toBeNull();
+		}
+	});
+});
+
+describe('start and stop', () => {
+	it('re-queues interrupted jobs and clears the scratch folders at startup', async () => {
+		const id = queued('ok');
+		expect(media.claimForProcessing(id)).toBeTruthy(); // "crashed" while processing
+		for (const root of [tmpRoot(), workRoot()]) {
+			fs.mkdirSync(path.join(root, 'LEFTOVER'), { recursive: true });
+			fs.writeFileSync(path.join(root, 'LEFTOVER', 'x'), 'x');
+		}
+		startQueue({ timings: FAST });
+		expect(fs.readdirSync(tmpRoot())).toEqual([]);
+		expect(fs.readdirSync(workRoot())).toEqual([]);
+		await settled(id, 'ready');
+		expect(row(id).attempts).toBe(2);
+	});
+
+	it('waits while /config is short of space', async () => {
+		const id = queued('ok');
+		startQueue({ timings: { ...FAST, minConfigFreeBytes: Number.MAX_SAFE_INTEGER, diskRecheckMs: 100 } });
+		await vi.waitFor(() => expect(events().filter((e) => e.type === 'start')).toHaveLength(2));
+		await new Promise((r) => setTimeout(r, 400));
+		expect(row(id).status).toBe('queued');
+		expect(jobs()).toHaveLength(0);
+	});
+
+	it('stops the lanes on shutdown and re-queues the job that was cut short', async () => {
+		const id = queued('hang');
+		startQueue({ timings: FAST });
+		await vi.waitFor(() => expect(jobs('photo')).toHaveLength(1));
+		await stopQueue();
+		expect(events().filter((e) => e.type === 'shutdown')).toHaveLength(2);
+		expect(row(id).status).toBe('queued');
+		expect(row(id).attempts).toBe(1);
+	});
+
+	it('SIGKILLs a lane that ignores the shutdown request', async () => {
+		const id = queued('stubborn');
+		startQueue({ timings: { ...FAST, shutdownGraceMs: 200 } });
+		await vi.waitFor(() => expect(jobs('photo')).toHaveLength(1));
+		const started = Date.now();
+		await stopQueue();
+		expect(Date.now() - started).toBeGreaterThanOrEqual(190);
+		expect(Date.now() - started).toBeLessThan(5000);
+		expect(events().filter((e) => e.type === 'ignored-shutdown')).toHaveLength(1);
+		expect(row(id).status).toBe('queued');
+	});
+});

@@ -4,7 +4,9 @@
  * - Per client: at most `max` failures per key in a sliding window (default 10 per 15 minutes).
  * - Globally: at most `globalMax` failures across all keys per window, so rotating IPs (an IPv6
  *   range, a botnet, or headers spoofed through a misconfigured proxy) can't brute-force the code.
- *   During such an attack typed sign-ins wait for everyone; QR links and existing cookies still work.
+ *   Known devices (a valid signed fp_device cookie, see signInSubject()) have a pool of their own,
+ *   so a flood of wrong guesses from strangers makes only strangers wait: phones that have signed
+ *   in here before can still type the code, and QR links and existing cookies keep working.
  * - Memory is bounded: per-key lists keep only the last `max` failures and at most `maxKeys`
  *   keys are tracked (least recently failed evicted first).
  *
@@ -12,6 +14,8 @@
  * failure is recorded against all of them.
  */
 import { BlockList, isIP } from 'node:net';
+import type { Cookies } from '@sveltejs/kit';
+import { readDevice } from './auth';
 import { getConfig } from './config';
 
 export interface RateLimitCheck {
@@ -22,7 +26,14 @@ export interface RateLimitCheck {
 	failures: number;
 }
 
-export type RateLimitKey = string | readonly string[];
+/** A sign-in attempt: its keys, and whether it counts in the known-device global pool. */
+export interface RateLimitSubject {
+	keys: readonly string[];
+	knownDevice: boolean;
+}
+
+/** One key, several keys (see clientKeys()), or a sign-in attempt (see signInSubject()). */
+export type RateLimitKey = string | readonly string[] | RateLimitSubject;
 
 export interface RateLimiter {
 	check(key: RateLimitKey, now?: number): RateLimitCheck;
@@ -37,13 +48,16 @@ export interface RateLimiter {
 export interface RateLimiterOptions {
 	max?: number;
 	windowMs?: number;
-	/** Failures across all keys per window before everyone waits. Default 10 × max. */
+	/** Failures across all keys per window before everyone in the same pool waits. Default 10 × max. */
 	globalMax?: number;
 	/** Most keys tracked at once. Default 10 000. */
 	maxKeys?: number;
 }
 
-const keysOf = (key: RateLimitKey): readonly string[] => (typeof key === 'string' ? [key] : key);
+function subjectOf(key: RateLimitKey): RateLimitSubject {
+	if (typeof key === 'string') return { keys: [key], knownDevice: false };
+	return 'knownDevice' in key ? key : { keys: key, knownDevice: false };
+}
 
 export function createRateLimiter(opts: RateLimiterOptions = {}): RateLimiter {
 	const max = opts.max ?? 10;
@@ -52,7 +66,9 @@ export function createRateLimiter(opts: RateLimiterOptions = {}): RateLimiter {
 	const maxKeys = opts.maxKeys ?? 10_000;
 	/** key → failure times, oldest first. Map order = least recently failed first. */
 	const failures = new Map<string, number[]>();
-	let global: number[] = [];
+	/** Failure times across all keys, per pool (known devices / everyone else). */
+	const global = { known: [] as number[], other: [] as number[] };
+	const poolOf = (s: RateLimitSubject) => (s.knownDevice ? 'known' : 'other');
 
 	const live = (list: number[], now: number) => list.filter((t) => now - t < windowMs);
 
@@ -83,10 +99,11 @@ export function createRateLimiter(opts: RateLimiterOptions = {}): RateLimiter {
 
 	return {
 		check(key, now = Date.now()) {
+			const subject = subjectOf(key);
 			let limited = false;
 			let retryAfterS = 0;
 			let worst = 0;
-			for (const k of keysOf(key)) {
+			for (const k of subject.keys) {
 				const list = recent(k, now);
 				worst = Math.max(worst, list.length);
 				if (list.length >= max) {
@@ -94,31 +111,35 @@ export function createRateLimiter(opts: RateLimiterOptions = {}): RateLimiter {
 					retryAfterS = Math.max(retryAfterS, retryAfter(list, max, now));
 				}
 			}
-			global = live(global, now);
-			if (global.length >= globalMax) {
+			const pool = poolOf(subject);
+			global[pool] = live(global[pool], now);
+			if (global[pool].length >= globalMax) {
 				limited = true;
-				retryAfterS = Math.max(retryAfterS, retryAfter(global, globalMax, now));
+				retryAfterS = Math.max(retryAfterS, retryAfter(global[pool], globalMax, now));
 			}
 			return { limited, retryAfterS, failures: worst };
 		},
 		fail(key, now = Date.now()) {
+			const subject = subjectOf(key);
 			prune(now);
-			for (const k of new Set(keysOf(key))) {
+			for (const k of new Set(subject.keys)) {
 				const list = recent(k, now);
 				list.push(now);
 				failures.delete(k); // re-insert: most recently failed goes to the end
 				failures.set(k, list.slice(-max));
 			}
-			global = live(global, now);
-			global.push(now);
-			if (global.length > globalMax) global = global.slice(-globalMax);
+			const pool = poolOf(subject);
+			const list = live(global[pool], now);
+			list.push(now);
+			global[pool] = list.length > globalMax ? list.slice(-globalMax) : list;
 		},
 		clear(key) {
-			for (const k of keysOf(key)) failures.delete(k);
+			for (const k of subjectOf(key).keys) failures.delete(k);
 		},
 		reset() {
 			failures.clear();
-			global = [];
+			global.known = [];
+			global.other = [];
 		},
 		get size() {
 			return failures.size;
@@ -126,9 +147,9 @@ export function createRateLimiter(opts: RateLimiterOptions = {}): RateLimiter {
 	};
 }
 
-/** Family code attempts on /login: 10 per client, 100 overall, per 15 minutes. */
+/** Family code attempts on /login: 10 per client, 100 overall (per pool), per 15 minutes. */
 export const loginLimiter = createRateLimiter({ max: 10, windowMs: 15 * 60_000, globalMax: 100 });
-/** Admin password attempts on /admin/login: 10 per client, 50 overall, per 15 minutes. */
+/** Admin password attempts on /admin/login: 10 per client, 50 overall (per pool), per 15 minutes. */
 export const adminLimiter = createRateLimiter({ max: 10, windowMs: 15 * 60_000, globalMax: 50 });
 
 // ---------------------------------------------------------------------------
@@ -171,6 +192,15 @@ export function ipKey(ip: string): string {
 
 let trustCache: { spec: string; list: BlockList | null } | null = null;
 
+const familyOf = (ip: string) => (isIP(ip) === 6 ? 'ipv6' : 'ipv4');
+
+/** Adds an IP or CIDR range ('203.0.113.0/24', '2001:db8::/32'). */
+function addRange(list: BlockList, entry: string): void {
+	const [addr, bits] = entry.split('/');
+	if (bits === undefined) list.addAddress(addr, familyOf(addr));
+	else list.addSubnet(addr, Number(bits), familyOf(addr));
+}
+
 function privateRanges(list: BlockList): void {
 	list.addSubnet('127.0.0.0', 8, 'ipv4');
 	list.addSubnet('10.0.0.0', 8, 'ipv4');
@@ -192,14 +222,8 @@ function trustedList(entries: readonly string[]): BlockList | null {
 			list = null;
 			break;
 		}
-		if (e === 'private') {
-			privateRanges(list);
-			continue;
-		}
-		const [addr, bits] = e.split('/');
-		const type = isIP(addr) === 6 ? 'ipv6' : 'ipv4';
-		if (bits === undefined) list.addAddress(addr, type);
-		else list.addSubnet(addr, Number(bits), type);
+		if (e === 'private') privateRanges(list);
+		else addRange(list, e);
 	}
 	trustCache = { spec, list };
 	return list;
@@ -210,7 +234,47 @@ export function isTrustedProxy(peer: string, entries: readonly string[] = getCon
 	const ip = normalizeIp(peer);
 	const list = trustedList(entries);
 	if (!ip || !list) return false;
-	return list.check(ip, isIP(ip) === 6 ? 'ipv6' : 'ipv4');
+	return list.check(ip, familyOf(ip));
+}
+
+/**
+ * Cloudflare's edge ranges as published at https://www.cloudflare.com/ips-v4 and /ips-v6, as of
+ * 2026-10-13 (unchanged since 2021). Behind Cloudflare (orange cloud) → Nginx Proxy Manager,
+ * NPM's X-Real-IP is the Cloudflare edge that connected to it, shared by every visitor who came
+ * through that edge.
+ */
+const CLOUDFLARE_RANGES = [
+	'173.245.48.0/20',
+	'103.21.244.0/22',
+	'103.22.200.0/22',
+	'103.31.4.0/22',
+	'141.101.64.0/18',
+	'108.162.192.0/18',
+	'190.93.240.0/20',
+	'188.114.96.0/20',
+	'197.234.240.0/22',
+	'198.41.128.0/17',
+	'162.158.0.0/15',
+	'104.16.0.0/13',
+	'104.24.0.0/14',
+	'172.64.0.0/13',
+	'131.0.72.0/22',
+	'2400:cb00::/32',
+	'2606:4700::/32',
+	'2803:f800::/32',
+	'2405:b500::/32',
+	'2405:8100::/32',
+	'2a06:98c0::/29',
+	'2c0f:f248::/32'
+];
+
+const cloudflare = new BlockList();
+for (const r of CLOUDFLARE_RANGES) addRange(cloudflare, r);
+
+/** Whether a forwarded "client" IP is really a proxy hop: a Cloudflare edge or a TRUSTED_PROXIES address. */
+export function isProxyHop(ip: string, entries?: readonly string[]): boolean {
+	const n = normalizeIp(ip);
+	return n !== null && (cloudflare.check(n, familyOf(n)) || isTrustedProxy(n, entries));
 }
 
 function socketAddress(event: ClientEvent): string | null {
@@ -230,12 +294,15 @@ function headerIp(h: Headers, name: string): string | null {
  * The client's IPs as far as we can trust them, in priority order. Headers count only when the
  * socket peer is a trusted proxy (Cloudflare Tunnel / Nginx Proxy Manager on the LAN or Docker
  * network, see TRUSTED_PROXIES); a client reaching us directly is identified by its socket.
+ * Header values that are proxy hops themselves are skipped; if none is left, the peer is used.
  */
 function clientIps(event: ClientEvent, entries?: readonly string[]): string[] {
 	const peer = socketAddress(event);
 	if (!peer || !isTrustedProxy(peer, entries)) return [peer ?? 'unknown'];
 	const h = event.request.headers;
-	const ips = [headerIp(h, 'cf-connecting-ip'), headerIp(h, 'x-real-ip')].filter((x): x is string => x !== null);
+	const ips = [headerIp(h, 'cf-connecting-ip'), headerIp(h, 'x-real-ip')].filter(
+		(x): x is string => x !== null && !isProxyHop(x, entries)
+	);
 	return ips.length > 0 ? ips : [peer];
 }
 
@@ -243,7 +310,9 @@ function clientIps(event: ClientEvent, entries?: readonly string[]): string[] {
  * Rate-limit keys for a request: every trusted client IP (IPv6 by /64). Both headers count
  * because which one a proxy overwrites depends on the setup: Cloudflare sets cf-connecting-ip but
  * passes a client's x-real-ip through, Nginx Proxy Manager does the opposite. Keying on both means
- * a spoofed header can't escape the limit set on the real one.
+ * a spoofed header can't escape the limit set on the real one. A header naming a proxy hop is
+ * ignored (Cloudflare → NPM, or cloudflared → NPM on one Docker network): keying on it would make
+ * everyone behind that hop share one limit.
  */
 export function clientKeys(event: ClientEvent, trustedProxies?: readonly string[]): string[] {
 	return [...new Set(clientIps(event, trustedProxies).map(ipKey))];
@@ -252,4 +321,21 @@ export function clientKeys(event: ClientEvent, trustedProxies?: readonly string[
 /** Best guess at the client's IP for logs: cf-connecting-ip ?? x-real-ip ?? the socket (headers only from trusted proxies). */
 export function clientIp(event: ClientEvent, trustedProxies?: readonly string[]): string {
 	return clientIps(event, trustedProxies)[0];
+}
+
+/**
+ * What a sign-in attempt is limited by: the client's IP keys plus, when the request carries a
+ * valid signed fp_device cookie (auth.readDevice), the device itself, which also moves the attempt
+ * into the known-device global pool. Device cookies can't be forged and are only issued after
+ * someone got in (on /name), so strangers flooding wrong guesses can't lock out the family's
+ * phones. Known devices still share a global ceiling of their own: anyone with the family code
+ * can mint new device ids, and that must not open an unlimited guess at the admin password.
+ */
+export function signInSubject(
+	event: ClientEvent & { cookies: Cookies },
+	trustedProxies?: readonly string[]
+): RateLimitSubject {
+	const keys = clientKeys(event, trustedProxies);
+	const device = readDevice(event.cookies);
+	return device ? { keys: [...keys, `device:${device.d}`], knownDevice: true } : { keys, knownDevice: false };
 }

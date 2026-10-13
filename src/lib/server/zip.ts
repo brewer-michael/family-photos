@@ -4,7 +4,7 @@
  * friendly unique names, entries dated to when each photo was taken, plus memories.txt.
  * STORE (photos and videos don't compress), ZIP64 once it grows past 4 GiB, streamed.
  */
-import type { Stats } from 'node:fs';
+import { createReadStream, type ReadStream, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { PassThrough, Readable } from 'node:stream';
 import { ZipArchive } from 'archiver';
@@ -99,16 +99,48 @@ export async function planAlbumZip(album: AlbumRow): Promise<ZipPlan> {
 	return { entries, memoriesText: buildMemoriesText(album, memories.listForAlbum(album.id), entries) };
 }
 
-/** Streams the ZIP. Aborting `signal` (the client went away) stops reading files at once. */
+const CHUNK_BYTES = 1024 * 1024;
+
+/**
+ * Streams the ZIP. When `signal` aborts (the client went away) or the returned stream is
+ * cancelled, the archive stops and the file being read is closed.
+ *
+ * Entries are appended one at a time (the next on the previous one's 'entry' event): archiver
+ * starts reading every appended stream at once, and its abort() leaves the current one open.
+ */
 export function streamZip(plan: ZipPlan, signal: AbortSignal): ReadableStream<Uint8Array> {
 	const archive = new ZipArchive({ store: true });
-	const out = new PassThrough({ highWaterMark: 1024 * 1024 });
+	const out = new PassThrough({ highWaterMark: CHUNK_BYTES });
+	/** The one file being read. */
+	let current: ReadStream | null = null;
+	let next = 0;
 	let finished = false;
 	const stop = () => {
 		if (finished) return;
 		finished = true;
 		archive.abort();
+		current?.destroy();
 		out.destroy();
+	};
+	const appendNext = () => {
+		if (finished) return;
+		const e = plan.entries[next++];
+		if (e) {
+			const file = createReadStream(e.path, { highWaterMark: CHUNK_BYTES });
+			file.once('error', (err) => {
+				if (finished) return;
+				console.error('[zip]', err);
+				out.destroy(err); // a truncated download, not a ZIP missing a file without saying so
+			});
+			current = file;
+			archive.append(file, { name: e.name, date: e.date, stats: e.stats });
+		} else if (next === plan.entries.length + 1) {
+			current = null;
+			archive.append(plan.memoriesText, { name: MEMORIES_FILE, date: localWallTime(Date.now()) });
+			archive.finalize().catch(() => {
+				// reported through the 'error' handler below
+			});
+		}
 	};
 	signal.addEventListener('abort', stop, { once: true });
 	archive.once('end', () => {
@@ -118,16 +150,12 @@ export function streamZip(plan: ZipPlan, signal: AbortSignal): ReadableStream<Ui
 		signal.removeEventListener('abort', stop);
 		stop(); // the web stream was cancelled before the archive ended
 	});
-	archive.on('warning', (e) => console.warn('[zip]', e.message));
+	archive.on('entry', appendNext);
 	archive.on('error', (e) => {
 		console.error('[zip]', e);
 		out.destroy(e);
 	});
 	archive.pipe(out);
-	for (const e of plan.entries) archive.file(e.path, { name: e.name, date: e.date, stats: e.stats });
-	archive.append(plan.memoriesText, { name: MEMORIES_FILE, date: localWallTime(Date.now()) });
-	archive.finalize().catch(() => {
-		// reported through the 'error' handler above
-	});
+	appendNext();
 	return Readable.toWeb(out) as ReadableStream<Uint8Array>;
 }

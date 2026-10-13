@@ -8,7 +8,7 @@ import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import sharp from 'sharp';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it } from 'vitest';
 import { getConfig, type Config } from '#lib/server/config';
 import { getDb } from '#lib/server/db';
 import * as paths from '#lib/server/paths';
@@ -18,9 +18,8 @@ import { ffmpegCaps, parseRate, type FfmpegCaps, type FfprobeResult } from '#lib
 import { MediaError } from '#lib/shared/errors';
 import { PIPELINE_VERSION } from '#lib/shared/media-types';
 import { freshDb, testEnv } from '../helpers/env';
-import { APPLE, FIXTURES, makeFixture, missingEncoders, type FixtureId } from '../fixtures/video/fixtures';
+import { APPLE, FIXTURES, UTC_ONLY_CREATION_TIME, makeFixture, missingEncoders, type FixtureId } from '../fixtures/video/fixtures';
 import type { WorkerContext } from '../../src/worker/context';
-import { endExiftool } from '../../src/worker/exiftool';
 import { processVideo } from '../../src/worker/video';
 
 const APPLE_TAKEN_MS = Date.UTC(2024, 6, 4, 18, 22, 31);
@@ -40,10 +39,6 @@ beforeAll(async () => {
 	paths.ensureDirs();
 	albumId = albums.create({ title: 'Video tests', createdByName: 'Test', createdByDevice: 'deviceTTTTTTTTTTTTTTTT' }).id;
 	caps = await ffmpegCaps();
-});
-
-afterAll(async () => {
-	await endExiftool();
 });
 
 interface Queued {
@@ -287,6 +282,14 @@ describe('video lane: fixtures', () => {
 		expect(row).toMatchObject({ taken_ms: CLIENT_MTIME_MS, taken_at: null, gps_lat: null });
 	});
 
+	it('F2w wide-gamut SDR: converted BT.2020 → BT.709 without tone mapping', async ({ skip }) => {
+		const q = enqueue(fixture('F2w', skip));
+		if (!caps.zscale) return expectFailure(q, 'unsupported', /zscale/);
+		await processVideo(q.id, context().ctx);
+		await expectCommitted(q, { conversion: 'transcode', width: 640, height: 360, durationS: 1, fps: 30, audio: true, kept: true });
+		expect(logs.join('\n')).toMatch(/"colour":"wcg"/);
+	});
+
 	it('F3 H.264 remux: video and audio streams copied bit for bit, source deleted', async ({ skip }) => {
 		const file = fixture('F3', skip);
 		const before = [streamHash(file, 'v:0'), streamHash(file, 'a:0')];
@@ -346,10 +349,14 @@ describe('video lane: fixtures', () => {
 		expect(frames(out)).toBe(frames(file));
 	});
 
-	it('F8 no sound: remux without an audio track', async ({ skip }) => {
+	it('F8 no sound: remux without an audio track; a UTC creation_time is an instant, not a local time', async ({ skip }) => {
 		const q = enqueue(fixture('F8', skip));
 		await processVideo(q.id, context().ctx);
-		await expectCommitted(q, { conversion: 'remux', width: 640, height: 360, durationS: 1, audio: false, kept: false });
+		const { row, out, raw } = await expectCommitted(q, { conversion: 'remux', width: 640, height: 360, durationS: 1, audio: false, kept: false });
+		expect(row).toMatchObject({ taken_at: null, taken_ms: Date.parse(UTC_ONLY_CREATION_TIME) });
+		expect(raw.format.tags?.creation_time).toBe(UTC_ONLY_CREATION_TIME);
+		// No local time and no place: nothing for the exiftool step to write.
+		expect(exifRead(out)['Keys:CreationDate']).toBeUndefined();
 	});
 
 	it('F9 NTSC DV: deinterlaced, square pixels, 29.97 fps despite the bogus average rate', async ({ skip }) => {
@@ -363,6 +370,18 @@ describe('video lane: fixtures', () => {
 	it('F9b Dolby Vision profile 5: unsupported, source kept', async ({ skip }) => {
 		const q = enqueue(fixture('F9b', skip));
 		await expectFailure(q, 'unsupported', /Dolby Vision profile 5/);
+	});
+
+	it('F9c Dolby Vision 8.4: tone-mapped through its HLG base layer, plain SDR out', async ({ skip }) => {
+		const file = fixture('F9c', skip);
+		const dovi = ffprobe(file).streams[0].side_data_list?.find((d) => d.side_data_type === 'DOVI configuration record');
+		expect(dovi).toMatchObject({ dv_profile: 8, dv_bl_signal_compatibility_id: 4 });
+		const q = enqueue(file);
+		if (!(await hdrOrUnsupported(q))) return;
+		await processVideo(q.id, context().ctx);
+		// expectCommitted also checks that no DOVI configuration record is left.
+		await expectCommitted(q, { conversion: 'transcode', width: 640, height: 360, durationS: 1, fps: 30, audio: true, kept: true, hdr: true });
+		expect(logs.join('\n')).toMatch(/"colour":"hdr"/);
 	});
 
 	it('F10 MJPEG in AVI (full range)', async ({ skip }) => {
@@ -468,6 +487,20 @@ describe('video lane: guards and failure handling', () => {
 		const q = enqueue(fixture('F16', skip));
 		await processVideo(q.id, context({ keepOriginals: false }).ctx);
 		await expectCommitted(q, { conversion: 'transcode', width: 960, height: 480, durationS: 1, audio: true, kept: false });
+	});
+
+	it('a row that stops being processing mid-job is not committed and leaves nothing in library/', async ({ skip }) => {
+		const q = enqueue(fixture('F8', skip));
+		const { ctx } = context();
+		// 99 % is the heartbeat after the conversion; the main process requeues the row meanwhile.
+		ctx.progress = (pct) => {
+			if (pct === 99) media.requeue(q.id, 'test');
+		};
+		await expect(processVideo(q.id, ctx)).rejects.toMatchObject({ code: 'retryable', detail: expect.stringMatching(/no longer processing/) });
+		expect(media.getById(q.id)?.status).toBe('queued');
+		expect(fs.existsSync(paths.libraryPath(q.id, 'mp4'))).toBe(false);
+		expect(fs.existsSync(paths.workDir(q.id))).toBe(false);
+		expect(fs.existsSync(q.src)).toBe(true);
 	});
 
 	it('a missing upload fails as corrupt', async ({ skip }) => {

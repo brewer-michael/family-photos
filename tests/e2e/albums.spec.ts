@@ -1,6 +1,6 @@
 import { expect, test } from '@playwright/test';
 import { adminLogin, login } from './helpers';
-import { deviceIdOf, seedAlbum, seedMedia } from './seed';
+import { deviceIdOf, markSeededReady, seedAlbum, seedMedia } from './seed';
 
 test.describe('albums', () => {
 	test('create an album, then only its creator (and the admin) can change it', async ({ page, browser, baseURL }, testInfo) => {
@@ -88,6 +88,33 @@ test.describe('albums', () => {
 		await expect(page.locator(':focus')).toHaveAttribute('href', /^\/view\//);
 	});
 
+	test('when an upload finishes after "Show more", no tile falls between the pages', async ({ page }) => {
+		const album = seedAlbum('Growing album');
+		for (let i = 0; i < 64; i++) {
+			const day = String(1 + (i % 28)).padStart(2, '0');
+			await seedMedia(album, { name: `IMG_${3000 + i}.HEIC`, takenAt: `2022-05-${day}T${String(i % 24).padStart(2, '0')}:00:00` });
+		}
+		await login(page, 'Aunt Linda');
+		const device = await deviceIdOf(page.context());
+		const late = await seedMedia(album, { name: 'IMG_9999.HEIC', status: 'processing', takenAt: '2024-01-01T00:00:00', device });
+
+		await page.goto(`/album/${album}`);
+		const grid = page.getByRole('list', { name: 'Photos and videos in Growing album' });
+		await page.getByRole('link', { name: 'Show more' }).click();
+		await expect(grid.getByRole('listitem')).toHaveCount(64);
+		await expect(page.getByRole('link', { name: 'Show more' })).toHaveCount(0);
+
+		// The upload becomes the newest photo: the first page now ends one tile earlier.
+		await markSeededReady(late, { takenAt: '2024-01-01T00:00:00' });
+		await expect(page.getByRole('list', { name: 'Still on their way' })).toHaveCount(0);
+		await expect(grid.getByRole('link').first()).toHaveAttribute('href', `/view/${late}`);
+		await page.getByRole('link', { name: 'Show more' }).click();
+		await expect(grid.getByRole('listitem')).toHaveCount(65);
+		await expect(page.getByRole('link', { name: 'Show more' })).toHaveCount(0);
+		const hrefs = await grid.getByRole('link').evaluateAll((links) => links.map((a) => a.getAttribute('href')));
+		expect(new Set(hrefs).size).toBe(65);
+	});
+
 	test('home lists new photos and albums; /add picks or starts an album', async ({ page }) => {
 		const title = `Picnic ${Date.now()}`;
 		const album = seedAlbum(title);
@@ -121,7 +148,8 @@ test.describe('albums', () => {
 		await page.goto(`/album/${album}`);
 		const pending = page.getByRole('list', { name: 'Still on their way' });
 		await expect(pending.getByRole('listitem')).toHaveCount(2);
-		await expect(pending).toContainText('beach.MOV');
+		await expect(pending).toContainText('beach');
+		await expect(pending).not.toContainText(/MOV|HEIC/);
 		await expect(pending).toContainText('Getting your video ready…');
 		await expect(pending).toContainText("We couldn't add this one. Michael has been told.");
 		await expect(pending.locator('img')).toHaveCount(1); // the video's early poster

@@ -38,11 +38,16 @@
 	let total = $state(0);
 	let files: File[] = [];
 	let controller: AbortController | null = null;
+	/** Set when the page goes away: stops fetching and the one-by-one downloads. */
+	let gone = false;
 
 	onMount(() => {
 		const platform = detectPlatform();
 		mode = platform === 'desktop' ? 'zip' : platform === 'ios' && canShareFiles() ? 'share' : 'sequential';
-		return () => controller?.abort();
+		return () => {
+			gone = true;
+			controller?.abort();
+		};
 	});
 
 	const step = $derived(steps[index]);
@@ -119,6 +124,7 @@
 			} else {
 				phase = 'saving';
 				for (const t of targets) {
+					if (gone) return;
 					startDownload(t.downloadUrl, t.name);
 					saved += 1;
 					await new Promise((r) => setTimeout(r, ANDROID_DOWNLOAD_GAP_MS));

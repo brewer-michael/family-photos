@@ -7,6 +7,8 @@ import { aboutTime } from './format';
 
 export const POLL_VISIBLE_MS = 3000;
 export const POLL_HIDDEN_MS = 10_000;
+/** Most ids GET /api/status answers in one request (it refuses more with a 400). */
+export const STATUS_BATCH = 100;
 
 const FINISHED: ReadonlySet<Status> = new Set(['ready', 'failed', 'duplicate']);
 
@@ -78,8 +80,10 @@ export interface PollOptions {
 
 /**
  * Polls the status of `ids` every 3 s (10 s while the tab is hidden) and calls `onUpdate` with
- * each answer. Ids drop out once finished; polling stops when none are left. Network errors and
- * error responses are retried on the slow interval. Returns a function that stops polling early.
+ * each round's answers (asked in batches of 100). Ids drop out once finished; polling stops when
+ * none are left. After a network error or error response the next round waits the slow interval
+ * (answers from the batches that worked are still passed on). Returns a function that stops
+ * polling early.
  */
 export function pollStatus(
 	ids: readonly string[],
@@ -114,21 +118,23 @@ export function pollStatus(
 	async function tick(): Promise<void> {
 		if (stopped || inFlight || waiting.size === 0) return;
 		inFlight = true;
-		let next = delay();
-		try {
-			const q = encodeURIComponent([...waiting].join(','));
-			const res = await doFetch(`/api/status?ids=${q}`, { headers: { accept: 'application/json' } });
-			if (!res.ok) throw new Error(`status ${res.status}`);
-			const rows = (await res.json()) as MediaStatusDTO[];
-			if (stopped) return;
-			for (const r of rows) if (isFinished(r.status)) waiting.delete(r.id);
-			onUpdate(rows);
-		} catch {
-			next = hiddenMs;
-		} finally {
-			inFlight = false;
-		}
-		schedule(next);
+		const asking = [...waiting];
+		const batches: string[][] = [];
+		for (let i = 0; i < asking.length; i += STATUS_BATCH) batches.push(asking.slice(i, i + STATUS_BATCH));
+		const answers = await Promise.allSettled(batches.map(fetchBatch));
+		inFlight = false;
+		if (stopped) return;
+		const rows = answers.flatMap((a) => (a.status === 'fulfilled' ? a.value : []));
+		for (const r of rows) if (isFinished(r.status)) waiting.delete(r.id);
+		if (answers.some((a) => a.status === 'fulfilled')) onUpdate(rows);
+		schedule(answers.some((a) => a.status === 'rejected') ? hiddenMs : delay());
+	}
+
+	async function fetchBatch(batch: string[]): Promise<MediaStatusDTO[]> {
+		const q = encodeURIComponent(batch.join(','));
+		const res = await doFetch(`/api/status?ids=${q}`, { headers: { accept: 'application/json' } });
+		if (!res.ok) throw new Error(`status ${res.status}`);
+		return (await res.json()) as MediaStatusDTO[];
 	}
 
 	doc.addEventListener('visibilitychange', onVisible);

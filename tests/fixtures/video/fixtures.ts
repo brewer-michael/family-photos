@@ -19,6 +19,9 @@ export const APPLE = {
 	contentId: '8E2C5A1B-0D7F-4C3E-9A61-2B4F6D8E0A13'
 } as const;
 
+/** F8's only date: an mvhd creation_time (a UTC instant; 20:30 on July 4 in Los Angeles). */
+export const UTC_ONLY_CREATION_TIME = '2024-07-05T03:30:00.000000Z';
+
 const appleTags = [
 	'-metadata', `com.apple.quicktime.creationdate=${APPLE.creationDate}`,
 	'-metadata', `com.apple.quicktime.location.ISO6709=${APPLE.location}`,
@@ -82,6 +85,19 @@ export const FIXTURES = {
 			]
 		]
 	},
+	F2w: {
+		id: 'F2w',
+		file: 'f2w-bt2020-sdr.mp4',
+		what: '10-bit HEVC with BT.2020 primaries and an SDR transfer (wide gamut, not HDR)',
+		encoders: ['libx265', 'aac'],
+		steps: (out) => [
+			[
+				...lavfi('testsrc2=s=640x360:r=30:d=1'), ...lavfi('sine=d=1'),
+				'-vf', 'format=yuv420p10le,setparams=color_primaries=bt2020:color_trc=bt2020-10:colorspace=bt2020nc',
+				...x265('colorprim=bt2020:transfer=bt2020-10:colormatrix=bt2020nc'), '-tag:v', 'hvc1', ...aacStereo, out
+			]
+		]
+	},
 	F3: {
 		id: 'F3',
 		file: 'f3-h264-remux.mov',
@@ -135,9 +151,9 @@ export const FIXTURES = {
 	F8: {
 		id: 'F8',
 		file: 'f8-no-audio.mp4',
-		what: 'H.264 without a sound track: remux, nothing to drop',
+		what: 'H.264 without a sound track, dated only by creation_time (UTC, like most Android and camera clips): remux',
 		encoders: ['libx264'],
-		steps: (out) => [[...lavfi('testsrc2=s=640x360:r=25:d=1'), ...x264(), out]]
+		steps: (out) => [[...lavfi('testsrc2=s=640x360:r=25:d=1'), ...x264(), '-metadata', `creation_time=${UTC_ONLY_CREATION_TIME}`, out]]
 	},
 	F9: {
 		id: 'F9',
@@ -155,6 +171,19 @@ export const FIXTURES = {
 		encoders: ['libx265'],
 		steps: (out) => [[...lavfi('testsrc2=s=640x360:r=30:d=1'), '-vf', 'format=yuv420p10le', ...x265('repeat-headers=1'), '-tag:v', 'hvc1', out]],
 		post: (out) => injectDvcc(out, { profile: 5, level: 6, compatId: 0 })
+	},
+	F9c: {
+		id: 'F9c',
+		file: 'f9c-dolby-vision-84.mp4',
+		what: 'Dolby Vision 8.4 (HLG base layer, as iPhones record): tone-mapped through the base layer, no DOVI record left',
+		encoders: ['libx265', 'aac'],
+		steps: (out) => [
+			[
+				...lavfi('testsrc2=s=640x360:r=30:d=1'), ...lavfi('sine=d=1'),
+				'-vf', `format=yuv420p10le,${HLG}`, ...x265('colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc'), ...HLG_TAGS, '-tag:v', 'hvc1', ...aacStereo, out
+			]
+		],
+		post: (out) => injectDvcc(out, { profile: 8, level: 2, compatId: 4 })
 	},
 	F10: {
 		id: 'F10',

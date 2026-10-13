@@ -105,18 +105,73 @@ describe('album ZIP', () => {
 		expect(execFileSync('unzip', ['-p', zip, MEMORIES_FILE], { encoding: 'utf8' })).toContain('No memories have been written');
 	});
 
-	it('stops streaming when aborted', async () => {
-		readyItem(albumId, { name: 'big.jpg', takenAt: '2023-07-01T10:00:00', takenMs: 1, bytes: Buffer.alloc(8 * 1024 * 1024, 1) });
-		const plan = await planAlbumZip(albums.get(albumId)!);
-		const ac = new AbortController();
-		const reader = streamZip(plan, ac.signal).getReader();
-		await reader.read();
-		ac.abort();
-		const end = await (async () => {
-			for (let i = 0; i < 10_000; i++) if ((await reader.read()).done) return 'ended';
-			return 'still running';
-		})().catch(() => 'errored');
-		expect(end).toMatch(/ended|errored/);
+	describe('when the download stops half-way', () => {
+		/** Open descriptors of this process that point at `file` (Linux). */
+		const fdsOn = (file: string) =>
+			fs.readdirSync('/proc/self/fd').filter((fd) => {
+				try {
+					return fs.readlinkSync(`/proc/self/fd/${fd}`) === file;
+				} catch {
+					return false; // closed while listing
+				}
+			}).length;
+
+		async function waitForNoFds(file: string): Promise<number> {
+			for (let i = 0; i < 100 && fdsOn(file) > 0; i++) await new Promise((r) => setTimeout(r, 20));
+			return fdsOn(file);
+		}
+
+		/** Starts a ZIP of one 32 MB file, reads ~4 MB of it and returns the reader. */
+		async function startBigZip(signal: AbortSignal) {
+			const id = readyItem(albumId, { name: 'big.mp4', kind: 'video', takenAt: '2023-07-01T10:00:00', takenMs: 1, bytes: Buffer.alloc(32 * 1024 * 1024, 1) });
+			const file = libraryPath(id, 'mp4');
+			const reader = streamZip(await planAlbumZip(albums.get(albumId)!), signal).getReader();
+			for (let read = 0; read < 4 * 1024 * 1024; ) read += (await reader.read()).value?.length ?? 0;
+			expect(fdsOn(file)).toBe(1);
+			return { reader, file };
+		}
+
+		it.runIf(process.platform === 'linux')('closes the file when the client goes away', async () => {
+			const ac = new AbortController();
+			const { reader, file } = await startBigZip(ac.signal);
+			ac.abort();
+			const end = await (async () => {
+				for (let i = 0; i < 10_000; i++) if ((await reader.read()).done) return 'ended';
+				return 'still running';
+			})().catch(() => 'errored');
+			expect(end).toMatch(/ended|errored/);
+			expect(await waitForNoFds(file)).toBe(0);
+		});
+
+		it.runIf(process.platform === 'linux')('closes the file when the stream is cancelled', async () => {
+			const { reader, file } = await startBigZip(new AbortController().signal);
+			await reader.cancel();
+			expect(await waitForNoFds(file)).toBe(0);
+		});
+
+		it.runIf(process.platform === 'linux')('opens one file at a time', async () => {
+			const files = Array.from({ length: 5 }, (_, i) =>
+				libraryPath(readyItem(albumId, { name: `f${i}.jpg`, takenAt: '2023-07-01T10:00:00', takenMs: i, bytes: Buffer.alloc(4 * 1024 * 1024, i) }), 'jpg')
+			);
+			const reader = streamZip(await planAlbumZip(albums.get(albumId)!), new AbortController().signal).getReader();
+			let most = 0;
+			for (;;) {
+				const { done } = await reader.read();
+				if (done) break;
+				most = Math.max(most, files.reduce((n, f) => n + fdsOn(f), 0));
+			}
+			expect(most).toBe(1);
+		});
+
+		it('fails the download (instead of hanging) when a file disappears', async () => {
+			const id = readyItem(albumId, { name: 'gone.jpg', takenAt: '2023-07-01T10:00:00', takenMs: 1 });
+			const plan = await planAlbumZip(albums.get(albumId)!);
+			fs.rmSync(libraryPath(id, 'jpg'));
+			const reader = streamZip(plan, new AbortController().signal).getReader();
+			await expect((async () => {
+				while (!(await reader.read()).done);
+			})()).rejects.toThrow(/ENOENT/);
+		});
 	});
 });
 

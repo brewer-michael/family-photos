@@ -7,6 +7,7 @@ import {
 	downloadName,
 	isGenericStem,
 	stampFor,
+	stemOf,
 	type NameSource
 } from '#lib/server/filenames';
 
@@ -86,6 +87,14 @@ describe('downloadName', () => {
 		expect(isGenericStem('imagery')).toBe(false);
 		expect(isGenericStem('image')).toBe(true);
 		expect(isGenericStem('Video-2')).toBe(true);
+	});
+
+	it('takes the stem off the uploaded name', () => {
+		expect(stemOf('beach.MOV')).toBe('beach');
+		expect(stemOf('trim.4F2A.MOV')).toBe('trim.4F2A');
+		expect(stemOf('C:\\Users\\jo\\IMG_1.HEIC')).toBe('IMG_1');
+		expect(stemOf('.hidden')).toBe('.hidden');
+		expect(stemOf('README')).toBe('README');
 	});
 });
 

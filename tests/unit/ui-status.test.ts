@@ -87,6 +87,44 @@ describe('pollStatus', () => {
 		expect(listeners).toHaveLength(0); // done: no timers or listeners left
 	});
 
+	it('asks about at most 100 ids per request and merges the answers', async () => {
+		const ids = Array.from({ length: 150 }, (_, i) => `M${String(i).padStart(3, '0')}`);
+		const asked: string[][] = [];
+		let round = 0;
+		const fn = vi.fn(async (url: string) => {
+			const q = decodeURIComponent(new URL(url, 'http://x').searchParams.get('ids') ?? '').split(',');
+			asked.push(q);
+			// Round 1: everything is processing; round 2: the second batch fails, the first is ready.
+			if (round === 2 && q.includes('M149')) return new Response('x', { status: 503 });
+			return Response.json(q.map((id) => ({ id, status: round === 1 ? 'processing' : 'ready' })));
+		}) as unknown as typeof fetch;
+		const seen: MediaStatusDTO[][] = [];
+		pollStatus(ids, (rows) => seen.push(rows), { fetchImpl: fn, doc });
+
+		round = 1;
+		await vi.advanceTimersByTimeAsync(3000);
+		expect(asked.map((q) => q.length)).toEqual([100, 50]);
+		expect(new Set(asked.flat())).toEqual(new Set(ids));
+		expect(seen).toHaveLength(1); // one update per round, with both halves
+		expect(seen[0].map((r) => r.id).sort()).toEqual(ids);
+
+		round = 2;
+		await vi.advanceTimersByTimeAsync(3000);
+		expect(asked).toHaveLength(4);
+		expect(seen[1]).toHaveLength(100); // the half that answered is still shown
+		expect(seen[1].every((r) => r.status === 'ready')).toBe(true);
+
+		round = 3; // a failed batch → the next round waits 10 s, and asks only about the 50 left
+		await vi.advanceTimersByTimeAsync(9999);
+		expect(asked).toHaveLength(4);
+		await vi.advanceTimersByTimeAsync(1);
+		expect(asked.slice(4).map((q) => q.length)).toEqual([50]);
+		expect(seen[2]).toHaveLength(50);
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(asked).toHaveLength(5); // all ready: stopped
+		expect(listeners).toHaveLength(0);
+	});
+
 	it('slows to 10 s while hidden or after an error, and catches up when the tab is shown', async () => {
 		const { fn, urls } = fakeFetch([500, [{ id: 'A', status: 'queued' }], [{ id: 'A', status: 'queued' }]]);
 		const stop = pollStatus(['A'], () => {}, { fetchImpl: fn, doc });

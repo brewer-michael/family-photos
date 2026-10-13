@@ -7,6 +7,7 @@
 //   2. fill x-forwarded-proto from the socket when a proxy didn't set it,
 //   3. keep connections alive longer than common proxies (65 s) and shut down gracefully,
 //      letting the app stop its worker lanes (globalThis[Symbol.for('family-photos.shutdown')]).
+// It also sets the security headers on every response (see SECURITY_HEADERS).
 import http from 'node:http';
 import process from 'node:process';
 
@@ -17,6 +18,17 @@ const protocolHeader = process.env.PROTOCOL_HEADER.toLowerCase();
 const host = process.env.HOST || '0.0.0.0';
 const port = Number(process.env.PORT || 3000);
 const shutdownTimeoutMs = Number(process.env.SHUTDOWN_TIMEOUT || 30) * 1000;
+
+// Set before the handler runs, so they are on every response: pages and endpoints, static files,
+// and the ones SvelteKit answers before the app's `handle` hook runs or outside it (trailing-slash
+// 308s, CSRF 403s, redirects thrown from the hook, 404s). Kit's CSP adds frame-ancestors 'none'
+// to pages (vite.config.ts); X-Frame-Options covers everything else.
+const SECURITY_HEADERS = {
+	'x-content-type-options': 'nosniff',
+	'referrer-policy': 'same-origin',
+	'x-frame-options': 'DENY',
+	'x-robots-tag': 'noindex, nofollow'
+};
 
 /** @type {(req: http.IncomingMessage, res: http.ServerResponse, next: () => void) => void} */
 let handler;
@@ -38,6 +50,7 @@ try {
 }
 
 const server = http.createServer((req, res) => {
+	for (const [name, value] of Object.entries(SECURITY_HEADERS)) res.setHeader(name, value);
 	const raw = req.headers[protocolHeader];
 	const first = (Array.isArray(raw) ? raw[0] : raw)?.split(',')[0]?.trim().toLowerCase();
 	if (first === 'http' || first === 'https') {
