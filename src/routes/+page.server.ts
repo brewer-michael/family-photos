@@ -1,14 +1,12 @@
 import type { PageServerLoad } from './$types';
-import * as albums from '#lib/server/repo/albums';
+import * as media from '#lib/server/repo/media';
+import { albumCards, toTile } from '#lib/server/repo/ui';
+
+const NEW_PHOTOS = 18;
 
 export const load: PageServerLoad = () => {
 	return {
-		albums: albums.list().map((a) => ({
-			id: a.id,
-			title: a.title,
-			whenText: a.when_text,
-			itemCount: a.item_count,
-			coverId: a.cover_id
-		}))
+		recent: media.listRecent({ limit: NEW_PHOTOS }).map(toTile),
+		albums: albumCards()
 	};
 };

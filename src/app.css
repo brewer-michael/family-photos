@@ -1,0 +1,401 @@
+/*
+ * Family Photos design system: plain CSS with tokens (no framework).
+ *
+ * Built for everyone from 5 to 95 (docs/PLAN.md "UX rules"):
+ * - 18px+ type that follows the browser's text size, and iOS Settings › Text Size;
+ * - tap targets of at least 56px, icon + word labels, visible focus rings;
+ * - warm, high-contrast colours (text ≥ 7:1, everything else ≥ 4.5:1), light and dark;
+ * - motion only when the device allows it; nothing that needs hover.
+ */
+
+:root {
+	color-scheme: light dark;
+
+	/* Colour — light (default) */
+	--bg: #fff8ef;
+	--surface: #ffffff;
+	--surface-2: #fbeee0;
+	--text: #2b1d14;
+	--muted: #5e4a3c;
+	--border: #8a6f5c;
+	--line: #ead8c6;
+	--primary: #9c3d1f;
+	--primary-hover: #82311a;
+	--on-primary: #ffffff;
+	--accent: #1d5c4d;
+	--danger: #9f1d1d;
+	--ok: #1f6b3a;
+	--focus: #1a56c4;
+	--focus-halo: #ffffff;
+	--shadow: 0 1px 2px rgb(60 30 10 / 0.12), 0 4px 14px rgb(60 30 10 / 0.08);
+	--scrim: rgb(20 12 6 / 0.55);
+	--tile-bg: #ead8c6;
+
+	/* Type: 18px at the default text size (see the iOS block below) */
+	--fs-base: 1rem;
+	--fs-small: calc(var(--fs-base) * 0.9);
+	--fs-large: calc(var(--fs-base) * 1.2);
+	--fs-h2: calc(var(--fs-base) * 1.4);
+	--fs-h1: calc(var(--fs-base) * 1.75);
+	--font: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+
+	/* Space and shape */
+	--tap: max(56px, 3.25rem);
+	--gap: 1rem;
+	--gutter: clamp(1rem, 4vw, 2rem);
+	--radius: 14px;
+	--radius-small: 10px;
+	--page-max: 72rem;
+	--text-max: 40rem;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #1b1511;
+		--surface: #2a211b;
+		--surface-2: #342923;
+		--text: #f8efe6;
+		--muted: #d6c5b5;
+		--border: #a48d7b;
+		--line: #4a3b31;
+		--primary: #f2a27c;
+		--primary-hover: #f7b897;
+		--on-primary: #22140c;
+		--accent: #8fd3bf;
+		--danger: #ffb4a8;
+		--ok: #9ee0b0;
+		--focus: #8ab4ff;
+		--focus-halo: #1b1511;
+		--shadow: 0 1px 2px rgb(0 0 0 / 0.5);
+		--scrim: rgb(0 0 0 / 0.7);
+		--tile-bg: #3a2e26;
+	}
+}
+
+html {
+	/* 112.5% of the browser default = 18px, and it grows with the browser's text size setting. */
+	font-size: 112.5%;
+	-webkit-text-size-adjust: 100%;
+	text-size-adjust: 100%;
+}
+
+/* iOS Safari: follow Settings › Display & Brightness › Text Size (17px at the default size, so the
+   body text is scaled to 18px). -webkit-touch-callout is only supported on iOS. */
+@supports (-webkit-touch-callout: none) {
+	html {
+		font: -apple-system-body;
+	}
+	:root {
+		--fs-base: 1.0625rem;
+	}
+}
+
+*,
+*::before,
+*::after {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	min-height: 100vh;
+	min-height: 100dvh;
+	background: var(--bg);
+	color: var(--text);
+	font-family: var(--font);
+	font-size: var(--fs-base);
+	line-height: 1.5;
+	overflow-wrap: break-word;
+	-webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3 {
+	line-height: 1.2;
+	margin: 0 0 0.5rem;
+	text-wrap: balance;
+}
+h1 {
+	font-size: var(--fs-h1);
+}
+h2 {
+	font-size: var(--fs-h2);
+}
+h3 {
+	font-size: var(--fs-large);
+}
+p {
+	margin: 0 0 1rem;
+}
+
+a {
+	color: var(--primary);
+	text-decoration-thickness: 2px;
+	text-underline-offset: 3px;
+}
+
+img,
+video {
+	max-width: 100%;
+}
+
+/* Focus: always visible for keyboards, a two-colour ring that shows on any background. */
+:focus-visible {
+	outline: 3px solid var(--focus);
+	outline-offset: 3px;
+	box-shadow: 0 0 0 6px var(--focus-halo);
+}
+
+.visually-hidden {
+	position: absolute !important;
+	width: 1px;
+	height: 1px;
+	padding: 0;
+	margin: -1px;
+	overflow: hidden;
+	clip: rect(0 0 0 0);
+	white-space: nowrap;
+	border: 0;
+}
+
+.skip-link {
+	position: absolute;
+	left: 0.5rem;
+	top: -10rem;
+	z-index: 100;
+	padding: 0.75rem 1rem;
+	background: var(--surface);
+	color: var(--text);
+	border-radius: var(--radius-small);
+}
+.skip-link:focus {
+	top: 0.5rem;
+}
+
+.page {
+	width: 100%;
+	max-width: var(--page-max);
+	margin: 0 auto;
+	padding: 1rem var(--gutter) 3rem;
+}
+.page-narrow {
+	max-width: var(--text-max);
+}
+
+.stack > * + * {
+	margin-top: var(--gap);
+}
+
+.muted {
+	color: var(--muted);
+}
+
+/* ---------------------------------------------------------------------------
+ * Buttons (and links that look like buttons): icon + word, ≥ 56px tall.
+ * ------------------------------------------------------------------------- */
+.btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	gap: 0.6rem;
+	min-height: var(--tap);
+	min-width: var(--tap);
+	padding: 0.6rem 1.25rem;
+	border: 2px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--surface);
+	color: var(--text);
+	font: inherit;
+	font-weight: 600;
+	line-height: 1.2;
+	text-align: center;
+	text-decoration: none;
+	cursor: pointer;
+	touch-action: manipulation;
+	-webkit-tap-highlight-color: transparent;
+	transition:
+		background-color 0.15s,
+		transform 0.1s;
+}
+.btn:active {
+	transform: scale(0.98);
+}
+.btn-primary {
+	background: var(--primary);
+	border-color: var(--primary);
+	color: var(--on-primary);
+}
+.btn-primary:active {
+	background: var(--primary-hover);
+}
+.btn-quiet {
+	border-color: transparent;
+	background: transparent;
+	color: var(--primary);
+	text-decoration: underline;
+	text-underline-offset: 3px;
+}
+.btn-danger {
+	border-color: var(--danger);
+	color: var(--danger);
+}
+.btn-big {
+	min-height: calc(var(--tap) * 1.3);
+	padding: 0.9rem 1.5rem;
+	font-size: var(--fs-large);
+	border-radius: calc(var(--radius) * 1.2);
+}
+.btn-block {
+	display: flex;
+	width: 100%;
+}
+.btn[disabled],
+.btn[aria-disabled='true'] {
+	cursor: default;
+	opacity: 0.7;
+	transform: none;
+}
+.btn svg {
+	flex: none;
+}
+
+/* ---------------------------------------------------------------------------
+ * Forms
+ * ------------------------------------------------------------------------- */
+.field {
+	display: flex;
+	flex-direction: column;
+	gap: 0.4rem;
+	margin-bottom: 1.25rem;
+}
+.field label,
+.label {
+	font-weight: 700;
+}
+.hint {
+	color: var(--muted);
+	font-size: var(--fs-small);
+	margin: 0;
+}
+.input,
+.textarea {
+	width: 100%;
+	min-height: var(--tap);
+	padding: 0.7rem 0.9rem;
+	border: 2px solid var(--border);
+	border-radius: var(--radius-small);
+	background: var(--surface);
+	color: var(--text);
+	font: inherit;
+}
+.textarea {
+	min-height: 7.5rem;
+	resize: vertical;
+}
+.input[aria-invalid='true'],
+.textarea[aria-invalid='true'] {
+	border-color: var(--danger);
+}
+.error {
+	color: var(--danger);
+	font-weight: 600;
+	margin: 0;
+}
+.notice {
+	padding: 0.9rem 1.1rem;
+	border-radius: var(--radius);
+	background: var(--surface-2);
+	border-left: 6px solid var(--accent);
+}
+.notice-ok {
+	border-left-color: var(--ok);
+}
+
+/* ---------------------------------------------------------------------------
+ * Cards, sections, empty states
+ * ------------------------------------------------------------------------- */
+.card {
+	background: var(--surface);
+	border: 1px solid var(--line);
+	border-radius: var(--radius);
+	box-shadow: var(--shadow);
+}
+.section {
+	margin-top: 2rem;
+}
+.section-head {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 1rem;
+	flex-wrap: wrap;
+}
+.empty {
+	padding: 1.5rem;
+	text-align: center;
+	color: var(--muted);
+	background: var(--surface-2);
+	border-radius: var(--radius);
+}
+.empty p:last-child {
+	margin-bottom: 0;
+}
+
+/* Spinner (static under reduced motion; there is always a word next to it). */
+.spinner {
+	display: inline-block;
+	width: 1.2em;
+	height: 1.2em;
+	border: 3px solid currentColor;
+	border-right-color: transparent;
+	border-radius: 50%;
+	animation: spin 0.9s linear infinite;
+	vertical-align: -0.2em;
+}
+@keyframes spin {
+	to {
+		transform: rotate(360deg);
+	}
+}
+
+/* Modal dialogs (Save sheet, Ask to remove): a bottom sheet on phones, centred on computers. */
+dialog.sheet {
+	width: min(36rem, 100% - 1rem);
+	max-height: calc(100dvh - 2rem);
+	padding: 1.25rem var(--gutter) 1.5rem;
+	border: 0;
+	border-radius: calc(var(--radius) * 1.4);
+	background: var(--surface);
+	color: var(--text);
+	box-shadow: var(--shadow);
+}
+dialog.sheet::backdrop {
+	background: var(--scrim);
+}
+@media (max-width: 40rem) {
+	dialog.sheet {
+		margin: auto 0.5rem 0.5rem;
+		width: calc(100% - 1rem);
+		max-width: none;
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.01ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.01ms !important;
+		scroll-behavior: auto !important;
+	}
+}
+
+@media (forced-colors: active) {
+	.btn,
+	.input,
+	.textarea {
+		border: 2px solid ButtonText;
+	}
+}
