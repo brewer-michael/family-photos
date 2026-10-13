@@ -1,0 +1,16 @@
+{
+	"extends": "$app/tsconfig",
+	"compilerOptions": {
+		"strict": true,
+		"noImplicitOverride": true,
+		"noFallthroughCasesInSwitch": true,
+		"sourceMap": true,
+		"types": ["node", "$app/types"],
+		"paths": {
+			"#lib": ["./src/lib"],
+			"#lib/*": ["./src/lib/*"]
+		}
+	},
+	"include": ["src", "tests", "*.ts", "server.js", "scripts"],
+	"exclude": ["node_modules", "build", "build-worker", ".svelte-kit/output"]
+}

@@ -34,7 +34,7 @@ The **media worker** is a separate entry point, `src/worker/main.ts`. A second `
 - **Plain HTTP breaks SvelteKit's CSRF check.** adapter-node assumes `https` when the proto header is missing, so on plain HTTP (LAN access and e2e tests) form actions and tus POSTs fail it.
   - Fix: a custom **`server.js`** sets `x-forwarded-proto` from the socket when it's missing, then mounts `build/handler.js`.
   - The Dockerfile sets `PROTOCOL_HEADER=x-forwarded-proto` and `BODY_SIZE_LIMIT=64M`.
-  - Don't set `ADDRESS_HEADER`. Client IP is `cf-connecting-ip` ?? `x-real-ip` ?? the socket address.
+  - Don't set `ADDRESS_HEADER`. Client IP is `cf-connecting-ip` ?? `x-real-ip` ?? the socket address, but the headers are believed only when the socket peer is a trusted proxy (`TRUSTED_PROXIES`, default loopback/private ranges). Rate limiting keys on both headers at once (IPv6 per /64) plus a global ceiling, because Cloudflare and NPM each pass the *other* header through from the client.
 - **HEIC/HEVC always arrive at some point.** Desktops, the Files app, Samsung's high-efficiency mode and iPhone videos (usually HEVC, often HDR or Dolby Vision 8.4) all produce them. The server normalizes everything; the client never converts.
 - **Two libraries can't be trusted for this:**
   - sharp's prebuilt libvips can't decode HEVC.
@@ -64,7 +64,7 @@ The **media worker** is a separate entry point, `src/worker/main.ts`. A second `
 - `ADMIN_EMAIL`, `ADMIN_NAME`
 - `SITE_TITLE`
 - `SMTP_HOST`, `SMTP_PORT` (587), `SMTP_USER`, `SMTP_PASS` (masked), `SMTP_FROM`
-- Advanced: `KEEP_ORIGINALS` (true), `MAX_UPLOAD_GB` (50), `MAX_VIDEO_MINUTES` (120), `VIDEO_THREADS` (auto: max(2, cores/2)), `PUID` (99), `PGID` (100), `UMASK` (022)
+- Advanced: `KEEP_ORIGINALS` (true), `MAX_UPLOAD_GB` (50), `MAX_VIDEO_MINUTES` (120), `VIDEO_THREADS` (auto: max(2, cores/2)), `TRUSTED_PROXIES` (private), `PUID` (99), `PGID` (100), `UMASK` (022)
 - **ExtraParams** (required): `--cpu-shares=128 --memory=4g`
 - TZ is injected by Unraid.
 

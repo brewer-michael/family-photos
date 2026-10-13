@@ -1,0 +1,58 @@
+{
+  "name": "family-photos",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.17"
+  },
+  "scripts": {
+    "prepare": "svelte-kit sync || echo \"\"",
+    "dev": "vite dev",
+    "dev:worker": "vite build --config vite.worker.config.ts --watch",
+    "build": "vite build && vite build --config vite.worker.config.ts",
+    "build:app": "vite build",
+    "build:worker": "vite build --config vite.worker.config.ts",
+    "preview": "vite preview",
+    "start": "node server.js",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "test": "vitest run --project unit",
+    "test:media": "vitest run --project media --passWithNoTests",
+    "test:e2e": "playwright test",
+    "smoke:worker": "node scripts/smoke-worker.mjs photo && node scripts/smoke-worker.mjs video"
+  },
+  "dependencies": {
+    "@sveltejs/adapter-node": "6.0.0",
+    "@sveltejs/kit": "3.0.1",
+    "@tus/file-store": "2.1.1",
+    "@tus/server": "2.4.5",
+    "archiver": "8.0.0",
+    "better-sqlite3": "13.0.3",
+    "exiftool-vendored": "39.0.1",
+    "file-type": "22.1.1",
+    "nodemailer": "10.1.0",
+    "qrcode": "1.5.4",
+    "sharp": "0.35.5",
+    "svelte": "5.57.2",
+    "tus-js-client": "4.3.1",
+    "ulid": "3.0.2"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.56.1",
+    "@sveltejs/vite-plugin-svelte": "7.3.1",
+    "@types/archiver": "8.0.0",
+    "@types/better-sqlite3": "9.6.0",
+    "@types/node": "22.20.5",
+    "@types/qrcode": "1.5.6",
+    "svelte-check": "4.7.6",
+    "typescript": "6.0.3",
+    "vite": "8.3.4",
+    "vitest": "5.0.4"
+  },
+  "imports": {
+    "#lib": "./src/lib",
+    "#lib/*": "./src/lib/*"
+  }
+}

@@ -1,0 +1,22 @@
+node_modules/
+/build/
+/build-worker/
+/.svelte-kit/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/coverage/
+# local dev data (CONFIG_DIR/PHOTOS_DIR defaults) and temp dirs
+/data/
+/tmp/
+*.tmp
+.fp-e2e-*/
+# env files
+.env
+.env.*
+!.env.example
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
